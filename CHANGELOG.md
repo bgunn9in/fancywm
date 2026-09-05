@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Added the opt-in Master + Satellites algorithmic layout with configurable master ratio/side, satellite orientation and capacity, keyboard and mouse operations, per-display state, and settings preview.
+- Added reservation-based overflow to compatible virtual desktops, optional bounded desktop creation, correlated recovery, manual-move preservation, and floating fallback.
+- Fixed Dispatcher-affinity, live orientation, capacity-transition, and reused-HWND event-order races found during portable testing of the new layout.
+- Made an active-axis directional move across the adjacent master promote the focused satellite, including the two-window horizontal case.
+- Preserved the existing generic FancyWM layout path when the feature is disabled or a display is outside its configured scope.
+
 ## v2.10.0
 - **Move windows by holding the Alt key**
 - Fix GIMP compatibility #133

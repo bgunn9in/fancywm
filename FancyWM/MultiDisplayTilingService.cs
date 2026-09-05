@@ -9,6 +9,7 @@ using System.Windows.Threading;
 
 using FancyWM.Models;
 using FancyWM.Utilities;
+using FancyWM.AlgorithmicLayouts;
 
 using WinMan;
 using FancyWM.Layouts.Tiling;
@@ -19,6 +20,8 @@ namespace FancyWM
     class MultiDisplayTilingService : ITilingService, IDisposable
     {
         public event EventHandler<TilingFailedEventArgs>? PlacementFailed;
+
+        public event EventHandler<AlgorithmicLayoutEvent>? AlgorithmicLayoutChanged;
         public event EventHandler<EventArgs>? PendingIntentChanged;
 
         public Dispatcher Dispatcher { get; }
@@ -38,11 +41,16 @@ namespace FancyWM
             get => m_exclusionMatchers;
             set
             {
-                foreach (var tiling in m_tilingServices.Values)
+                ITilingService[] tilingServices;
+                lock (m_syncRoot)
+                {
+                    m_exclusionMatchers = value;
+                    tilingServices = [.. m_tilingServices.Values];
+                }
+                foreach (var tiling in tilingServices)
                 {
                     tiling.ExclusionMatchers = value;
                 }
-                m_exclusionMatchers = value;
             }
         }
 
@@ -51,15 +59,20 @@ namespace FancyWM
             get => m_showPreviewFocus;
             set
             {
-                foreach (var tiling in m_tilingServices.Values)
+                ITilingService[] tilingServices;
+                lock (m_syncRoot)
+                {
+                    m_showPreviewFocus = value;
+                    tilingServices = [.. m_tilingServices.Values];
+                }
+                foreach (var tiling in tilingServices)
                 {
                     tiling.ShowPreviewFocus = value;
                 }
-                m_showPreviewFocus = value;
             }
         }
 
-        private readonly Dictionary<IDisplay, TilingService> m_tilingServices = [];
+        private readonly Dictionary<IDisplay, ITilingService> m_tilingServices = [];
         private readonly CompositeDisposable m_subscriptions = [];
         private readonly Subject<Unit> m_focusedWindowLocationChanges = new();
         private readonly ILogger m_logger;
@@ -71,180 +84,504 @@ namespace FancyWM
         private bool m_delayReposition;
         private IReadOnlyCollection<IWindowMatcher> m_exclusionMatchers = [];
         private readonly IObservable<ITilingServiceSettings> m_settings;
+        private readonly AlgorithmicLayoutCoordinator m_algorithmicLayoutCoordinator;
+        private readonly Func<IDisplay, ITilingService> m_tilingServiceFactory;
+        private readonly Action<ITilingService, bool> m_setAutoRegisterWindows;
+        private readonly Action m_scheduleGarbageCollection;
         private readonly object m_syncRoot = new();
+        private IWindow? m_observedFocusedWindow;
+        private bool m_disposed;
 
-        public MultiDisplayTilingService(IWorkspace workspace, IAnimationThread animationThread, IObservable<ITilingServiceSettings> settings)
+        public MultiDisplayTilingService(
+            IWorkspace workspace,
+            IAnimationThread animationThread,
+            IObservable<ITilingServiceSettings> settings,
+            AlgorithmicLayoutCoordinator algorithmicLayoutCoordinator)
+            : this(
+                workspace,
+                animationThread,
+                settings,
+                algorithmicLayoutCoordinator,
+                App.Current.Logger,
+                display => new TilingService(
+                    workspace,
+                    display,
+                    animationThread,
+                    settings,
+                    algorithmicLayoutCoordinator,
+                    true),
+                (service, value) =>
+                    ((TilingService)service).AutoRegisterWindows = value,
+                GCHelper.ScheduleCollection)
+        {
+        }
+
+        internal MultiDisplayTilingService(
+            IWorkspace workspace,
+            IAnimationThread animationThread,
+            IObservable<ITilingServiceSettings> settings,
+            AlgorithmicLayoutCoordinator algorithmicLayoutCoordinator,
+            ILogger logger,
+            Func<IDisplay, ITilingService> tilingServiceFactory,
+            Action<ITilingService, bool> setAutoRegisterWindows,
+            Action scheduleGarbageCollection)
         {
             Dispatcher = Dispatcher.CurrentDispatcher;
             Workspace = workspace;
             AnimationThread = animationThread;
             m_settings = settings;
-            m_logger = App.Current.Logger;
+            m_algorithmicLayoutCoordinator = algorithmicLayoutCoordinator
+                ?? throw new ArgumentNullException(nameof(algorithmicLayoutCoordinator));
+            if (!ReferenceEquals(m_algorithmicLayoutCoordinator.Dispatcher, Dispatcher))
+            {
+                throw new ArgumentException(
+                    "The algorithmic layout coordinator must use the multi-display service Dispatcher.",
+                    nameof(algorithmicLayoutCoordinator));
+            }
+            if (!ReferenceEquals(m_algorithmicLayoutCoordinator.Workspace, Workspace))
+            {
+                throw new ArgumentException(
+                    "The algorithmic layout coordinator must belong to the multi-display workspace.",
+                    nameof(algorithmicLayoutCoordinator));
+            }
+            m_logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            m_tilingServiceFactory = tilingServiceFactory
+                ?? throw new ArgumentNullException(nameof(tilingServiceFactory));
+            m_setAutoRegisterWindows = setAutoRegisterWindows
+                ?? throw new ArgumentNullException(nameof(setAutoRegisterWindows));
+            m_scheduleGarbageCollection = scheduleGarbageCollection
+                ?? throw new ArgumentNullException(nameof(scheduleGarbageCollection));
             m_logger.Information($"Using the multi-monitor tiling backend");
 
-            foreach (var display in Workspace.DisplayManager.Displays)
+            try
             {
-                var tiling = new TilingService(Workspace, display, animationThread, settings, true)
+                foreach (var display in Workspace.DisplayManager.Displays)
                 {
-                    ExclusionMatchers = m_exclusionMatchers,
-                    ShowPreviewFocus = m_showPreviewFocus,
-                };
-                tiling.PlacementFailed += OnTilingFailed;
-                tiling.Start();
-                m_tilingServices.Add(display, tiling);
+                    ITilingService? tiling = null;
+                    try
+                    {
+                        tiling = m_tilingServiceFactory(display);
+                        tiling.ExclusionMatchers = m_exclusionMatchers;
+                        tiling.ShowPreviewFocus = m_showPreviewFocus;
+                        tiling.PlacementFailed += OnTilingFailed;
+                        tiling.AlgorithmicLayoutChanged += OnAlgorithmicLayoutChanged;
+                        tiling.PendingIntentChanged += OnPendingIntentChanged;
+                        tiling.Start();
+                        m_tilingServices.Add(display, tiling);
+                        tiling = null;
+                    }
+                    finally
+                    {
+                        if (tiling != null)
+                        {
+                            DisposeTilingService(tiling);
+                        }
+                    }
+                }
+
+                var registeredDisplays = m_tilingServices.Keys.ToArray();
+                var initialFocusedWindow = TryGetFocusedWindow();
+                m_activeDisplay = MultiDisplayActiveDisplaySelector.Select(
+                        registeredDisplays,
+                        TryGetWindowCenter(initialFocusedWindow),
+                        Workspace.DisplayManager.PrimaryDisplay)
+                    ?? Workspace.DisplayManager.PrimaryDisplay;
+                m_setAutoRegisterWindows(m_tilingServices[m_activeDisplay], true);
+                m_tilingServices[m_activeDisplay].Refresh();
+
+                Workspace.DisplayManager.Added += OnDisplayAdded;
+                Workspace.DisplayManager.Removed += OnDisplayRemoved;
+
+                Workspace.FocusedWindowChanged += OnFocusedWindowChanged;
+                m_subscriptions.Add(Disposable.Create(
+                    () => Workspace.FocusedWindowChanged -= OnFocusedWindowChanged));
+                m_observedFocusedWindow = initialFocusedWindow;
+                if (m_observedFocusedWindow != null)
+                {
+                    m_observedFocusedWindow.PositionChanged += OnWindowPositionChanged;
+                }
+
+                var focusLocationObservable = m_focusedWindowLocationChanges
+                    .Throttle(TimeSpan.FromMilliseconds(100))
+                    .Do(_ => QueueDispatcherAction(
+                        () => UpdateActiveDisplay(reason: "the focused window was moved"),
+                        "updating the active display after a focused-window move"));
+                m_subscriptions.Add(focusLocationObservable.Subscribe());
+            }
+            catch
+            {
+                RollbackFailedInitialization();
+                throw;
+            }
+        }
+
+        private void RollbackFailedInitialization()
+        {
+            m_disposed = true;
+            TryInitializationCleanup(
+                () => Workspace.DisplayManager.Added -= OnDisplayAdded,
+                "unsubscribing from display-added events");
+            TryInitializationCleanup(
+                () => Workspace.DisplayManager.Removed -= OnDisplayRemoved,
+                "unsubscribing from display-removed events");
+            TryInitializationCleanup(
+                () => Workspace.FocusedWindowChanged -= OnFocusedWindowChanged,
+                "unsubscribing from focused-window events");
+
+            if (m_observedFocusedWindow != null)
+            {
+                TryInitializationCleanup(
+                    () => m_observedFocusedWindow.PositionChanged -= OnWindowPositionChanged,
+                    "unsubscribing from focused-window position events");
+                m_observedFocusedWindow = null;
             }
 
-            m_activeDisplay = GetActiveDisplay() ?? Workspace.DisplayManager.PrimaryDisplay;
-            m_tilingServices[m_activeDisplay].AutoRegisterWindows = true;
-            m_tilingServices[m_activeDisplay].Refresh();
+            TryInitializationCleanup(
+                m_subscriptions.Dispose,
+                "disposing multi-display subscriptions");
 
-            Workspace.DisplayManager.Added += OnDisplayAdded;
-            Workspace.DisplayManager.Removed += OnDisplayRemoved;
+            var initializedServices = m_tilingServices.Values.ToArray();
+            m_tilingServices.Clear();
+            foreach (var tiling in initializedServices)
+            {
+                DisposeTilingService(tiling);
+            }
 
-            Workspace.FocusedWindowChanged += OnFocusedWindowChanged;
-            m_subscriptions.Add(Disposable.Create(() => Workspace.FocusedWindowChanged -= OnFocusedWindowChanged));
+            TryInitializationCleanup(
+                m_focusedWindowLocationChanges.OnCompleted,
+                "completing focused-window location events");
+            TryInitializationCleanup(
+                m_focusedWindowLocationChanges.Dispose,
+                "disposing focused-window location events");
+        }
 
-            var focusLocationObservable = m_focusedWindowLocationChanges
-                .Throttle(TimeSpan.FromMilliseconds(100))
-                .Do(async _ => await Dispatcher.InvokeAsync(() =>
+        private void TryInitializationCleanup(Action cleanup, string operation)
+        {
+            try
+            {
+                cleanup();
+            }
+            catch (Exception exception)
+            {
+                m_logger.Error(
+                    exception,
+                    "Multi-display initialization rollback failed while {Operation}",
+                    operation);
+            }
+        }
+
+        private void QueueDispatcherAction(Action action, string operation)
+        {
+            ArgumentNullException.ThrowIfNull(action);
+            ArgumentException.ThrowIfNullOrWhiteSpace(operation);
+
+            void ApplySafely()
+            {
+                try
                 {
-                    UpdateActiveDisplay(reason: "the focused window was moved");
-                }));
-            m_subscriptions.Add(focusLocationObservable.Subscribe());
+                    action();
+                }
+                catch (Exception exception)
+                {
+                    m_logger.Error(
+                        exception,
+                        "Multi-display dispatcher action failed while {Operation}",
+                        operation);
+                }
+            }
+
+            try
+            {
+                Dispatcher.BeginInvoke((Action)ApplySafely);
+            }
+            catch (Exception exception)
+            {
+                m_logger.Error(
+                    exception,
+                    "Could not queue multi-display dispatcher action while {Operation}",
+                    operation);
+            }
         }
 
         private void OnDisplayRemoved(object? sender, DisplayChangedEventArgs e)
         {
-            Dispatcher.Invoke(() =>
+            if (!Dispatcher.CheckAccess())
             {
-                lock (m_syncRoot)
-                {
-                    if (m_activeDisplay.Equals(e.Source))
-                    {
-                        UpdateActiveDisplay($"the active display {e.Source} was removed");
-                    }
-                    if (m_tilingServices.TryGetValue(e.Source, out var tiling))
-                    {
-                        m_tilingServices.Remove(e.Source);
-                        tiling.PlacementFailed -= OnTilingFailed;
-                        tiling.PendingIntentChanged -= OnPendingIntentChanged;
-                        tiling.Stop();
-                        tiling.Dispose();
-                    }
-                }
+                QueueDispatcherAction(
+                    () => OnDisplayRemoved(sender, e),
+                    "removing a display");
+                return;
+            }
 
-                GCHelper.ScheduleCollection();
-            });
+            ITilingService? removedTiling = null;
+            bool updateActiveDisplay = false;
+            lock (m_syncRoot)
+            {
+                if (m_disposed)
+                {
+                    return;
+                }
+                updateActiveDisplay = m_activeDisplay.Equals(e.Source);
+                if (m_tilingServices.Remove(e.Source, out var tiling))
+                {
+                    removedTiling = tiling;
+                }
+            }
+
+            try
+            {
+                if (updateActiveDisplay)
+                {
+                    UpdateActiveDisplay($"the active display {e.Source} was removed");
+                }
+            }
+            catch (Exception exception)
+            {
+                m_logger.Error(
+                    exception,
+                    "Could not reroute the active display after removing {Display}",
+                    e.Source);
+            }
+            finally
+            {
+                if (removedTiling != null)
+                {
+                    DisposeTilingService(removedTiling);
+                }
+                m_scheduleGarbageCollection();
+            }
         }
 
         private void OnDisplayAdded(object? sender, DisplayChangedEventArgs e)
         {
-            Dispatcher.Invoke(() =>
+            if (!Dispatcher.CheckAccess())
             {
-                lock (m_syncRoot)
+                QueueDispatcherAction(
+                    () => OnDisplayAdded(sender, e),
+                    "adding a display");
+                return;
+            }
+
+            bool showPreviewFocus;
+            IReadOnlyCollection<IWindowMatcher> exclusionMatchers;
+            lock (m_syncRoot)
+            {
+                if (m_disposed || m_tilingServices.ContainsKey(e.Source))
                 {
-                    if (!m_tilingServices.ContainsKey(e.Source))
-                    {
-                        var tiling = new TilingService(Workspace, e.Source, AnimationThread, m_settings, true)
-                        {
-                            ShowPreviewFocus = m_showPreviewFocus,
-                            ExclusionMatchers = m_exclusionMatchers,
-                        };
-                        tiling.PlacementFailed += OnTilingFailed;
-                        tiling.PendingIntentChanged += OnPendingIntentChanged;
-                        tiling.Start();
-                        m_tilingServices.Add(e.Source, tiling);
-                    }
-                    UpdateActiveDisplay(reason: $"display {e.Source} was added");
+                    return;
                 }
-            });
+                showPreviewFocus = m_showPreviewFocus;
+                exclusionMatchers = m_exclusionMatchers;
+            }
+
+            var tiling = m_tilingServiceFactory(e.Source);
+            tiling.ShowPreviewFocus = showPreviewFocus;
+            tiling.ExclusionMatchers = exclusionMatchers;
+            tiling.PlacementFailed += OnTilingFailed;
+            tiling.AlgorithmicLayoutChanged += OnAlgorithmicLayoutChanged;
+            tiling.PendingIntentChanged += OnPendingIntentChanged;
+            try
+            {
+                tiling.Start();
+            }
+            catch
+            {
+                DisposeTilingService(tiling);
+                throw;
+            }
+
+            bool registered;
+            lock (m_syncRoot)
+            {
+                registered = !m_disposed && m_tilingServices.TryAdd(e.Source, tiling);
+            }
+            if (!registered)
+            {
+                DisposeTilingService(tiling);
+                return;
+            }
+
+            UpdateActiveDisplay(reason: $"display {e.Source} was added");
         }
 
         private void OnPendingIntentChanged(object? sender, EventArgs e)
         {
-            PendingIntentChanged?.Invoke(this, e);
-            foreach (var tiling in m_tilingServices)
+            ITilingService[] tilingServices;
+            lock (m_syncRoot)
             {
-                tiling.Value.PendingIntent = ((TilingService)sender!).PendingIntent;
+                if (m_disposed)
+                {
+                    return;
+                }
+                tilingServices = [.. m_tilingServices.Values];
+            }
+            PendingIntentChanged?.Invoke(this, e);
+            foreach (var tiling in tilingServices)
+            {
+                tiling.PendingIntent = ((ITilingService)sender!).PendingIntent;
             }
         }
 
         private void OnWindowPositionChanged(object? sender, WindowPositionChangedEventArgs e)
         {
-            m_focusedWindowLocationChanges.OnNext(Unit.Default);
+            lock (m_syncRoot)
+            {
+                if (m_disposed)
+                {
+                    return;
+                }
+            }
+            try
+            {
+                m_focusedWindowLocationChanges.OnNext(Unit.Default);
+            }
+            catch (ObjectDisposedException)
+            {
+                // Dispose can complete between the guarded state check and the
+                // notification when WinMan raises PositionChanged concurrently.
+                m_logger.Debug(
+                    "Ignored a focused-window position notification during multi-display disposal");
+            }
         }
 
         private void OnFocusedWindowChanged(object? sender, FocusedWindowChangedEventArgs e)
         {
-            if (e.OldFocusedWindow != null)
+            var focusedWindow = e.NewFocusedWindow;
+            lock (m_syncRoot)
             {
-                e.OldFocusedWindow.PositionChanged -= OnWindowPositionChanged;
+                if (m_disposed)
+                {
+                    return;
+                }
+                if (m_observedFocusedWindow != null)
+                {
+                    m_observedFocusedWindow.PositionChanged -= OnWindowPositionChanged;
+                }
+                m_observedFocusedWindow = focusedWindow;
+                if (focusedWindow == null)
+                {
+                    return;
+                }
+                focusedWindow.PositionChanged += OnWindowPositionChanged;
             }
-            if (e.NewFocusedWindow == null)
-            {
-                return;
-            }
-            e.NewFocusedWindow.PositionChanged += OnWindowPositionChanged;
 
-            _ = Dispatcher.InvokeAsync(() =>
-            {
-                UpdateActiveDisplay($"the focused window has changed to {e.NewFocusedWindow.DebugString()}");
-            });
+            QueueDispatcherAction(
+                () => UpdateActiveDisplay($"the focused window has changed to {focusedWindow.DebugString()}"),
+                "updating the active display after a focus change");
         }
 
         private void UpdateActiveDisplay(string? reason = null)
         {
+            if (!Dispatcher.CheckAccess())
+            {
+                Dispatcher.Invoke(() => UpdateActiveDisplay(reason));
+                return;
+            }
+
+            IDisplay[] registeredDisplays;
+            IDisplay previousDisplay;
             lock (m_syncRoot)
             {
-                var newActiveDisplay = GetActiveDisplay() ?? Workspace.DisplayManager.PrimaryDisplay;
-                if (!newActiveDisplay.Equals(m_activeDisplay))
+                if (m_disposed || m_tilingServices.Count == 0)
                 {
-                    m_logger.Information($"Active display changed from {m_activeDisplay} to {newActiveDisplay}");
-                    if (m_tilingServices.TryGetValue(m_activeDisplay, out var oldTiling))
-                    {
-                        oldTiling.AutoRegisterWindows = true;
-                    }
-                    else
-                    {
-                        m_logger.Warning($"Previous active display {m_activeDisplay} is not associated with a tiling service!");
-                    }
-                    m_activeDisplay = newActiveDisplay;
-                    if (m_tilingServices.TryGetValue(m_activeDisplay, out var newTiling))
-                    {
-                        newTiling.AutoRegisterWindows = true;
-                        newTiling.Refresh();
-                    }
-                    else
-                    {
-                        m_logger.Warning($"New active display {m_activeDisplay} is not associated with a tiling service!");
-                    }
-                    m_logger.Verbose($"Check triggered because {reason}.");
+                    return;
                 }
+                registeredDisplays = [.. m_tilingServices.Keys];
+                previousDisplay = m_activeDisplay;
             }
-        }
 
-        private IDisplay? GetActiveDisplay()
-        {
+            var primaryDisplay = Workspace.DisplayManager.PrimaryDisplay;
+            var selectedDisplay = MultiDisplayActiveDisplaySelector.Select(
+                registeredDisplays,
+                TryGetFocusedWindowCenter(),
+                primaryDisplay);
+
+            ITilingService? oldTiling;
+            ITilingService newTiling;
+            IDisplay newActiveDisplay;
             lock (m_syncRoot)
             {
-                var window = Workspace.FocusedWindow;
-                if (window == null)
-                    return null;
-                var display = Workspace.DisplayManager.Displays
-                    .FirstOrDefault(x => x.Bounds.Contains(window.Position.Center));
-                return display;
+                if (m_disposed || m_tilingServices.Count == 0)
+                {
+                    return;
+                }
+                newActiveDisplay = selectedDisplay != null
+                    && m_tilingServices.ContainsKey(selectedDisplay)
+                        ? selectedDisplay
+                        : m_tilingServices.ContainsKey(primaryDisplay)
+                            ? primaryDisplay
+                            : m_tilingServices.Keys.First();
+                if (newActiveDisplay.Equals(m_activeDisplay)
+                    && m_tilingServices.ContainsKey(m_activeDisplay))
+                {
+                    return;
+                }
+
+                m_tilingServices.TryGetValue(m_activeDisplay, out oldTiling);
+                m_activeDisplay = newActiveDisplay;
+                newTiling = m_tilingServices[newActiveDisplay];
             }
+
+            m_logger.Information($"Active display changed from {previousDisplay} to {newActiveDisplay}");
+            if (oldTiling != null)
+            {
+                m_setAutoRegisterWindows(oldTiling, true);
+            }
+            m_setAutoRegisterWindows(newTiling, true);
+            newTiling.Refresh();
+            m_logger.Verbose($"Check triggered because {reason}.");
         }
 
-        private TilingService GetActiveTilingService()
+        private ITilingService GetActiveTilingService()
         {
+            if (!Dispatcher.CheckAccess())
+            {
+                return Dispatcher.Invoke(GetActiveTilingService);
+            }
+
+            UpdateActiveDisplay(reason: "an operation requested the active display");
             lock (m_syncRoot)
             {
                 return m_tilingServices[m_activeDisplay];
             }
         }
 
-        private TilingService GetPrimaryTilingService()
+        private Point? TryGetFocusedWindowCenter()
+        {
+            return TryGetWindowCenter(TryGetFocusedWindow());
+        }
+
+        private IWindow? TryGetFocusedWindow()
+        {
+            try
+            {
+                return Workspace.FocusedWindow;
+            }
+            catch (InvalidWindowReferenceException ex)
+            {
+                m_logger.Debug(
+                    ex,
+                    "The focused window became invalid while selecting the active display");
+                return null;
+            }
+        }
+
+        private Point? TryGetWindowCenter(IWindow? window)
+        {
+            try
+            {
+                return window?.Position.Center;
+            }
+            catch (InvalidWindowReferenceException ex)
+            {
+                m_logger.Debug(
+                    ex,
+                    "The focused window became invalid while selecting the active display");
+                return null;
+            }
+        }
+
+        private ITilingService GetPrimaryTilingService()
         {
             lock (m_syncRoot)
             {
@@ -254,14 +591,105 @@ namespace FancyWM
 
         private void OnTilingFailed(object? sender, TilingFailedEventArgs e)
         {
+            lock (m_syncRoot)
+            {
+                if (m_disposed)
+                {
+                    return;
+                }
+            }
             PlacementFailed?.Invoke(this, e);
+        }
+
+        private void OnAlgorithmicLayoutChanged(
+            object? sender,
+            AlgorithmicLayoutEvent e)
+        {
+            lock (m_syncRoot)
+            {
+                if (m_disposed)
+                {
+                    return;
+                }
+            }
+            foreach (var subscriber in AlgorithmicLayoutChanged?
+                .GetInvocationList() ?? [])
+            {
+                try
+                {
+                    ((EventHandler<AlgorithmicLayoutEvent>)subscriber)(this, e);
+                }
+                catch (Exception ex)
+                {
+                    m_logger.Error(
+                        ex,
+                        "Algorithmic layout event subscriber failed; kind={EventKind}, correlation={CorrelationId}",
+                        e.Kind,
+                        e.CorrelationId);
+                }
+            }
         }
 
         public void Dispose()
         {
+            List<ITilingService> tilingServices;
+            IWindow? observedFocusedWindow;
             lock (m_syncRoot)
             {
-                m_subscriptions.Dispose();
+                if (m_disposed)
+                {
+                    return;
+                }
+                m_disposed = true;
+                tilingServices = [.. m_tilingServices.Values];
+                m_tilingServices.Clear();
+                observedFocusedWindow = m_observedFocusedWindow;
+                m_observedFocusedWindow = null;
+            }
+
+            Workspace.DisplayManager.Added -= OnDisplayAdded;
+            Workspace.DisplayManager.Removed -= OnDisplayRemoved;
+            Workspace.FocusedWindowChanged -= OnFocusedWindowChanged;
+
+            if (observedFocusedWindow != null)
+            {
+                observedFocusedWindow.PositionChanged -= OnWindowPositionChanged;
+            }
+
+            foreach (var tiling in tilingServices)
+            {
+                DisposeTilingService(tiling);
+            }
+
+            m_focusedWindowLocationChanges.OnCompleted();
+            m_subscriptions.Dispose();
+            m_focusedWindowLocationChanges.Dispose();
+
+            PlacementFailed = null;
+            AlgorithmicLayoutChanged = null;
+            PendingIntentChanged = null;
+        }
+
+        private void DisposeTilingService(ITilingService tiling)
+        {
+            tiling.PlacementFailed -= OnTilingFailed;
+            tiling.AlgorithmicLayoutChanged -= OnAlgorithmicLayoutChanged;
+            tiling.PendingIntentChanged -= OnPendingIntentChanged;
+            try
+            {
+                tiling.Stop();
+            }
+            catch (Exception ex)
+            {
+                m_logger.Error(ex, "Stopping a display tiling service during disposal failed");
+            }
+            try
+            {
+                tiling.Dispose();
+            }
+            catch (Exception ex)
+            {
+                m_logger.Error(ex, "Disposing a display tiling service failed");
             }
         }
 
@@ -273,24 +701,28 @@ namespace FancyWM
         public bool DiscoverWindows()
         {
             bool anyChanges = false;
+            ITilingService[] tilingServices;
             lock (m_syncRoot)
             {
-                foreach (var tiling in m_tilingServices.Values)
-                {
-                    anyChanges = anyChanges || tiling.DiscoverWindows();
-                }
+                tilingServices = [.. m_tilingServices.Values];
+            }
+            foreach (var tiling in tilingServices)
+            {
+                anyChanges = anyChanges || tiling.DiscoverWindows();
             }
             return anyChanges;
         }
 
         public void Refresh()
         {
+            ITilingService[] tilingServices;
             lock (m_syncRoot)
             {
-                foreach (var tiling in m_tilingServices.Values)
-                {
-                    tiling.Refresh();
-                }
+                tilingServices = [.. m_tilingServices.Values];
+            }
+            foreach (var tiling in tilingServices)
+            {
+                tiling.Refresh();
             }
         }
 
@@ -308,7 +740,7 @@ namespace FancyWM
                 return;
             }
 
-            var closest = m_tilingServices.Values
+            var closest = SnapshotTilingServices()
                 .Where(x => x != tiling)
                 .OrderBy(x => SqrDistanceInDirection(tiling.GetBounds().Center, x.GetBounds().Center, direction))
                 .FirstOrDefault();
@@ -347,23 +779,27 @@ namespace FancyWM
 
         public void Stop()
         {
+            ITilingService[] tilingServices;
             lock (m_syncRoot)
             {
-                foreach (var tiling in m_tilingServices.Values)
-                {
-                    tiling.Stop();
-                }
+                tilingServices = [.. m_tilingServices.Values];
+            }
+            foreach (var tiling in tilingServices)
+            {
+                tiling.Stop();
             }
         }
 
         public void Start()
         {
+            ITilingService[] tilingServices;
             lock (m_syncRoot)
             {
-                foreach (var tiling in m_tilingServices.Values)
-                {
-                    tiling.Start();
-                }
+                tilingServices = [.. m_tilingServices.Values];
+            }
+            foreach (var tiling in tilingServices)
+            {
+                tiling.Start();
             }
         }
 
@@ -390,7 +826,7 @@ namespace FancyWM
             }
 
             var tiling = GetActiveTilingService();
-            var closest = m_tilingServices.Values
+            var closest = SnapshotTilingServices()
                 .OrderBy(x => SqrDistanceInDirection(tiling.GetBounds().Center, x.GetBounds().Center, direction))
                 .FirstOrDefault();
             if (closest == null)
@@ -414,7 +850,15 @@ namespace FancyWM
 
         public bool CanSwapFocus(TilingDirection direction)
         {
-            return GetActiveTilingService().CanMoveFocus(direction);
+            return GetActiveTilingService().CanSwapFocus(direction);
+        }
+
+        private ITilingService[] SnapshotTilingServices()
+        {
+            lock (m_syncRoot)
+            {
+                return [.. m_tilingServices.Values];
+            }
         }
 
         public bool CanMoveWindow(TilingDirection direction)
@@ -435,6 +879,66 @@ namespace FancyWM
         public void Resize(PanelOrientation orientation, double displayPercentage)
         {
             GetActiveTilingService().Resize(orientation, displayPercentage);
+        }
+
+        public bool CanToggleMasterSatelliteLayout()
+        {
+            return GetActiveTilingService().CanToggleMasterSatelliteLayout();
+        }
+
+        public void ToggleMasterSatelliteLayout()
+        {
+            GetActiveTilingService().ToggleMasterSatelliteLayout();
+        }
+
+        public bool CanPromoteFocusedWindowToMaster()
+        {
+            return GetActiveTilingService().CanPromoteFocusedWindowToMaster();
+        }
+
+        public void PromoteFocusedWindowToMaster()
+        {
+            GetActiveTilingService().PromoteFocusedWindowToMaster();
+        }
+
+        public bool CanSwapMasterSide()
+        {
+            return GetActiveTilingService().CanSwapMasterSide();
+        }
+
+        public void SwapMasterSide()
+        {
+            GetActiveTilingService().SwapMasterSide();
+        }
+
+        public bool CanToggleSatelliteOrientation()
+        {
+            return GetActiveTilingService().CanToggleSatelliteOrientation();
+        }
+
+        public void ToggleSatelliteOrientation()
+        {
+            GetActiveTilingService().ToggleSatelliteOrientation();
+        }
+
+        public bool CanResetMasterRatio()
+        {
+            return GetActiveTilingService().CanResetMasterRatio();
+        }
+
+        public void ResetMasterRatio()
+        {
+            GetActiveTilingService().ResetMasterRatio();
+        }
+
+        public bool CanRebalanceMasterSatelliteLayout()
+        {
+            return GetActiveTilingService().CanRebalanceMasterSatelliteLayout();
+        }
+
+        public void RebalanceMasterSatelliteLayout()
+        {
+            GetActiveTilingService().RebalanceMasterSatelliteLayout();
         }
 
         public void ToggleDesktop()

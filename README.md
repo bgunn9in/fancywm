@@ -33,6 +33,10 @@ FancyWM organizes windows into three panel types:
 
 These panels can be **nested arbitrarily** - a horizontal panel containing vertical sub-panels, with stack panels embedded inside them. Build custom layouts by combining primitives, not by editing configuration files.
 
+### Master + Satellites (opt-in)
+
+The optional **Master + Satellites** layout keeps one configurable master beside an ordered vertical or horizontal satellite group. Capacity is bounded, and overflow can remain floating, move safely to an existing virtual desktop, or create one within a configured limit. Layout state is independent per virtual desktop and display, uses the real monitor work area, and leaves FancyWM's standard panel behavior unchanged when disabled. See [the layout guide](docs/master-satellite-layout.md) for settings, commands, and current verification notes.
+
 ### No Configuration Needed
 
 Forget predefined layout templates and complex configuration. FancyWM creates layouts as you work. The available keybingins are shown after you press **[⇧ Shift] + [⊞ Win]**.

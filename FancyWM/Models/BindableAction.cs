@@ -33,6 +33,20 @@ namespace FancyWM.Models
         [DefaultKeybinding(KeyCode.S)]
         CreateStackPanel,
 
+        // Group: Master + Satellites
+        [DefaultKeybinding(KeyCode.A)]
+        ToggleMasterSatelliteLayout,
+        [DefaultKeybinding(KeyCode.M)]
+        PromoteFocusedWindowToMaster,
+        [DefaultKeybinding(KeyCode.B)]
+        SwapMasterSide,
+        [DefaultKeybinding()]
+        ToggleSatelliteOrientation,
+        [DefaultKeybinding()]
+        ResetMasterRatio,
+        [DefaultKeybinding()]
+        RebalanceMasterSatelliteLayout,
+
         // Group: Windows
         [DefaultKeybinding(KeyCode.Enter)]
         PullWindowUp,

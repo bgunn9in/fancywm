@@ -42,11 +42,17 @@ namespace FancyWM.Models
                 var members = typeof(BindableAction).GetFields(BindingFlags.Static | BindingFlags.Public);
                 foreach (var member in members)
                 {
+                    var action = (BindableAction)member.GetValue(null)!;
                     var keys = member.GetCustomAttribute<DefaultKeybindingAttribute>()!.Keys.ToHashSet();
+                    if (keys.Count == 0)
+                    {
+                        Add(action, null);
+                        continue;
+                    }
                     if (keybindingSet.Add(keys))
                     {
                         var keybinding = new Keybinding(keys, false);
-                        Add((BindableAction)member.GetValue(null)!, keybinding);
+                        Add(action, keybinding);
                     }
                 }
             }

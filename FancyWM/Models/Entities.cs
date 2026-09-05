@@ -169,7 +169,7 @@ namespace FancyWM.Models
 
         protected override async Task<T> ReadAsync(Stream stream)
         {
-            var result = await JsonSerializer.DeserializeAsync<T>(stream, Options) ?? throw new InvalidOperationException("Deserialized value is null.");
+            var result = await JsonSerializer.DeserializeAsync<T>(stream, Options) ?? throw new JsonException("Deserialized value is null.");
             return result;
         }
 
@@ -192,7 +192,7 @@ namespace FancyWM.Models
 
         protected override async Task<T> ReadAsync(Stream stream)
         {
-            var result = await JsonSerializer.DeserializeAsync<T>(stream, m_readOptions) ?? throw new InvalidOperationException("Deserialized value is null.");
+            var result = await JsonSerializer.DeserializeAsync<T>(stream, m_readOptions) ?? throw new JsonException("Deserialized value is null.");
             return result;
         }
 

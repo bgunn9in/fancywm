@@ -17,6 +17,11 @@ namespace FancyWM.Layouts.Tiling
 
         public PanelOrientation Orientation { get; set; }
 
+        /// <summary>
+        /// The length available to the flex container on the current layout axis.
+        /// </summary>
+        public double ContainerLength => m_constraints.ContainerWidth;
+
         private List<TilingNode> m_children = [];
 
         private Flex m_constraints;
@@ -25,6 +30,64 @@ namespace FancyWM.Layouts.Tiling
         {
             m_constraints = new Flex();
             m_constraints.SetContainerWidth(1);
+        }
+
+        /// <summary>
+        /// Changes the layout axis and clears flex constraints from the previous axis.
+        /// </summary>
+        /// <returns><see langword="true"/> when the orientation changed.</returns>
+        public bool ChangeOrientation(PanelOrientation orientation)
+        {
+            if (!Enum.IsDefined(orientation))
+            {
+                throw new ArgumentOutOfRangeException(nameof(orientation));
+            }
+
+            if (Orientation == orientation)
+            {
+                return false;
+            }
+
+            Orientation = orientation;
+            ResetConstraints();
+            return true;
+        }
+
+        /// <summary>
+        /// Clears all child flex allocations while preserving the current children.
+        /// The next arrange initializes constraints for the current layout axis.
+        /// </summary>
+        public void ResetConstraints()
+        {
+            var constraints = new Flex();
+            constraints.SetContainerWidth(m_constraints.ContainerWidth);
+            foreach (var _ in m_children)
+            {
+                constraints.InsertItem(constraints.Count, 0, 0);
+            }
+            m_constraints = constraints;
+        }
+
+        /// <summary>
+        /// Gets the current flex allocation and bounds for a direct child.
+        /// </summary>
+        public FlexConstraints GetChildConstraints(TilingNode node)
+        {
+            int index = m_children.IndexOf(node);
+            if (index < 0)
+            {
+                throw new ArgumentException($"Node {node} is not a child of this panel.", nameof(node));
+            }
+            return m_constraints[index];
+        }
+
+        /// <summary>
+        /// Discards individual child allocations and distributes the current axis
+        /// as evenly as the measured child constraints allow.
+        /// </summary>
+        public void DistributeChildrenEvenly()
+        {
+            m_constraints.DistributeItemsEvenly();
         }
 
         protected override void AttachCore(int index, TilingNode node)

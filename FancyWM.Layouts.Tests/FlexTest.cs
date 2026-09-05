@@ -307,5 +307,40 @@ namespace FancyWM.Layouts.Tests
             Assert.AreEqual(53.4, f[0].Width, 0.1);
             Assert.AreEqual(46.5, f[1].Width, 0.1);
         }
+
+        [TestMethod]
+        public void TestDistributeItemsEvenly()
+        {
+            Flex f = new();
+            f.SetContainerWidth(100);
+            f.InsertItem(0, minWidth: 0, maxWidth: 100);
+            f.InsertItem(0, minWidth: 0, maxWidth: 100);
+            f.InsertItem(0, minWidth: 0, maxWidth: 100);
+            f.ResizeItem(0, 70);
+
+            f.DistributeItemsEvenly();
+
+            Assert.AreEqual(33.3, f[0].Width, 0.1);
+            Assert.AreEqual(33.3, f[1].Width, 0.1);
+            Assert.AreEqual(33.3, f[2].Width, 0.1);
+            Assert.AreEqual(100, f.UsedWidth, 0.1);
+        }
+
+        [TestMethod]
+        public void TestDistributeItemsEvenlyRespectsMinAndMax()
+        {
+            Flex f = new();
+            f.SetContainerWidth(100);
+            f.InsertItem(0, minWidth: 60, maxWidth: 100);
+            f.InsertItem(1, minWidth: 0, maxWidth: 15);
+            f.InsertItem(2, minWidth: 0, maxWidth: 100);
+
+            f.DistributeItemsEvenly();
+
+            Assert.AreEqual(60, f[0].Width, 0.1);
+            Assert.AreEqual(15, f[1].Width, 0.1);
+            Assert.AreEqual(25, f[2].Width, 0.1);
+            Assert.AreEqual(100, f.UsedWidth, 0.1);
+        }
     }
 }

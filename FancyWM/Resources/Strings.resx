@@ -973,4 +973,91 @@ If you are running a supported non-Insider Windows build and you see this messag
   <data name="Messages.NewerVersionAvailable" xml:space="preserve">
     <value>A newer version is available</value>
   </data>
+  <data name="TilingError.UnsupportedInAlgorithmicLayout" xml:space="preserve">
+    <value>This operation is not supported while Master + Satellites is active.</value>
+  </data>
+  <data name="Keybindings.MasterSatellite" xml:space="preserve">
+    <value>Master + Satellites</value>
+  </data>
+  <data name="Keybinding.ToggleMasterSatelliteLayout.Caption" xml:space="preserve">
+    <value>Toggle Master + Satellites</value>
+  </data>
+  <data name="Keybinding.ToggleMasterSatelliteLayout.Description" xml:space="preserve">
+    <value>Enable or disable the Master + Satellites layout on the current desktop and display</value>
+  </data>
+  <data name="Keybinding.PromoteFocusedWindowToMaster.Caption" xml:space="preserve">
+    <value>Promote focused window to master</value>
+  </data>
+  <data name="Keybinding.PromoteFocusedWindowToMaster.Description" xml:space="preserve">
+    <value>Make the focused satellite the master and move the old master into its exact slot</value>
+  </data>
+  <data name="Keybinding.SwapMasterSide.Caption" xml:space="preserve">
+    <value>Swap master side</value>
+  </data>
+  <data name="Keybinding.SwapMasterSide.Description" xml:space="preserve">
+    <value>Move the master between the left and right sides without changing its requested ratio</value>
+  </data>
+  <data name="Keybinding.ToggleSatelliteOrientation.Caption" xml:space="preserve">
+    <value>Toggle satellite orientation</value>
+  </data>
+  <data name="Keybinding.ToggleSatelliteOrientation.Description" xml:space="preserve">
+    <value>Switch the satellite panel between vertical and horizontal orientation</value>
+  </data>
+  <data name="Keybinding.ResetMasterRatio.Caption" xml:space="preserve">
+    <value>Reset master ratio</value>
+  </data>
+  <data name="Keybinding.ResetMasterRatio.Description" xml:space="preserve">
+    <value>Reset the requested master width ratio to 60 percent</value>
+  </data>
+  <data name="Keybinding.RebalanceMasterSatelliteLayout.Caption" xml:space="preserve">
+    <value>Rebalance Master + Satellites</value>
+  </data>
+  <data name="Keybinding.RebalanceMasterSatelliteLayout.Description" xml:space="preserve">
+    <value>Restore the canonical tree and evenly distribute satellites while preserving roles and order</value>
+  </data>
+  <data name="AlgorithmicLayout.LayoutEnabled" xml:space="preserve">
+    <value>Master + Satellites enabled</value>
+  </data>
+  <data name="AlgorithmicLayout.LayoutDisabled" xml:space="preserve">
+    <value>Master + Satellites disabled</value>
+  </data>
+  <data name="AlgorithmicLayout.WindowMovedToDesktop" xml:space="preserve">
+    <value>"{0}" moved to {1}.</value>
+  </data>
+  <data name="AlgorithmicLayout.WindowLeftFloating" xml:space="preserve">
+    <value>{0} left floating</value>
+  </data>
+  <data name="AlgorithmicLayout.OperationRejected" xml:space="preserve">
+    <value>Master + Satellites operation rejected</value>
+  </data>
+  <data name="AlgorithmicLayout.OrientationRejected" xml:space="preserve">
+    <value>The current windows cannot fit in the selected satellite orientation. The current layout kept its previous orientation; the default was saved for new and empty layouts.</value>
+  </data>
+  <data name="AlgorithmicLayout.LayoutRecovered" xml:space="preserve">
+    <value>Master + Satellites layout recovered</value>
+  </data>
+  <data name="AlgorithmicLayout.TransferFailed" xml:space="preserve">
+    <value>Master + Satellites transfer failed</value>
+  </data>
+  <data name="AlgorithmicLayout.TransferCancelled" xml:space="preserve">
+    <value>Master + Satellites transfer cancelled</value>
+  </data>
+  <data name="AlgorithmicLayout.CapacityHint" xml:space="preserve">
+    <value>Source capacity: {0}/{1}.</value>
+  </data>
+  <data name="AlgorithmicLayout.CapacityReachedHint" xml:space="preserve">
+    <value>{0} reached its {1}-window limit.</value>
+  </data>
+  <data name="AlgorithmicLayout.CapacityPerDesktopHint" xml:space="preserve">
+    <value>Capacity: {0} windows per desktop.</value>
+  </data>
+  <data name="AlgorithmicLayout.NoCapacityHint" xml:space="preserve">
+    <value>Master + Satellites is full on all available desktops.</value>
+  </data>
+  <data name="AlgorithmicLayout.DesktopIndex" xml:space="preserve">
+    <value>Desktop {0}</value>
+  </data>
+  <data name="AlgorithmicLayout.UnknownDesktop" xml:space="preserve">
+    <value>another desktop</value>
+  </data>
 </root>

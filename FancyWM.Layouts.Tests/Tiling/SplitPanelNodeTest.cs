@@ -169,5 +169,107 @@ namespace FancyWM.Layouts.Tests.Tiling
                 desktop.Arrange();
             });
         }
+
+        [TestMethod]
+        public void TestChangeOrientationResetsConstraints()
+        {
+            var panel = new SplitPanelNode { Orientation = PanelOrientation.Horizontal };
+            var desktop = new DesktopTree
+            {
+                Root = panel,
+                WorkArea = Rectangle.OffsetAndSize(0, 0, 1000, 600),
+            };
+            var first = new WindowNode(WindowMockFactory.CreateNotepadWindow());
+            var second = new WindowNode(WindowMockFactory.CreateNotepadWindow());
+            panel.Attach(first);
+            panel.Attach(second);
+            desktop.Measure();
+            desktop.Arrange();
+            Assert.IsTrue(panel.ResizeTo(first, 700, GrowDirection.Both));
+
+            Assert.IsTrue(panel.ChangeOrientation(PanelOrientation.Vertical));
+            Assert.AreEqual(0, panel.GetChildConstraints(first).MaxWidth, 0.01);
+            Assert.AreEqual(0, panel.GetChildConstraints(second).MaxWidth, 0.01);
+
+            desktop.Measure();
+            desktop.Arrange();
+
+            Assert.AreEqual(600, panel.ContainerLength, 0.01);
+            Assert.AreEqual(300, panel.GetChildConstraints(first).Width, 0.01);
+            Assert.AreEqual(300, panel.GetChildConstraints(second).Width, 0.01);
+        }
+
+        [TestMethod]
+        public void TestChangeOrientationToCurrentValuePreservesConstraints()
+        {
+            var panel = new SplitPanelNode { Orientation = PanelOrientation.Horizontal };
+            var desktop = new DesktopTree
+            {
+                Root = panel,
+                WorkArea = Rectangle.OffsetAndSize(0, 0, 1000, 600),
+            };
+            var first = new WindowNode(WindowMockFactory.CreateNotepadWindow());
+            var second = new WindowNode(WindowMockFactory.CreateNotepadWindow());
+            panel.Attach(first);
+            panel.Attach(second);
+            desktop.Measure();
+            desktop.Arrange();
+            Assert.IsTrue(panel.ResizeTo(first, 700, GrowDirection.Both));
+            var firstWidth = panel.GetChildConstraints(first).Width;
+            var secondWidth = panel.GetChildConstraints(second).Width;
+
+            Assert.IsFalse(panel.ChangeOrientation(PanelOrientation.Horizontal));
+
+            Assert.AreEqual(firstWidth, panel.GetChildConstraints(first).Width, 0.01);
+            Assert.AreEqual(secondWidth, panel.GetChildConstraints(second).Width, 0.01);
+        }
+
+        [TestMethod]
+        public void TestMoveCarriesChildConstraints()
+        {
+            var panel = new SplitPanelNode { Orientation = PanelOrientation.Horizontal };
+            var desktop = new DesktopTree
+            {
+                Root = panel,
+                WorkArea = Rectangle.OffsetAndSize(0, 0, 1000, 600),
+            };
+            var first = new WindowNode(WindowMockFactory.CreateNotepadWindow());
+            var second = new WindowNode(WindowMockFactory.CreateNotepadWindow());
+            panel.Attach(first);
+            panel.Attach(second);
+            desktop.Measure();
+            desktop.Arrange();
+            Assert.IsTrue(panel.ResizeTo(first, 700, GrowDirection.Both));
+            var firstWidth = panel.GetChildConstraints(first).Width;
+            var secondWidth = panel.GetChildConstraints(second).Width;
+
+            panel.Move(0, 1);
+
+            Assert.AreSame(second, panel.Children[0]);
+            Assert.AreSame(first, panel.Children[1]);
+            Assert.AreEqual(secondWidth, panel.GetChildConstraints(second).Width, 0.01);
+            Assert.AreEqual(firstWidth, panel.GetChildConstraints(first).Width, 0.01);
+        }
+
+        [TestMethod]
+        public void TestContainerLengthAccountsForRootSpacing()
+        {
+            var panel = new SplitPanelNode
+            {
+                Orientation = PanelOrientation.Horizontal,
+                Spacing = 10,
+            };
+            var desktop = new DesktopTree
+            {
+                Root = panel,
+                WorkArea = Rectangle.OffsetAndSize(0, 0, 1000, 600),
+            };
+            panel.Attach(new WindowNode(WindowMockFactory.CreateNotepadWindow()));
+
+            desktop.Measure();
+            desktop.Arrange();
+
+            Assert.AreEqual(990, panel.ContainerLength, 0.01);
+        }
     }
 }

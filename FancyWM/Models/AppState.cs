@@ -8,26 +8,35 @@ namespace FancyWM.Models
     {
         public IObservableFileEntity<Settings> Settings { get; }
 
-        public AppState()
+        public AppState() : this(Path.GetFullPath("settings.json"))
         {
-            Settings = new ObservableJsonEntityWithCommentPreservation<Settings>(Path.GetFullPath("settings.json"),
+        }
+
+        internal AppState(string settingsPath)
+        {
+            Settings = new ObservableJsonEntityWithCommentPreservation<Settings>(settingsPath,
                 () => new Settings
                 {
                     AutoCollapsePanels = true,
                 },
-                new JsonSerializerOptions
+                CreateSettingsJsonSerializerOptions());
+        }
+
+        internal static JsonSerializerOptions CreateSettingsJsonSerializerOptions()
+        {
+            return new JsonSerializerOptions
+            {
+                AllowTrailingCommas = true,
+                WriteIndented = true,
+                PropertyNamingPolicy = null,
+                PropertyNameCaseInsensitive = true,
+                ReadCommentHandling = JsonCommentHandling.Skip,
+                Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+                Converters =
                 {
-                    AllowTrailingCommas = true,
-                    WriteIndented = true,
-                    PropertyNamingPolicy = null,
-                    PropertyNameCaseInsensitive = true,
-                    ReadCommentHandling = JsonCommentHandling.Skip,
-                    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-                    Converters =
-                    {
-                        new JsonStringEnumConverter(JsonNamingPolicy.CamelCase)
-                    }
-                });
+                    new JsonStringEnumConverter(JsonNamingPolicy.CamelCase)
+                }
+            };
         }
     }
 }

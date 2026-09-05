@@ -59,6 +59,22 @@ namespace FancyWM.Tests
         }
 
         [TestMethod]
+        public void TestAddWindowToExplicitBackgroundDesktop()
+        {
+            var workspace = new TilingWorkspace();
+            var current = m_desktopFactory.CreateVirtualDesktop();
+            var background = m_desktopFactory.CreateVirtualDesktop();
+            workspace.RegisterDesktop(current, m_workarea, PanelOrientation.Horizontal);
+            workspace.RegisterDesktop(background, m_workarea, PanelOrientation.Horizontal);
+            var window = m_windowFactory.CreateExplorerWindow();
+
+            var node = workspace.RegisterWindow(window, background);
+
+            Assert.AreSame(node, workspace.GetTree(background)!.FindNode(window));
+            Assert.IsNull(workspace.GetTree(current)!.FindNode(window));
+        }
+
+        [TestMethod]
         public void TestRemoveMissingWindow()
         {
             var workspace = new TilingWorkspace();

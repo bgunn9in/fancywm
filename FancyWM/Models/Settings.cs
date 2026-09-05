@@ -18,6 +18,7 @@ namespace FancyWM.Models
         bool AutoCollapsePanels { get; }
         bool DelayReposition { get; }
         bool AutoFloatNewWindows { get; }
+        MasterSatelliteLayoutSettings MasterSatelliteLayout { get; }
     }
 
     [AttributeUsage(AttributeTargets.Field)]
@@ -28,6 +29,8 @@ namespace FancyWM.Models
 
     public record class Settings : IEquatable<Settings>, ITilingServiceSettings
     {
+        private MasterSatelliteLayoutSettings m_masterSatelliteLayout = new();
+
         public Settings()
         {
 
@@ -50,6 +53,12 @@ namespace FancyWM.Models
 
         public bool DelayReposition { get; init; } = true;
         public bool AutoFloatNewWindows { get; init; } = false;
+
+        public MasterSatelliteLayoutSettings MasterSatelliteLayout
+        {
+            get => m_masterSatelliteLayout;
+            init => m_masterSatelliteLayout = value ?? new();
+        }
 
         public bool AnimateWindowMovement { get; init; } = true;
 

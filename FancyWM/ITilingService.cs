@@ -2,20 +2,43 @@
 
 using WinMan;
 using FancyWM.Layouts.Tiling;
+using FancyWM.AlgorithmicLayouts;
 using FancyWM.Utilities;
 using System.Collections.Generic;
 
 namespace FancyWM
 {
-    internal class TilingFailedEventArgs(TilingError reason, IWindow? window = null) : EventArgs
+    internal class TilingFailedEventArgs(
+        TilingError reason,
+        IWindow? window = null,
+        string? presentationSafeHint = null) : EventArgs
     {
         public TilingError FailReason { get; } = reason;
         public IWindow? FailSource { get; } = window;
+        public string? PresentationSafeHint { get; } = presentationSafeHint;
+        public bool RequestsFailureSound =>
+            PresentationSafeHint != null
+            || FailReason != TilingError.TargetCannotFit;
+
+        public static TilingFailedEventArgs FromException(
+            TilingFailedException exception,
+            IWindow? window = null)
+        {
+            ArgumentNullException.ThrowIfNull(exception);
+            return new TilingFailedEventArgs(
+                exception.FailReason,
+                window,
+                exception is AlgorithmicLayoutCommandException algorithmic
+                    ? algorithmic.UserHint
+                    : null);
+        }
     }
 
     internal interface ITilingService : IDisposable
     {
         event EventHandler<TilingFailedEventArgs> PlacementFailed;
+
+        event EventHandler<AlgorithmicLayoutEvent> AlgorithmicLayoutChanged;
 
         event EventHandler<EventArgs> PendingIntentChanged;
 
@@ -48,6 +71,18 @@ namespace FancyWM
         void MoveWindow(TilingDirection direction);
         bool CanResize(PanelOrientation orientation, double displayPercentage);
         void Resize(PanelOrientation orientation, double displayPercentage);
+        bool CanToggleMasterSatelliteLayout();
+        void ToggleMasterSatelliteLayout();
+        bool CanPromoteFocusedWindowToMaster();
+        void PromoteFocusedWindowToMaster();
+        bool CanSwapMasterSide();
+        void SwapMasterSide();
+        bool CanToggleSatelliteOrientation();
+        void ToggleSatelliteOrientation();
+        bool CanResetMasterRatio();
+        void ResetMasterRatio();
+        bool CanRebalanceMasterSatelliteLayout();
+        void RebalanceMasterSatelliteLayout();
 
         void Stop();
         void Start();

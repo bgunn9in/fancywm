@@ -54,6 +54,14 @@
                                 </StackPanel>
                             </viewmodels:PageItem.Header>
                         </viewmodels:PageItem>
+                        <viewmodels:PageItem Page="{x:Type pages:LayoutsPage}">
+                            <viewmodels:PageItem.Header>
+                                <StackPanel Orientation="Horizontal">
+                                    <ui:FontIcon FontFamily="Segoe MDL2 Assets" Glyph="&#xE81E;" />
+                                    <TextBlock Margin="10" Text="Layouts" />
+                                </StackPanel>
+                            </viewmodels:PageItem.Header>
+                        </viewmodels:PageItem>
                         <viewmodels:PageItem Page="{x:Type pages:KeybindingsPage}">
                             <viewmodels:PageItem.Header>
                                 <StackPanel Orientation="Horizontal">

@@ -24,6 +24,13 @@ namespace FancyWM.Controls
             BindableAction.CreateStackPanel,
             BindableAction.PullWindowUp,
 
+            BindableAction.ToggleMasterSatelliteLayout,
+            BindableAction.PromoteFocusedWindowToMaster,
+            BindableAction.SwapMasterSide,
+            BindableAction.ToggleSatelliteOrientation,
+            BindableAction.ResetMasterRatio,
+            BindableAction.RebalanceMasterSatelliteLayout,
+
             BindableAction.MoveFocusLeft,
             BindableAction.MoveFocusUp,
             BindableAction.MoveFocusRight,

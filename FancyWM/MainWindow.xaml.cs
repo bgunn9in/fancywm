@@ -36,6 +36,7 @@ using System.Data;
 using System.Windows.Threading;
 using SystemParameters = FancyWM.Utilities.SystemParameters;
 using System.IO;
+using FancyWM.AlgorithmicLayouts;
 
 namespace FancyWM
 {
@@ -45,6 +46,7 @@ namespace FancyWM
     public partial class MainWindow : Window, IDisposable
     {
         private readonly Win32Workspace m_workspace;
+        private readonly AlgorithmicLayoutCoordinator m_algorithmicLayoutCoordinator;
         private ITilingService m_tiling;
         private readonly CompositeDisposable m_subscriptions;
         private readonly UnmanagedResourceGuard? m_unmanagedResourceGuard;
@@ -106,6 +108,10 @@ namespace FancyWM
             m_workspace.UnhandledException += OnWorkspaceUnhandledException;
 
             m_workspace.Open();
+
+            m_algorithmicLayoutCoordinator = new AlgorithmicLayoutCoordinator(
+                m_workspace,
+                Dispatcher);
 
             m_toasts = new ToastService(m_workspace);
 
@@ -181,14 +187,25 @@ namespace FancyWM
                 {
                     if (multiMonitorSupport)
                     {
-                        m_tiling = new MultiDisplayTilingService(m_workspace, m_animationThread, settings);
+                        m_tiling = new MultiDisplayTilingService(
+                            m_workspace,
+                            m_animationThread,
+                            settings,
+                            m_algorithmicLayoutCoordinator);
                     }
                     else
                     {
-                        m_tiling = new TilingService(m_workspace, m_workspace.DisplayManager.PrimaryDisplay, m_animationThread, settings, true);
+                        m_tiling = new TilingService(
+                            m_workspace,
+                            m_workspace.DisplayManager.PrimaryDisplay,
+                            m_animationThread,
+                            settings,
+                            m_algorithmicLayoutCoordinator,
+                            true);
                     }
 
                     m_tiling.PlacementFailed += OnTilingFailed;
+                    m_tiling.AlgorithmicLayoutChanged += OnAlgorithmicLayoutChanged;
                     m_tiling.Start();
                 }))
                 .Select(_ => Unit.Default);
@@ -563,31 +580,147 @@ namespace FancyWM
             }
         }
 
-        private void OnTilingFailed(object? sender, TilingFailedEventArgs e)
+        private async void OnTilingFailed(object? sender, TilingFailedEventArgs e)
         {
-            if (e.FailReason == TilingError.NoValidPlacementExists)
+            try
             {
-                if (e.FailSource == null)
+                if (e.FailReason == TilingError.NoValidPlacementExists)
                 {
-                    throw new ArgumentException($"{nameof(e.FailSource)} is required for {nameof(e.FailReason)}!");
+                    if (e.FailSource == null)
+                    {
+                        throw new ArgumentException($"{nameof(e.FailSource)} is required for {nameof(e.FailReason)}!");
+                    }
+
+                    PlayBeepSound();
+                    await ShowToastAsync(
+                        $"{Strings.Messages_FloatingModeEnabledFor} {e.FailSource.Title}",
+                        Strings.Messages_CannotBeResizedToFit,
+                        ToastDurationLong);
                 }
+                else
+                {
+                    var reason = GetTilingErrorText(e.FailReason) ?? Strings.Messages_OperationFailed;
+                    var hint = !string.IsNullOrWhiteSpace(e.PresentationSafeHint)
+                        ? e.PresentationSafeHint
+                        : e.FailSource != null
+                            ? e.FailSource.GetCachedProcessName() + " " + Strings.Common_Window
+                            : null;
 
-                PlayBeepSound();
-                _ = ShowToastAsync($"{Strings.Messages_FloatingModeEnabledFor} {e.FailSource.Title}", Strings.Messages_CannotBeResizedToFit, ToastDurationLong);
+                    if (e.RequestsFailureSound)
+                    {
+                        PlayBeepSound();
+                    }
+                    await ShowToastAsync(reason, hint, ToastDurationLong);
+                }
             }
-            else
+            catch (Exception exception)
             {
-                var reason = GetTilingErrorText(e.FailReason) ?? Strings.Messages_OperationFailed;
-                var hint = e.FailSource != null
-                    ? e.FailSource.GetCachedProcessName() + " " + Strings.Common_Window
-                    : null;
+                m_logger.Error(
+                    exception,
+                    "Failed to present tiling failure {FailureReason}",
+                    e.FailReason);
+            }
+        }
 
-                if (e.FailReason != TilingError.TargetCannotFit)
+        private async void OnAlgorithmicLayoutChanged(
+            object? sender,
+            AlgorithmicLayoutEvent e)
+        {
+            try
+            {
+                var notification = AlgorithmicLayoutNotificationFormatter.Format(
+                    e,
+                    Strings.Common_Window,
+                    GetAlgorithmicDesktopLabel);
+                if (!notification.ShouldShow)
+                {
+                    return;
+                }
+                if (AlgorithmicLayoutNotificationFormatter.ShouldPlayFailureSound(
+                    notification,
+                    m_soundOnFailure))
                 {
                     PlayBeepSound();
                 }
-                _ = ShowToastAsync(reason, hint, ToastDurationLong);
+                await ShowToastAsync(
+                    notification.Message!,
+                    notification.Hint,
+                    ToastDurationLong);
             }
+            catch (Exception exception)
+            {
+                m_logger.Error(
+                    exception,
+                    "Failed to present Master + Satellites event {EventKind}; correlation={CorrelationId}",
+                    e.Kind,
+                    e.CorrelationId);
+            }
+        }
+
+        private string GetAlgorithmicDesktopLabel(IVirtualDesktop? desktop)
+        {
+            if (desktop == null)
+            {
+                return GetAlgorithmicLayoutString(
+                    "AlgorithmicLayout.UnknownDesktop",
+                    "another desktop");
+            }
+
+            string? name = null;
+            try
+            {
+                var candidateName = desktop.Name;
+                if (!string.IsNullOrWhiteSpace(candidateName))
+                {
+                    name = candidateName;
+                }
+            }
+            catch (Exception exception)
+            {
+                m_logger.Debug(
+                    exception,
+                    "Could not read the virtual desktop name for a Master + Satellites notification");
+            }
+
+            int index;
+            try
+            {
+                index = m_workspace.VirtualDesktopManager.Desktops
+                    .ToList()
+                    .FindIndex(candidate => ReferenceEquals(candidate, desktop)
+                        || EqualityComparer<IVirtualDesktop>.Default.Equals(
+                            candidate,
+                            desktop));
+            }
+            catch (Exception exception)
+            {
+                m_logger.Debug(
+                    exception,
+                    "Could not enumerate virtual desktops for a Master + Satellites notification");
+                index = -1;
+            }
+            if (index >= 0)
+            {
+                var indexedName = string.Format(
+                    GetAlgorithmicLayoutString(
+                        "AlgorithmicLayout.DesktopIndex",
+                        "Desktop {0}"),
+                    index + 1);
+                return string.IsNullOrWhiteSpace(name)
+                    || string.Equals(name, indexedName, StringComparison.OrdinalIgnoreCase)
+                        ? indexedName
+                        : $"{name} ({indexedName})";
+            }
+            return name ?? GetAlgorithmicLayoutString(
+                    "AlgorithmicLayout.UnknownDesktop",
+                    "another desktop");
+        }
+
+        private static string GetAlgorithmicLayoutString(
+            string key,
+            string fallback)
+        {
+            return Strings.ResourceManager.GetString(key) ?? fallback;
         }
 
         private async void OnCommandKey(IReadOnlySet<KeyCode> keys)
@@ -644,7 +777,9 @@ namespace FancyWM
             var messageText = friendlyActionName != null
                 ? Strings.Messages_CouldNot + " " + friendlyActionName + "!"
                 : Strings.Messages_OperationFailed;
-            var hintText = GetTilingErrorText(e.FailReason);
+            var hintText = e is AlgorithmicLayoutCommandException algorithmic
+                ? algorithmic.UserHint
+                : GetTilingErrorText(e.FailReason);
 
             PlayBeepSound();
             await ShowToastAsync(messageText, hintText, ToastDurationLong);
@@ -691,6 +826,30 @@ namespace FancyWM
                     friendlyActionName = "wrap in stack panel";
                     //_ = ShowInfoToastAsync("Stack Panel", ToastDurationShort);
                     m_tiling.Stack();
+                    return;
+                case BindableAction.ToggleMasterSatelliteLayout:
+                    friendlyActionName = "toggle Master + Satellites layout";
+                    m_tiling.ToggleMasterSatelliteLayout();
+                    return;
+                case BindableAction.PromoteFocusedWindowToMaster:
+                    friendlyActionName = "promote focused window to master";
+                    m_tiling.PromoteFocusedWindowToMaster();
+                    return;
+                case BindableAction.SwapMasterSide:
+                    friendlyActionName = "swap master side";
+                    m_tiling.SwapMasterSide();
+                    return;
+                case BindableAction.ToggleSatelliteOrientation:
+                    friendlyActionName = "toggle satellite orientation";
+                    m_tiling.ToggleSatelliteOrientation();
+                    return;
+                case BindableAction.ResetMasterRatio:
+                    friendlyActionName = "reset master ratio";
+                    m_tiling.ResetMasterRatio();
+                    return;
+                case BindableAction.RebalanceMasterSatelliteLayout:
+                    friendlyActionName = "rebalance Master + Satellites layout";
+                    m_tiling.RebalanceMasterSatelliteLayout();
                     return;
                 case BindableAction.RefreshWorkspace:
                     friendlyActionName = "refresh workspace";
@@ -948,6 +1107,7 @@ namespace FancyWM
                 TilingError.TargetCannotFit => Strings.TilingError_TargetCannotFit,
                 TilingError.InvalidTarget => Strings.TilingError_InvalidTarget,
                 TilingError.NestingInStackPanel => Strings.TilingError_NestingInStackPanel,
+                TilingError.UnsupportedInAlgorithmicLayout => Strings.ResourceManager.GetString("TilingError.UnsupportedInAlgorithmicLayout"),
                 _ => null,
             };
         }
@@ -1154,6 +1314,30 @@ namespace FancyWM
             if (m_tiling.CanStack())
             {
                 yield return BindableAction.CreateStackPanel;
+            }
+            if (m_tiling.CanToggleMasterSatelliteLayout())
+            {
+                yield return BindableAction.ToggleMasterSatelliteLayout;
+            }
+            if (m_tiling.CanPromoteFocusedWindowToMaster())
+            {
+                yield return BindableAction.PromoteFocusedWindowToMaster;
+            }
+            if (m_tiling.CanSwapMasterSide())
+            {
+                yield return BindableAction.SwapMasterSide;
+            }
+            if (m_tiling.CanToggleSatelliteOrientation())
+            {
+                yield return BindableAction.ToggleSatelliteOrientation;
+            }
+            if (m_tiling.CanResetMasterRatio())
+            {
+                yield return BindableAction.ResetMasterRatio;
+            }
+            if (m_tiling.CanRebalanceMasterSatelliteLayout())
+            {
+                yield return BindableAction.RebalanceMasterSatelliteLayout;
             }
             //yield return BindableAction.RefreshWorkspace;
             if (m_tiling.CanFloat())
@@ -1603,7 +1787,12 @@ namespace FancyWM
             m_dispatcherTimer?.Stop();
 
             m_logger.Debug($"Stopping the tiling window manager...");
+            if (m_tiling != null)
+            {
+                m_tiling.AlgorithmicLayoutChanged -= OnAlgorithmicLayoutChanged;
+            }
             m_tiling?.Dispose();
+            m_algorithmicLayoutCoordinator?.Dispose();
             m_logger.Debug($"Closing the workspace...");
             m_workspace?.Dispose();
             m_logger.Debug($"Closing all other subscriptions...");

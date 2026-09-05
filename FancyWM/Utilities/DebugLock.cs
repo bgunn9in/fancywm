@@ -14,6 +14,8 @@ namespace FancyWM.Utilities
         public TimeSpan MaxLockTime { get; private set; }
         public TimeSpan LastLockTime { get; private set; }
 
+        internal bool IsHeldByCurrentThread => m_lock.IsHeldByCurrentThread;
+
         public ref struct Scope
         {
             internal DebugLock? LockObj;

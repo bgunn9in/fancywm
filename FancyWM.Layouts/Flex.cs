@@ -270,6 +270,75 @@ namespace FancyWM.Layouts
             Validate();
         }
 
+        /// <summary>
+        /// Distributes the container between all items as evenly as their minimum
+        /// and maximum constraints allow. Existing individual widths are discarded.
+        /// </summary>
+        public void DistributeItemsEvenly()
+        {
+            if (m_items.Count == 0)
+            {
+                return;
+            }
+
+            InTransaction(() =>
+            {
+                if (MinWidth.Gt(ContainerWidth))
+                {
+                    throw new UnsatisfiableFlexConstraintsException(
+                        $"Container width ({ContainerWidth}) < MinWidth ({MinWidth})")
+                    {
+                        Container = this,
+                    };
+                }
+
+                var widths = new double[m_items.Count];
+                var remainingIndices = Enumerable.Range(0, m_items.Count).ToList();
+                double remainingWidth = ContainerWidth;
+
+                while (remainingIndices.Count > 0)
+                {
+                    double equalWidth = remainingWidth / remainingIndices.Count;
+                    bool constrainedItemFound = false;
+                    foreach (int index in remainingIndices.ToArray())
+                    {
+                        var item = m_items[index];
+                        double? constrainedWidth = equalWidth.Lt(item.MinWidth)
+                            ? item.MinWidth
+                            : equalWidth.Gt(item.MaxWidth)
+                                ? item.MaxWidth
+                                : null;
+                        if (!constrainedWidth.HasValue)
+                        {
+                            continue;
+                        }
+
+                        widths[index] = constrainedWidth.Value;
+                        remainingWidth -= constrainedWidth.Value;
+                        remainingIndices.Remove(index);
+                        constrainedItemFound = true;
+                    }
+
+                    if (!constrainedItemFound)
+                    {
+                        foreach (int index in remainingIndices)
+                        {
+                            widths[index] = equalWidth;
+                        }
+                        remainingIndices.Clear();
+                    }
+                }
+
+                for (int i = 0; i < m_items.Count; i++)
+                {
+                    var item = m_items[i];
+                    item.Width = widths[i];
+                    m_items[i] = item;
+                }
+            });
+            Validate();
+        }
+
         private void Validate()
         {
 #if DEBUG

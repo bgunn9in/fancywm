@@ -7,6 +7,8 @@ using System.Linq;
 using System.Reactive.Linq;
 using System.Runtime.CompilerServices;
 using System.Security.Principal;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
@@ -38,6 +40,50 @@ namespace FancyWM.ViewModels
         public bool AllocateNewPanelSpace { get => m_allocateNewPanelSpace; set => SetField(ref m_allocateNewPanelSpace, value); }
         public bool AutoCollapsePanels { get => m_autoCollapsePanels; set => SetField(ref m_autoCollapsePanels, value); }
         public int AutoSplitCount { get => m_autoSplitCount; set => SetField(ref m_autoSplitCount, value); }
+
+        public bool MasterSatelliteEnabled { get => m_masterSatelliteEnabled; set => SetField(ref m_masterSatelliteEnabled, value); }
+        public double MasterRatio { get => m_masterRatio; set => SetField(ref m_masterRatio, value); }
+        public MasterSide DefaultMasterSide { get => m_defaultMasterSide; set => SetField(ref m_defaultMasterSide, value); }
+        public SatelliteLayoutOrientation DefaultSatelliteOrientation { get => m_defaultSatelliteOrientation; set => SetField(ref m_defaultSatelliteOrientation, value); }
+        public int MaxSatellites { get => m_maxSatellites; set => SetField(ref m_maxSatellites, value); }
+
+        public MasterSatelliteOverflowPolicy OverflowPolicy
+        {
+            get => m_overflowPolicy;
+            set
+            {
+                if (m_overflowPolicy == value)
+                {
+                    return;
+                }
+
+                SetField(ref m_overflowPolicy, value);
+                base.NotifyPropertyChanged(nameof(CanConfigureMaxAutoCreatedDesktops));
+                base.NotifyPropertyChanged(nameof(CanFollowOverflowWindow));
+            }
+        }
+
+        public AlgorithmicLayoutDisplayScope AlgorithmicLayoutDisplayScope
+        {
+            get => m_algorithmicLayoutDisplayScope;
+            set => SetField(ref m_algorithmicLayoutDisplayScope, value);
+        }
+
+        public int MaxAutoCreatedDesktops { get => m_maxAutoCreatedDesktops; set => SetField(ref m_maxAutoCreatedDesktops, value); }
+        public bool FollowOverflowWindow { get => m_followOverflowWindow; set => SetField(ref m_followOverflowWindow, value); }
+
+        public IReadOnlyList<MasterSide> MasterSideOptions { get; } = Enum.GetValues<MasterSide>();
+        public IReadOnlyList<SatelliteLayoutOrientation> SatelliteOrientationOptions { get; } = Enum.GetValues<SatelliteLayoutOrientation>();
+        public IReadOnlyList<MasterSatelliteOverflowPolicy> OverflowPolicyOptions { get; } = Enum.GetValues<MasterSatelliteOverflowPolicy>();
+        public IReadOnlyList<AlgorithmicLayoutDisplayScope> AlgorithmicLayoutDisplayScopeOptions { get; } = Enum.GetValues<AlgorithmicLayoutDisplayScope>();
+
+        public bool CanConfigureMaxAutoCreatedDesktops
+            => OverflowPolicy == MasterSatelliteOverflowPolicy.MoveToExistingOrCreateDesktop;
+
+        public bool CanFollowOverflowWindow
+            => OverflowPolicy != MasterSatelliteOverflowPolicy.FloatOnCurrentDesktop;
+
+        public ICommand ApplyUwqhdPresetCommand { get; }
 
         public bool DelayReposition { get => m_delayReposition; set => SetField(ref m_delayReposition, value); }
         public bool AnimateWindowMovement { get => m_animateWindowMovement; set => SetField(ref m_animateWindowMovement, value); }
@@ -201,6 +247,15 @@ namespace FancyWM.ViewModels
         private bool m_allocateNewPanelSpace;
         private bool m_autoCollapsePanels;
         private int m_autoSplitCount;
+        private bool m_masterSatelliteEnabled;
+        private double m_masterRatio;
+        private MasterSide m_defaultMasterSide;
+        private SatelliteLayoutOrientation m_defaultSatelliteOrientation;
+        private int m_maxSatellites;
+        private MasterSatelliteOverflowPolicy m_overflowPolicy;
+        private AlgorithmicLayoutDisplayScope m_algorithmicLayoutDisplayScope;
+        private int m_maxAutoCreatedDesktops;
+        private bool m_followOverflowWindow;
         private bool m_delayReposition;
         private bool m_customAccentColor;
         private bool m_animateWindowMovement;
@@ -210,6 +265,7 @@ namespace FancyWM.ViewModels
         private Color m_accentColor;
         private readonly IDisposable m_subscription;
         private bool m_isInit = false;
+        private bool m_suppressSave;
         private ObservableCollection<KeybindingViewModel>? m_keybindings;
         private int m_panelHeight;
         private int m_panelFontSize;
@@ -223,12 +279,22 @@ namespace FancyWM.ViewModels
         private bool m_soundOnFailure;
         private bool m_showFocus;
         private bool m_showFocusDuringAction;
-        private readonly ILogger m_logger = App.Current.Logger;
+        private readonly ILogger m_logger;
 
         public SettingsViewModel(IObservableFileEntity<Settings> observable)
+            : this(observable, App.Current.Logger, Autostart.IsEnabledAsync)
+        {
+        }
+
+        internal SettingsViewModel(
+            IObservableFileEntity<Settings> observable,
+            ILogger logger,
+            Func<Task<bool>> getAutostartEnabledAsync)
         {
             var dispatcher = Dispatcher.CurrentDispatcher;
             Model = observable;
+            m_logger = logger;
+            ApplyUwqhdPresetCommand = new DelegateCommand(_ => ApplyUwqhdPreset());
             m_subscription = observable
                 .Subscribe(settings =>
             {
@@ -244,6 +310,15 @@ namespace FancyWM.ViewModels
                     AllocateNewPanelSpace = settings.AllocateNewPanelSpace;
                     AutoCollapsePanels = settings.AutoCollapsePanels;
                     AutoSplitCount = settings.AutoSplitCount;
+                    MasterSatelliteEnabled = settings.MasterSatelliteLayout.Enabled;
+                    MasterRatio = settings.MasterSatelliteLayout.MasterRatio;
+                    DefaultMasterSide = settings.MasterSatelliteLayout.DefaultMasterSide;
+                    DefaultSatelliteOrientation = settings.MasterSatelliteLayout.DefaultSatelliteOrientation;
+                    MaxSatellites = settings.MasterSatelliteLayout.MaxSatellites;
+                    OverflowPolicy = settings.MasterSatelliteLayout.OverflowPolicy;
+                    AlgorithmicLayoutDisplayScope = settings.MasterSatelliteLayout.DisplayScope;
+                    MaxAutoCreatedDesktops = settings.MasterSatelliteLayout.MaxAutoCreatedDesktops;
+                    FollowOverflowWindow = settings.MasterSatelliteLayout.FollowOverflowWindow;
                     DelayReposition = settings.DelayReposition;
                     AnimateWindowMovement = settings.AnimateWindowMovement;
                     ModifierMoveWindow = settings.ModifierMoveWindow;
@@ -281,16 +356,52 @@ namespace FancyWM.ViewModels
                         }
                     }
 
-                    Autostart.IsEnabledAsync()
-                        .ContinueWith(t =>
+                    void completeInitialization(Task<bool> task)
+                    {
+                        bool? isAutostartEnabled = null;
+                        try
                         {
-                            dispatcher.Invoke(() =>
-                            {
-                                SetField(ref m_runsAtStartup, t.Result, nameof(RunsAtStartup));
-                            });
+                            isAutostartEnabled = task.GetAwaiter().GetResult();
+                        }
+                        catch (Exception e)
+                        {
+                            m_logger.Error(e, "Failed to determine whether FancyWM runs at startup");
+                        }
 
+                        dispatcher.Invoke(() =>
+                        {
+                            if (isAutostartEnabled.HasValue)
+                            {
+                                SetField(ref m_runsAtStartup, isAutostartEnabled.Value, nameof(RunsAtStartup));
+                            }
                             m_isInit = true;
                         });
+                    }
+
+                    Task<bool> initializationTask;
+                    try
+                    {
+                        initializationTask = getAutostartEnabledAsync();
+                    }
+                    catch (Exception e)
+                    {
+                        m_logger.Error(e, "Failed to start the autostart state query");
+                        m_isInit = true;
+                        return;
+                    }
+
+                    if (initializationTask.IsCompleted)
+                    {
+                        completeInitialization(initializationTask);
+                    }
+                    else
+                    {
+                        _ = initializationTask.ContinueWith(
+                            completeInitialization,
+                            CancellationToken.None,
+                            TaskContinuationOptions.ExecuteSynchronously,
+                            TaskScheduler.Default);
+                    }
                 });
             });
 
@@ -341,7 +452,7 @@ namespace FancyWM.ViewModels
         {
             base.NotifyPropertyChanged(propertyName);
 
-            if (!m_isInit)
+            if (!m_isInit || m_suppressSave)
             {
                 return;
             }
@@ -352,11 +463,19 @@ namespace FancyWM.ViewModels
         public override void Dispose()
         {
             m_subscription?.Dispose();
+            if (m_keybindings != null)
+            {
+                foreach (var keybinding in m_keybindings)
+                {
+                    keybinding.PropertyChanged -= OnKeybindingPropertyChanged;
+                }
+            }
+            base.Dispose();
         }
 
         private void SaveChanges()
         {
-            _ = Model.SaveAsync(x =>
+            var saveTask = Model.SaveAsync(x =>
             {
                 m_logger.Debug($"{nameof(SettingsViewModel)} is overwriting existing Settings");
 
@@ -369,6 +488,18 @@ namespace FancyWM.ViewModels
                     AllocateNewPanelSpace = AllocateNewPanelSpace,
                     AutoCollapsePanels = AutoCollapsePanels,
                     AutoSplitCount = AutoSplitCount,
+                    MasterSatelliteLayout = x.MasterSatelliteLayout with
+                    {
+                        Enabled = MasterSatelliteEnabled,
+                        MasterRatio = MasterRatio,
+                        DefaultMasterSide = DefaultMasterSide,
+                        DefaultSatelliteOrientation = DefaultSatelliteOrientation,
+                        MaxSatellites = MaxSatellites,
+                        OverflowPolicy = OverflowPolicy,
+                        DisplayScope = AlgorithmicLayoutDisplayScope,
+                        MaxAutoCreatedDesktops = MaxAutoCreatedDesktops,
+                        FollowOverflowWindow = FollowOverflowWindow,
+                    },
                     DelayReposition = DelayReposition,
                     AnimateWindowMovement = AnimateWindowMovement,
                     ModifierMoveWindow = ModifierMoveWindow,
@@ -388,6 +519,35 @@ namespace FancyWM.ViewModels
                     ShowFocusDuringAction = ShowFocusDuringAction
                 };
             });
+
+            _ = saveTask.ContinueWith(
+                task => m_logger.Error(task.Exception, "Failed to save settings"),
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+
+        public void ApplyUwqhdPreset()
+        {
+            m_suppressSave = true;
+            try
+            {
+                MasterRatio = 0.60;
+                DefaultMasterSide = MasterSide.Left;
+                DefaultSatelliteOrientation = SatelliteLayoutOrientation.Vertical;
+                MaxSatellites = 3;
+                OverflowPolicy = MasterSatelliteOverflowPolicy.MoveToExistingDesktop;
+                FollowOverflowWindow = false;
+            }
+            finally
+            {
+                m_suppressSave = false;
+            }
+
+            if (m_isInit)
+            {
+                SaveChanges();
+            }
         }
 
         private static List<KeybindingGroup> CreateKeybindingGroups(IList<KeybindingViewModel> keybindings)
@@ -404,6 +564,14 @@ namespace FancyWM.ViewModels
                     BindableAction.CreateHorizontalPanel,
                     BindableAction.CreateVerticalPanel,
                     BindableAction.CreateStackPanel
+                }),
+                (Strings.ResourceManager.GetString("Keybindings.MasterSatellite") ?? "Master + Satellites", new HashSet<BindableAction>{
+                    BindableAction.ToggleMasterSatelliteLayout,
+                    BindableAction.PromoteFocusedWindowToMaster,
+                    BindableAction.SwapMasterSide,
+                    BindableAction.ToggleSatelliteOrientation,
+                    BindableAction.ResetMasterRatio,
+                    BindableAction.RebalanceMasterSatelliteLayout,
                 }),
                 (Strings.Keybindings_Windows, new HashSet<BindableAction>{
                     BindableAction.PullWindowUp,

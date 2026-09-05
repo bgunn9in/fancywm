@@ -28,6 +28,7 @@ namespace FancyWM
         TargetCannotFit,
         PullsBeyondTopLevelPanel,
         NestingInStackPanel,
+        UnsupportedInAlgorithmicLayout,
     }
 
     internal class TilingFailedException : InvalidOperationException
@@ -111,18 +112,18 @@ namespace FancyWM
         }
     }
 
-    internal class TilingWorkspace
+    internal partial class TilingWorkspace
     {
         private readonly TilingWorkspaceState m_states = new();
-        private readonly Dictionary<IWindow, Rectangle> m_originalPositions = [];
+        private readonly Dictionary<IWindow, Rectangle> m_originalPositions
+            = new(ReferenceEqualityComparer.Instance);
 
         public IEnumerable<DesktopTree> Trees => m_states.States.Select(x => x.DesktopTree);
 
-        public bool AutoCollapse { get; set; } = false;
+        internal IReadOnlyList<IVirtualDesktop> SnapshotDesktops() =>
+            m_states.Desktops.ToArray();
 
-        public TilingWorkspace()
-        {
-        }
+        public bool AutoCollapse { get; set; } = false;
 
         public PanelNode CreateRoot(PanelOrientation orientation)
         {
@@ -153,6 +154,38 @@ namespace FancyWM
         public WindowNode RegisterWindow(IWindow window, int maxTreeWidth = 100)
         {
             var state = GetValidatedState(window);
+            return RegisterWindow(window, state, maxTreeWidth);
+        }
+
+        /// <summary>
+        /// Registers a window against an event-resolved desktop without asking the
+        /// virtual-desktop manager to infer ownership again. This is required for
+        /// background desktop moves where CurrentDesktop and IWindow ownership can
+        /// change independently while workspace events are being reconciled.
+        /// </summary>
+        public WindowNode RegisterWindow(
+            IWindow window,
+            IVirtualDesktop virtualDesktop,
+            int maxTreeWidth = 100)
+        {
+            ArgumentNullException.ThrowIfNull(window);
+            ArgumentNullException.ThrowIfNull(virtualDesktop);
+            var state = m_states.GetState(virtualDesktop)
+                ?? throw new ArgumentException(
+                    "Desktop not registered with backend!",
+                    nameof(virtualDesktop));
+            if (m_states.FindByTree(window) != null)
+            {
+                throw new WindowAlreadyRegisteredException();
+            }
+            return RegisterWindow(window, state, maxTreeWidth);
+        }
+
+        private WindowNode RegisterWindow(
+            IWindow window,
+            DesktopState state,
+            int maxTreeWidth)
+        {
             var focusedNode = state.FocusedNode;
             var parent = ResolveParent(state, focusedNode);
             parent = ResolveParentWithWidthConstraint(parent, focusedNode, window, maxTreeWidth);

@@ -15,7 +15,46 @@ using System.Threading;
 
 namespace FancyWM
 {
-    public class TilingOverlayRenderer : IDisposable
+    /// <summary>
+    /// The service-facing overlay surface. Keeping the native WPF host behind
+    /// this boundary allows lifecycle and event integration to be exercised
+    /// without opening a real overlay window in automated tests.
+    /// </summary>
+    internal interface ITilingOverlayRenderer : IDisposable
+    {
+        event EventHandler<PanelNode>? TilingPanelMoveRequested;
+        event EventHandler<PanelNode>? TilingPanelMoving;
+        event EventHandler<TilingNode>? TilingNodeFocusRequested;
+        event EventHandler<TilingNode>? TilingNodePullUpRequested;
+        event EventHandler<TilingNode>? TilingNodeCloseRequested;
+
+        event EventHandler<TilingNode>? HorizontalSplitRequested;
+        event EventHandler<TilingNode>? VerticalSplitRequested;
+        event EventHandler<TilingNode>? StackRequested;
+        event EventHandler<TilingNode>? PullUpRequested;
+        event EventHandler<WindowNode>? FloatRequested;
+        event EventHandler<WindowNode>? IgnoreProcessRequested;
+        event EventHandler<WindowNode>? IgnoreClassRequested;
+        event EventHandler<WindowNode>? BeginHorizontalWithRequested;
+        event EventHandler<WindowNode>? BeginVerticalWithRequested;
+        event EventHandler<WindowNode>? BeginStackWithRequested;
+
+        int PanelSpacing { get; set; }
+        Thickness PanelPadding { get; set; }
+        IReadOnlySet<IWindow> PreviewWindows { get; set; }
+        Rectangle? FocusRectangle { get; set; }
+        Rectangle? PreviewRectangle { get; set; }
+        IWindow? IntentSourceWindow { get; set; }
+
+        void UpdateOverlay(
+            IReadOnlyCollection<TilingNode> snapshot,
+            IReadOnlyCollection<TilingNode> focusedPath);
+        void InvalidateView();
+        void Show();
+        void Hide();
+    }
+
+    public class TilingOverlayRenderer : IDisposable, ITilingOverlayRenderer
     {
         public event EventHandler<PanelNode>? TilingPanelMoveRequested;
         public event EventHandler<PanelNode>? TilingPanelMoving;
@@ -300,10 +339,14 @@ namespace FancyWM
             m_overlay.Show();
         }
 
+        void ITilingOverlayRenderer.Show() => Show();
+
         internal void Hide()
         {
             m_overlay.Hide();
         }
+
+        void ITilingOverlayRenderer.Hide() => Hide();
 
         private void WindowViewModel_StackActionPressed(object sender, RoutedEventArgs e)
         {
