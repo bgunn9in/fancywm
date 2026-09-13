@@ -6,6 +6,7 @@ using System.Reactive.Disposables;
 using System.Reactive.Linq;
 using System.Reactive.Subjects;
 using System.Windows.Threading;
+using System.Threading.Tasks;
 
 using FancyWM.Models;
 using FancyWM.Utilities;
@@ -28,7 +29,7 @@ namespace FancyWM
         public IWorkspace Workspace { get; }
         public IAnimationThread AnimationThread { get; }
 
-        public bool Active => GetPrimaryTilingService().Active;
+        public bool Active => m_shutdownPreparation == null && GetPrimaryTilingService().Active;
 
         public ITilingServiceIntent? PendingIntent
         {
@@ -91,6 +92,11 @@ namespace FancyWM
         private readonly object m_syncRoot = new();
         private IWindow? m_observedFocusedWindow;
         private bool m_disposed;
+        private TaskCompletionSource? m_shutdownPreparation;
+        private bool m_shutdownStopped;
+        private int m_displayChanges;
+        private TaskCompletionSource? m_displayChangesCompletion;
+        private List<Exception>? m_displayChangeFailures;
 
         public MultiDisplayTilingService(
             IWorkspace workspace,
@@ -274,11 +280,19 @@ namespace FancyWM
         {
             ArgumentNullException.ThrowIfNull(action);
             ArgumentException.ThrowIfNullOrWhiteSpace(operation);
+            lock (m_syncRoot)
+            {
+                if (m_disposed || m_shutdownPreparation != null) { return; }
+            }
 
             void ApplySafely()
             {
                 try
                 {
+                    lock (m_syncRoot)
+                    {
+                        if (m_disposed || m_shutdownPreparation != null) { return; }
+                    }
                     action();
                 }
                 catch (Exception exception)
@@ -317,7 +331,7 @@ namespace FancyWM
             bool updateActiveDisplay = false;
             lock (m_syncRoot)
             {
-                if (m_disposed)
+                if (m_disposed || m_shutdownPreparation != null)
                 {
                     return;
                 }
@@ -325,9 +339,11 @@ namespace FancyWM
                 if (m_tilingServices.Remove(e.Source, out var tiling))
                 {
                     removedTiling = tiling;
+                    BeginDisplayChangeLocked();
                 }
             }
 
+            List<Exception>? failures = null;
             try
             {
                 if (updateActiveDisplay)
@@ -337,18 +353,19 @@ namespace FancyWM
             }
             catch (Exception exception)
             {
-                m_logger.Error(
-                    exception,
-                    "Could not reroute the active display after removing {Display}",
-                    e.Source);
+                if (removedTiling != null) { failures = [exception]; }
+                else
+                {
+                    m_logger.Error(exception,
+                        "Could not reroute the active display after removing {Display}", e.Source);
+                }
             }
             finally
             {
                 if (removedTiling != null)
                 {
-                    DisposeTilingService(removedTiling);
+                    _ = RetireTilingServiceAsync(removedTiling, collect: true, failures);
                 }
-                m_scheduleGarbageCollection();
             }
         }
 
@@ -366,42 +383,128 @@ namespace FancyWM
             IReadOnlyCollection<IWindowMatcher> exclusionMatchers;
             lock (m_syncRoot)
             {
-                if (m_disposed || m_tilingServices.ContainsKey(e.Source))
+                if (m_disposed || m_shutdownPreparation != null || m_tilingServices.ContainsKey(e.Source))
                 {
                     return;
                 }
                 showPreviewFocus = m_showPreviewFocus;
                 exclusionMatchers = m_exclusionMatchers;
+                BeginDisplayChangeLocked();
             }
 
-            var tiling = m_tilingServiceFactory(e.Source);
-            tiling.ShowPreviewFocus = showPreviewFocus;
-            tiling.ExclusionMatchers = exclusionMatchers;
-            tiling.PlacementFailed += OnTilingFailed;
-            tiling.AlgorithmicLayoutChanged += OnAlgorithmicLayoutChanged;
-            tiling.PendingIntentChanged += OnPendingIntentChanged;
+            ITilingService? tiling = null;
+            bool registered = false;
+            List<Exception>? failures = null;
             try
             {
+                tiling = m_tilingServiceFactory(e.Source);
+                lock (m_syncRoot)
+                {
+                    // Publish the owner before setters or Start can reenter
+                    // shutdown. A factory already entered is held by the
+                    // display-change completion until its returned owner drains.
+                    registered = !m_disposed && m_shutdownPreparation == null
+                        && m_tilingServices.TryAdd(e.Source, tiling);
+                }
+                if (!registered) { return; }
+                tiling.ShowPreviewFocus = showPreviewFocus;
+                tiling.ExclusionMatchers = exclusionMatchers;
+                tiling.PlacementFailed += OnTilingFailed;
+                tiling.AlgorithmicLayoutChanged += OnAlgorithmicLayoutChanged;
+                tiling.PendingIntentChanged += OnPendingIntentChanged;
+                if (m_disposed || m_shutdownPreparation != null) { return; }
                 tiling.Start();
+                UpdateActiveDisplay(reason: $"display {e.Source} was added");
             }
-            catch
+            catch (Exception error)
             {
-                DisposeTilingService(tiling);
+                failures = [error];
+                lock (m_syncRoot)
+                {
+                    if (registered && m_shutdownPreparation == null
+                        && m_tilingServices.TryGetValue(e.Source, out var current)
+                        && ReferenceEquals(current, tiling))
+                    {
+                        m_tilingServices.Remove(e.Source);
+                        registered = false;
+                    }
+                }
                 throw;
             }
+            finally
+            {
+                if (tiling != null && !registered)
+                {
+                    _ = RetireTilingServiceAsync(tiling, collect: false, failures);
+                }
+                else { CompleteDisplayChange(failures); }
+            }
+        }
 
-            bool registered;
+        private void BeginDisplayChangeLocked()
+        {
+            if (m_displayChanges++ == 0)
+            {
+                m_displayChangesCompletion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            }
+        }
+
+        private void CompleteDisplayChange(List<Exception>? failures)
+        {
+            TaskCompletionSource? completion = null;
+            List<Exception>? completedFailures = null;
             lock (m_syncRoot)
             {
-                registered = !m_disposed && m_tilingServices.TryAdd(e.Source, tiling);
+                if (failures?.Count > 0) { (m_displayChangeFailures ??= []).AddRange(failures); }
+                if (--m_displayChanges == 0)
+                {
+                    completion = m_displayChangesCompletion;
+                    completedFailures = m_displayChangeFailures;
+                    m_displayChangesCompletion = null;
+                    m_displayChangeFailures = null;
+                }
             }
-            if (!registered)
-            {
-                DisposeTilingService(tiling);
-                return;
-            }
+            if (completion == null) { return; }
+            if (completedFailures == null) { completion.TrySetResult(); return; }
+            var failure = new AggregateException("Completing a display lifecycle change failed!", completedFailures);
+            try { m_logger.Error(failure, "Completing a display lifecycle change failed"); }
+            catch (Exception error) { failure = new AggregateException(failure, error); }
+            completion.TrySetException(failure);
+            _ = completion.Task.Exception;
+        }
 
-            UpdateActiveDisplay(reason: $"display {e.Source} was added");
+        private async Task RetireTilingServiceAsync(ITilingService tiling, bool collect, List<Exception>? failures)
+        {
+            failures ??= [];
+            try
+            {
+                Task? preparation = null;
+                try { preparation = tiling.PrepareForShutdownAsync(); }
+                catch (Exception error) { failures.Add(error); }
+                if (preparation != null)
+                {
+                    try { await preparation.ConfigureAwait(false); }
+                    catch (Exception error)
+                    {
+                        if (preparation.Exception is { } aggregate) { failures.AddRange(aggregate.InnerExceptions); }
+                        else { failures.Add(error); }
+                    }
+                }
+
+                void ReleaseOwner()
+                {
+                    DisposeTilingService(tiling, failures: failures);
+                    if (collect)
+                    {
+                        try { m_scheduleGarbageCollection(); }
+                        catch (Exception error) { failures.Add(error); }
+                    }
+                }
+                if (Dispatcher.CheckAccess()) { ReleaseOwner(); }
+                else { await Dispatcher.InvokeAsync(ReleaseOwner).Task.ConfigureAwait(false); }
+            }
+            catch (Exception error) { failures.Add(error); }
+            finally { CompleteDisplayChange(failures); }
         }
 
         private void OnPendingIntentChanged(object? sender, EventArgs e)
@@ -409,7 +512,7 @@ namespace FancyWM
             ITilingService[] tilingServices;
             lock (m_syncRoot)
             {
-                if (m_disposed)
+                if (m_disposed || m_shutdownPreparation != null)
                 {
                     return;
                 }
@@ -426,7 +529,7 @@ namespace FancyWM
         {
             lock (m_syncRoot)
             {
-                if (m_disposed)
+                if (m_disposed || m_shutdownPreparation != null)
                 {
                     return;
                 }
@@ -449,7 +552,7 @@ namespace FancyWM
             var focusedWindow = e.NewFocusedWindow;
             lock (m_syncRoot)
             {
-                if (m_disposed)
+                if (m_disposed || m_shutdownPreparation != null)
                 {
                     return;
                 }
@@ -482,7 +585,7 @@ namespace FancyWM
             IDisplay previousDisplay;
             lock (m_syncRoot)
             {
-                if (m_disposed || m_tilingServices.Count == 0)
+                if (m_disposed || m_shutdownPreparation != null || m_tilingServices.Count == 0)
                 {
                     return;
                 }
@@ -501,7 +604,7 @@ namespace FancyWM
             IDisplay newActiveDisplay;
             lock (m_syncRoot)
             {
-                if (m_disposed || m_tilingServices.Count == 0)
+                if (m_disposed || m_shutdownPreparation != null || m_tilingServices.Count == 0)
                 {
                     return;
                 }
@@ -593,7 +696,7 @@ namespace FancyWM
         {
             lock (m_syncRoot)
             {
-                if (m_disposed)
+                if (m_disposed || m_shutdownPreparation != null)
                 {
                     return;
                 }
@@ -607,7 +710,7 @@ namespace FancyWM
         {
             lock (m_syncRoot)
             {
-                if (m_disposed)
+                if (m_disposed || m_shutdownPreparation != null)
                 {
                     return;
                 }
@@ -634,6 +737,7 @@ namespace FancyWM
         {
             List<ITilingService> tilingServices;
             IWindow? observedFocusedWindow;
+            bool stopChildren;
             lock (m_syncRoot)
             {
                 if (m_disposed)
@@ -641,6 +745,7 @@ namespace FancyWM
                     return;
                 }
                 m_disposed = true;
+                stopChildren = m_shutdownPreparation == null || !m_shutdownStopped;
                 tilingServices = [.. m_tilingServices.Values];
                 m_tilingServices.Clear();
                 observedFocusedWindow = m_observedFocusedWindow;
@@ -658,7 +763,7 @@ namespace FancyWM
 
             foreach (var tiling in tilingServices)
             {
-                DisposeTilingService(tiling);
+                DisposeTilingService(tiling, stopChildren);
             }
 
             m_focusedWindowLocationChanges.OnCompleted();
@@ -670,27 +775,23 @@ namespace FancyWM
             PendingIntentChanged = null;
         }
 
-        private void DisposeTilingService(ITilingService tiling)
+        private void DisposeTilingService(ITilingService tiling, bool stop = true, List<Exception>? failures = null)
         {
-            tiling.PlacementFailed -= OnTilingFailed;
-            tiling.AlgorithmicLayoutChanged -= OnAlgorithmicLayoutChanged;
-            tiling.PendingIntentChanged -= OnPendingIntentChanged;
-            try
+            void Attempt(Action cleanup, string operation)
             {
-                tiling.Stop();
+                try { cleanup(); }
+                catch (Exception error)
+                {
+                    failures?.Add(error);
+                    try { m_logger.Error(error, "Display owner cleanup failed while {Operation}", operation); }
+                    catch (Exception reportingError) { failures?.Add(reportingError); }
+                }
             }
-            catch (Exception ex)
-            {
-                m_logger.Error(ex, "Stopping a display tiling service during disposal failed");
-            }
-            try
-            {
-                tiling.Dispose();
-            }
-            catch (Exception ex)
-            {
-                m_logger.Error(ex, "Disposing a display tiling service failed");
-            }
+            Attempt(() => tiling.PlacementFailed -= OnTilingFailed, "unsubscribing placement failures");
+            Attempt(() => tiling.AlgorithmicLayoutChanged -= OnAlgorithmicLayoutChanged, "unsubscribing layout changes");
+            Attempt(() => tiling.PendingIntentChanged -= OnPendingIntentChanged, "unsubscribing pending intent changes");
+            if (stop) { Attempt(tiling.Stop, "stopping the display service"); }
+            Attempt(tiling.Dispose, "disposing the display service");
         }
 
         public void Stack()
@@ -704,11 +805,13 @@ namespace FancyWM
             ITilingService[] tilingServices;
             lock (m_syncRoot)
             {
+                if (m_disposed || m_shutdownPreparation != null) { return false; }
                 tilingServices = [.. m_tilingServices.Values];
             }
             foreach (var tiling in tilingServices)
             {
-                anyChanges = anyChanges || tiling.DiscoverWindows();
+                bool changed = tiling.DiscoverWindows();
+                anyChanges |= changed;
             }
             return anyChanges;
         }
@@ -718,6 +821,7 @@ namespace FancyWM
             ITilingService[] tilingServices;
             lock (m_syncRoot)
             {
+                if (m_disposed || m_shutdownPreparation != null) { return; }
                 tilingServices = [.. m_tilingServices.Values];
             }
             foreach (var tiling in tilingServices)
@@ -780,13 +884,75 @@ namespace FancyWM
         public void Stop()
         {
             ITilingService[] tilingServices;
+            bool shutdown;
             lock (m_syncRoot)
             {
+                shutdown = m_shutdownPreparation != null;
+                if (shutdown)
+                {
+                    if (!m_shutdownPreparation!.Task.IsCompleted || m_shutdownStopped) { return; }
+                    m_shutdownStopped = true;
+                }
                 tilingServices = [.. m_tilingServices.Values];
             }
+            List<Exception>? failures = null;
             foreach (var tiling in tilingServices)
             {
-                tiling.Stop();
+                if (!shutdown) { tiling.Stop(); }
+                else
+                {
+                    try { tiling.Stop(); }
+                    catch (Exception error) { (failures ??= []).Add(error); }
+                }
+            }
+            if (failures != null) { throw new AggregateException("Restoring displays during shutdown failed!", failures); }
+        }
+
+        public Task PrepareForShutdownAsync()
+        {
+            Dispatcher.VerifyAccess();
+            TaskCompletionSource completion;
+            ITilingService[] services;
+            Task? displayChanges;
+            lock (m_syncRoot)
+            {
+                if (m_shutdownPreparation != null) { return m_shutdownPreparation.Task; }
+                completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                m_shutdownPreparation = completion;
+                // Keep the registered owners until the caller has awaited this
+                // task and performs the existing final Stop/Dispose sequence.
+                services = [.. m_tilingServices.Values];
+                displayChanges = m_displayChangesCompletion?.Task;
+            }
+            List<Exception> failures = [];
+            List<Task> pending = [];
+            if (displayChanges != null) { pending.Add(displayChanges); }
+            foreach (var service in services)
+            {
+                try { pending.Add(service.PrepareForShutdownAsync()); }
+                catch (Exception error) { failures.Add(error); }
+            }
+            _ = CompleteShutdownPreparationAsync(completion, pending, failures);
+            return completion.Task;
+        }
+
+        private static async Task CompleteShutdownPreparationAsync(TaskCompletionSource completion,
+            List<Task> pending, List<Exception> failures)
+        {
+            foreach (var operation in pending)
+            {
+                try { await operation.ConfigureAwait(false); }
+                catch (Exception error)
+                {
+                    if (operation.Exception is { } aggregate) { failures.AddRange(aggregate.InnerExceptions); }
+                    else { failures.Add(error); }
+                }
+            }
+            if (failures.Count == 0) { completion.TrySetResult(); }
+            else
+            {
+                completion.TrySetException(new AggregateException("Display shutdown preparation failed!", failures));
+                _ = completion.Task.Exception;
             }
         }
 
@@ -795,6 +961,7 @@ namespace FancyWM
             ITilingService[] tilingServices;
             lock (m_syncRoot)
             {
+                if (m_disposed || m_shutdownPreparation != null) { return; }
                 tilingServices = [.. m_tilingServices.Values];
             }
             foreach (var tiling in tilingServices)

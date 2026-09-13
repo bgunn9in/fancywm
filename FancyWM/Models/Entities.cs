@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -23,6 +23,9 @@ namespace FancyWM.Models
         IObservable<T> Value { get; }
 
         Task SaveAsync(Func<T, T> update);
+
+        // Complete only after all updates accepted before this call are durable.
+        Task FlushAsync() => Task.CompletedTask;
     }
 
     public abstract class ObservableFileEntityBase<T> : IObservableFileEntity<T>
@@ -30,117 +33,301 @@ namespace FancyWM.Models
         [JsonIgnore]
         public string FullPath { get; }
 
-        public IObservable<T> Value => m_value;
+        public IObservable<T> Value
+        {
+            get
+            {
+                _ = m_initTask.Value;
+                return m_saves;
+            }
+        }
 
-        private readonly IObservable<T> m_value;
-        private readonly Subject<T> m_saves = new();
+        private readonly ReplaySubject<T> m_saves = new(1);
+        private readonly object m_stateLock = new();
+        private readonly TimeProvider m_timeProvider;
+        private readonly Lazy<Task> m_initTask;
         private T m_currentValue = default!;
-        private readonly SemaphoreSlim m_rwLock = new(1, 1);
-        private Task m_initTask;
+        private T m_persistedValue = default!;
+        private TaskCompletionSource? m_pendingSave;
+        private TaskCompletionSource? m_activeSave;
+        private CancellationTokenSource? m_saveDelay;
+        private bool m_writerRunning;
+        private bool m_flushRequested;
+        private bool m_notifying;
+        private long m_revision;
+        private long m_notifiedRevision;
 
         protected ObservableFileEntityBase(string fullPath, Func<T> defaultFactory)
+            : this(fullPath, defaultFactory, TimeProvider.System)
+        {
+        }
+
+        protected ObservableFileEntityBase(string fullPath, Func<T> defaultFactory, TimeProvider timeProvider)
         {
             FullPath = fullPath;
+            m_timeProvider = timeProvider;
+            // Start virtual read/write calls after the derived constructor has finished.
+            m_initTask = new Lazy<Task>(() =>
+            {
+                var initialized = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var task = initialized.Task;
+                // Value subscribers receive OnError; also observe the initialization Task
+                // when no caller ever invokes SaveAsync.
+                _ = task.ContinueWith(failed => _ = failed.Exception, CancellationToken.None,
+                    TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+                _ = InitializeAsync(initialized);
+                return task;
+            });
 
-            async Task<T> readAsync()
+            async Task InitializeAsync(TaskCompletionSource initialized)
             {
                 try
                 {
-                    if (!File.Exists(FullPath))
-                    {
-                        var defaultValue = defaultFactory();
-                        m_currentValue = defaultValue;
-                        await SaveAsync(_ => _, notify: false);
-                        return defaultValue;
-                    }
-
-                    using var stream = File.OpenRead(FullPath);
-                    return await ReadAsync(stream);
-                }
-                catch (Exception e) when (IsFileOrFormatException(e))
-                {
-                    var defaultValue = defaultFactory();
-                    m_currentValue = defaultValue;
+                    T value;
+                    bool writeDefault = !File.Exists(FullPath);
                     try
                     {
-                        // Try to preserve the old configuration, if any.
-                        File.Copy(FullPath, $"{FullPath}.{DateTime.UtcNow}.bak");
-                        File.Delete(FullPath);
+                        if (writeDefault)
+                        {
+                            value = defaultFactory();
+                        }
+                        else
+                        {
+                            using var stream = File.OpenRead(FullPath);
+                            value = await ReadAsync(stream).ConfigureAwait(false);
+                        }
                     }
-                    catch
+                    catch (Exception e) when (IsFileOrFormatException(e))
                     {
-                        // continue
+                        value = defaultFactory();
+                        writeDefault = true;
+                        if (File.Exists(FullPath))
+                        {
+                            File.Copy(FullPath, $"{FullPath}.{DateTime.UtcNow:yyyyMMddHHmmssfff}.bak");
+                        }
                     }
-                    await SaveAsync(_ => _, notify: false);
-                    return defaultValue;
+
+                    if (writeDefault)
+                    {
+                        await WriteValueAsync(value).ConfigureAwait(false);
+                    }
+                    lock (m_stateLock)
+                    {
+                        m_currentValue = m_persistedValue = value;
+                        m_revision++;
+                    }
+                    // Publish the initial value before releasing callers already
+                    // waiting for the read. Reentrant observer saves use the ready
+                    // in-memory value directly and can synchronously flush it.
+                    PublishLatest();
+                    initialized.TrySetResult();
+                }
+                catch (Exception e)
+                {
+                    initialized.TrySetException(e);
+                    m_saves.OnError(e);
                 }
             }
-
-            var lastValue = Observable.FromAsync(readAsync)
-                .Merge(m_saves)
-                .DistinctUntilChanged()
-                .Do(value => m_currentValue = value)
-                .Replay(1);
-            lastValue.Connect();
-
-            m_value = lastValue;
-            m_initTask = lastValue.FirstOrDefaultAsync().ToTask();
         }
 
-        private static bool IsFileOrFormatException(Exception? e) => e is FileNotFoundException || e is JsonException || e is FormatException || IsFileOrFormatException(e?.InnerException);
+        private static bool IsFileOrFormatException(Exception? e) => e != null &&
+            (e is FileNotFoundException || e is JsonException || e is FormatException || IsFileOrFormatException(e.InnerException));
 
         public IDisposable Subscribe(IObserver<T> observer)
         {
             return Value.Subscribe(observer);
         }
 
-        public virtual async Task SaveAsync(Func<T, T> update)
+        public virtual Task SaveAsync(Func<T, T> update)
         {
-            await m_initTask;
-            await SaveAsync(update, notify: true);
+            ArgumentNullException.ThrowIfNull(update);
+            bool valueReady;
+            lock (m_stateLock) valueReady = m_revision != 0;
+            if (valueReady) return SaveInitialized(update);
+            var initialization = m_initTask.Value;
+            return initialization.IsCompletedSuccessfully
+                ? SaveInitialized(update)
+                : SaveAfterInitializationAsync(initialization, update);
+        }
+
+        private async Task SaveAfterInitializationAsync(Task initialization, Func<T, T> update)
+        {
+            await initialization.ConfigureAwait(false);
+            await SaveInitialized(update).ConfigureAwait(false);
+        }
+
+        private Task SaveInitialized(Func<T, T> update)
+        {
+            try
+            {
+                Task completion;
+                bool startWriter;
+                lock (m_stateLock)
+                {
+                    var newValue = update(m_currentValue);
+                    if (!Equals(m_currentValue, newValue))
+                    {
+                        m_currentValue = newValue;
+                        m_revision++;
+                    }
+                    completion = QueueSaveCore(out startWriter);
+                }
+                if (startWriter) _ = WritePendingAsync();
+                PublishLatest();
+                // All callers in this batch share its completion. Do not retain one
+                // async state machine (and updater closure) per slider notification.
+                return completion;
+            }
+            catch (Exception e)
+            {
+                return Task.FromException(e);
+            }
+        }
+
+        public Task FlushAsync()
+        {
+            Task completion;
+            bool startWriter;
+            lock (m_stateLock)
+            {
+                // An unopened/initializing entity has no accepted updates to flush.
+                if (m_revision == 0) return Task.CompletedTask;
+                completion = QueueSaveCore(out startWriter);
+                m_flushRequested = m_writerRunning;
+                m_saveDelay?.Cancel();
+            }
+            if (startWriter) _ = WritePendingAsync();
+            return completion;
+        }
+
+        private Task QueueSaveCore(out bool startWriter)
+        {
+            startWriter = false;
+            if (m_pendingSave == null && m_activeSave == null && Equals(m_currentValue, m_persistedValue))
+            {
+                return Task.CompletedTask;
+            }
+            // A matching in-flight value already covers an identical save/flush.
+            if (m_pendingSave == null && m_activeSave != null && m_activeRevision == m_revision)
+            {
+                return m_activeSave.Task;
+            }
+            m_pendingSave ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            if (!m_writerRunning)
+            {
+                m_writerRunning = startWriter = true;
+                m_saveDelay = new CancellationTokenSource();
+            }
+            return m_pendingSave.Task;
+        }
+
+        private long m_activeRevision;
+
+        private void PublishLatest()
+        {
+            lock (m_stateLock)
+            {
+                if (m_notifying) return;
+                m_notifying = true;
+            }
+            try
+            {
+                while (true)
+                {
+                    T value;
+                    lock (m_stateLock)
+                    {
+                        if (m_notifiedRevision == m_revision)
+                        {
+                            m_notifying = false;
+                            return;
+                        }
+                        value = m_currentValue;
+                        m_notifiedRevision = m_revision;
+                    }
+                    // Never call arbitrary observers under the persistence state lock.
+                    // Reentrant/concurrent updates retain only the latest pending value.
+                    m_saves.OnNext(value);
+                }
+            }
+            catch
+            {
+                lock (m_stateLock) m_notifying = false;
+                throw;
+            }
+        }
+
+        private async Task WritePendingAsync()
+        {
+            while (true)
+            {
+                CancellationTokenSource delay;
+                lock (m_stateLock) delay = m_saveDelay!;
+                Exception? failure = null;
+                try
+                {
+                    // Fixed window from first admission: continuous edits cannot postpone it.
+                    await Task.Delay(TimeSpan.FromMilliseconds(100), m_timeProvider, delay.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (delay.IsCancellationRequested) { }
+                catch (Exception e) { failure = e; }
+
+                T value;
+                TaskCompletionSource completion;
+                lock (m_stateLock)
+                {
+                    m_saveDelay = null;
+                    delay.Dispose();
+                    value = m_currentValue;
+                    m_activeRevision = m_revision;
+                    completion = m_activeSave = m_pendingSave!;
+                    m_pendingSave = null;
+                }
+                try
+                {
+                    if (failure == null) await WriteValueAsync(value).ConfigureAwait(false);
+                }
+                catch (Exception e) { failure = e; }
+                lock (m_stateLock)
+                {
+                    if (failure == null) m_persistedValue = value;
+                    m_activeSave = null;
+                    if (failure == null) completion.TrySetResult();
+                    else completion.TrySetException(failure);
+                    if (m_pendingSave == null)
+                    {
+                        m_writerRunning = m_flushRequested = false;
+                        return;
+                    }
+                    m_saveDelay = new CancellationTokenSource();
+                    if (m_flushRequested) m_saveDelay.Cancel();
+                }
+            }
         }
 
         protected abstract Task<T> ReadAsync(Stream stream);
         protected abstract Task WriteAsync(Stream stream, T value);
 
-        private async Task SaveAsync(Func<T, T> update, bool notify)
+        private async Task WriteValueAsync(T newValue)
         {
-            if (m_currentValue == null)
-            {
-                throw new InvalidOperationException("Model not initialized.");
-            }
-
-            var newValue = update(m_currentValue);
-
-            if (Equals(m_currentValue, newValue))
-            {
-                return;
-            }
-
-            await m_rwLock.WaitAsync();
+            var tempPath = FullPath + ".tmp";
             try
             {
-                var tempPath = FullPath + ".tmp";
                 using (var stream = File.Create(tempPath))
                 {
-                    await WriteAsync(stream, newValue);
+                    await WriteAsync(stream, newValue).ConfigureAwait(false);
                 }
 
                 if (File.Exists(FullPath))
                 {
                     var backupPath = FullPath + ".bak";
-                    if (File.Exists(backupPath))
-                    {
-                        File.Delete(backupPath);
-                    }
-                    File.Move(FullPath, backupPath);
+                    File.Replace(tempPath, FullPath, backupPath);
+                    File.Delete(backupPath);
                 }
-
-                File.Move(tempPath, FullPath, overwrite: true);
-
-                if (File.Exists(FullPath + ".bak"))
+                else
                 {
-                    File.Delete(FullPath + ".bak");
+                    File.Move(tempPath, FullPath);
                 }
             }
             catch (UnauthorizedAccessException ex)
@@ -153,12 +340,8 @@ namespace FancyWM.Models
             }
             finally
             {
-                m_rwLock.Release();
-            }
-
-            if (notify)
-            {
-                m_saves.OnNext(newValue);
+                // A failed serialization never replaces the last good file.
+                if (File.Exists(tempPath)) File.Delete(tempPath);
             }
         }
     }
@@ -169,14 +352,14 @@ namespace FancyWM.Models
 
         protected override async Task<T> ReadAsync(Stream stream)
         {
-            var result = await JsonSerializer.DeserializeAsync<T>(stream, Options) ?? throw new JsonException("Deserialized value is null.");
+            var result = await JsonSerializer.DeserializeAsync<T>(stream, Options).ConfigureAwait(false) ?? throw new JsonException("Deserialized value is null.");
             return result;
         }
 
         protected override async Task WriteAsync(Stream stream, T value)
         {
-            await JsonSerializer.SerializeAsync(stream, value, Options);
-            await stream.FlushAsync();
+            await JsonSerializer.SerializeAsync(stream, value, Options).ConfigureAwait(false);
+            await stream.FlushAsync().ConfigureAwait(false);
         }
     }
 
@@ -192,41 +375,43 @@ namespace FancyWM.Models
 
         protected override async Task<T> ReadAsync(Stream stream)
         {
-            var result = await JsonSerializer.DeserializeAsync<T>(stream, m_readOptions) ?? throw new JsonException("Deserialized value is null.");
+            var result = await JsonSerializer.DeserializeAsync<T>(stream, m_readOptions).ConfigureAwait(false) ?? throw new JsonException("Deserialized value is null.");
             return result;
         }
 
         protected override async Task WriteAsync(Stream stream, T value)
         {
             using var newValueStream = new MemoryStream();
-            await JsonSerializer.SerializeAsync(newValueStream, value, Options);
+            await JsonSerializer.SerializeAsync(newValueStream, value, Options).ConfigureAwait(false);
             newValueStream.Position = 0;
 
             try
             {
                 using var oldValueStream = File.OpenRead(FullPath);
-                await MergeJsonPreservingComments(stream, newValueStream, oldValueStream);
+                await MergeJsonPreservingComments(stream, newValueStream, oldValueStream).ConfigureAwait(false);
             }
             catch (Exception)
             {
+                stream.Position = 0;
+                stream.SetLength(0);
                 newValueStream.Position = 0;
-                await newValueStream.CopyToAsync(stream);
+                await newValueStream.CopyToAsync(stream).ConfigureAwait(false);
             }
 
-            await stream.FlushAsync();
+            await stream.FlushAsync().ConfigureAwait(false);
         }
 
         private static async Task<byte[]> ReadAllAsync(Stream stream)
         {
             byte[] b = new byte[stream.Length - stream.Position];
-            await stream.ReadAsync(b);
+            await stream.ReadAsync(b).ConfigureAwait(false);
             return b;
         }
 
         private async Task MergeJsonPreservingComments(Stream outputStream, Stream newValueStream, Stream oldValueStream)
         {
-            var newValueBytes = await ReadAllAsync(newValueStream);
-            var oldValueBytes = await ReadAllAsync(oldValueStream);
+            var newValueBytes = await ReadAllAsync(newValueStream).ConfigureAwait(false);
+            var oldValueBytes = await ReadAllAsync(oldValueStream).ConfigureAwait(false);
 
             var readerOptions = new JsonReaderOptions { CommentHandling = JsonCommentHandling.Allow, AllowTrailingCommas = true };
             var writerOptions = new JsonWriterOptions { Indented = Options.WriteIndented, Encoder = Options.Encoder };

@@ -68,6 +68,10 @@ namespace FancyWM
     internal class TilingWorkspaceState
     {
         private readonly Dictionary<IVirtualDesktop, DesktopState> m_states = [];
+        // DesktopState keeps its tree identity while roots are rebuilt or restored.
+        private readonly Dictionary<DesktopTree, (DesktopState? State, int Count)> m_statesByTree
+            = new(ReferenceEqualityComparer.Instance);
+        private int m_nullStateCount;
 
         public IEnumerable<IVirtualDesktop> Desktops => m_states.Keys;
         public IEnumerable<DesktopState> States => m_states.Values;
@@ -75,6 +79,17 @@ namespace FancyWM
         public void AddState(IVirtualDesktop virtualDesktop, DesktopState state)
         {
             m_states.Add(virtualDesktop, state);
+            if (state == null)
+            {
+                m_nullStateCount++;
+                return;
+            }
+            if (state.DesktopTree is DesktopTree tree)
+            {
+                m_statesByTree[tree] = m_statesByTree.TryGetValue(tree, out var entry)
+                    ? (null, entry.Count + 1)
+                    : (state, 1);
+            }
         }
 
         public DesktopState? GetState(IVirtualDesktop virtualDesktop)
@@ -84,20 +99,67 @@ namespace FancyWM
 
         public DesktopState? GetState(DesktopTree tree)
         {
+            if (tree != null && m_nullStateCount == 0)
+            {
+                if (!m_statesByTree.TryGetValue(tree, out var entry))
+                {
+                    return null;
+                }
+                if (entry.Count == 1)
+                {
+                    return entry.State;
+                }
+            }
+            return FindSingleStateForTree(tree);
+        }
+
+        private DesktopState? FindSingleStateForTree(DesktopTree? tree)
+        {
+            // Preserve the original ambiguity and malformed-null behavior.
             return m_states.Where(x => x.Value.DesktopTree == tree).SingleOrDefault().Value;
         }
 
         public void RemoveState(IVirtualDesktop virtualDesktop)
         {
-            if (!m_states.Remove(virtualDesktop))
+            if (!m_states.Remove(virtualDesktop, out var state))
             {
                 throw new ArgumentException("The specified desktop does not exist!");
+            }
+            if (state == null)
+            {
+                m_nullStateCount--;
+                return;
+            }
+            if (state.DesktopTree is DesktopTree tree)
+            {
+                var entry = m_statesByTree[tree];
+                if (entry.Count == 1)
+                {
+                    m_statesByTree.Remove(tree);
+                }
+                else if (entry.Count == 2)
+                {
+                    var remaining = m_states.Values.Single(candidate => candidate?.DesktopTree == tree);
+                    m_statesByTree[tree] = (remaining, 1);
+                }
+                else
+                {
+                    m_statesByTree[tree] = (null, entry.Count - 1);
+                }
             }
         }
 
         public DesktopState? FindByVdm(IWindow window)
         {
-            var desktop = m_states.Keys.FirstOrDefault(x => x.HasWindow(window));
+            IVirtualDesktop? desktop = null;
+            foreach (var candidate in m_states.Keys)
+            {
+                if (candidate.HasWindow(window))
+                {
+                    desktop = candidate;
+                    break;
+                }
+            }
             if (desktop == null)
             {
                 return null;
@@ -107,8 +169,14 @@ namespace FancyWM
 
         public DesktopState? FindByTree(IWindow window)
         {
-            var state = m_states.Values.FirstOrDefault(x => x.DesktopTree.FindNode(window) != null);
-            return state;
+            foreach (var state in m_states.Values)
+            {
+                if (state.DesktopTree.FindNode(window) != null)
+                {
+                    return state;
+                }
+            }
+            return null;
         }
     }
 
@@ -353,25 +421,25 @@ namespace FancyWM
             if (node.Desktop == null)
                 throw new ArgumentException($"Node must be registered with the backend!", nameof(node));
 
-            var nodeAtPoint = node.Desktop.Root!.Windows
-                .Where(x => x != node)
-                .Concat(node.Desktop.Root.Nodes.Where(x => x.Type == TilingNodeType.Placeholder))
-                .FirstOrDefault(x => x.ComputedRectangle.Contains(pt)) ?? node.Desktop.Root!.Nodes
-                    .OfType<PanelNode>()
-                    .Where(x => x != node)
-                    .FirstOrDefault(x => Rectangle.OffsetAndSize(
-                        x.ComputedRectangle.Left - x.Padding.Left,
-                        x.ComputedRectangle.Top - x.Padding.Top,
-                        x.ComputedRectangle.Width + x.Padding.Left + x.Padding.Right,
-                        x.Padding.Top).Contains(pt));
+            var nodeAtPoint = FindMoveTarget(node, pt);
             if (nodeAtPoint == null || nodeAtPoint.Parent == null)
                 return;
 
-            if (nodeAtPoint.PathToRoot.Contains(node))
-                throw new TilingFailedException(TilingError.CausesRecursiveNesting);
+            for (TilingNode? ancestor = nodeAtPoint; ancestor != null; ancestor = ancestor.Parent)
+            {
+                if (EqualityComparer<TilingNode>.Default.Equals(ancestor, node))
+                    throw new TilingFailedException(TilingError.CausesRecursiveNesting);
+            }
 
-            if (nodeAtPoint.PathToRoot.OfType<StackPanelNode>().Any() && node is not WindowNode)
-                throw new TilingFailedException(TilingError.NestingInStackPanel);
+            for (TilingNode? ancestor = nodeAtPoint; ancestor != null; ancestor = ancestor.Parent)
+            {
+                if (ancestor is not StackPanelNode)
+                    continue;
+
+                if (node is not WindowNode)
+                    throw new TilingFailedException(TilingError.NestingInStackPanel);
+                break;
+            }
 
             if (nodeAtPoint.Type == TilingNodeType.Placeholder)
             {
@@ -438,6 +506,103 @@ namespace FancyWM
                     }
                 }
             }
+        }
+
+        private static TilingNode? FindMoveTarget(TilingNode source, Point pt)
+        {
+            if (TryFindBuiltInMoveTarget(source.Desktop!.Root!, source, pt, out var target))
+            {
+                return target;
+            }
+
+            return source.Desktop!.Root!.Windows
+                .Where(x => x != source)
+                .Concat(source.Desktop.Root.Nodes.Where(x => x.Type == TilingNodeType.Placeholder))
+                .FirstOrDefault(x => x.ComputedRectangle.Contains(pt)) ?? source.Desktop.Root!.Nodes
+                    .OfType<PanelNode>()
+                    .Where(x => x != source)
+                    .FirstOrDefault(x => Rectangle.OffsetAndSize(
+                        x.ComputedRectangle.Left - x.Padding.Left,
+                        x.ComputedRectangle.Top - x.Padding.Top,
+                        x.ComputedRectangle.Width + x.Padding.Left + x.Padding.Right,
+                        x.Padding.Top).Contains(pt));
+        }
+
+        private static bool TryFindBuiltInMoveTarget(
+            TilingNode root,
+            TilingNode source,
+            Point pt,
+            out TilingNode? target)
+        {
+            var pending = new Stack<TilingNode>(16);
+            pending.Push(root);
+            TilingNode? placeholder = null;
+            while (pending.TryPop(out var node))
+            {
+                var type = node.GetType();
+                if (type == typeof(WindowNode))
+                {
+                    if (node != source && node.ComputedRectangle.Contains(pt))
+                    {
+                        target = node;
+                        return true;
+                    }
+                    continue;
+                }
+                if (type == typeof(PlaceholderNode))
+                {
+                    if (placeholder == null && node.ComputedRectangle.Contains(pt))
+                    {
+                        placeholder = node;
+                    }
+                    continue;
+                }
+                if (type != typeof(SplitPanelNode) && type != typeof(StackPanelNode))
+                {
+                    target = null;
+                    return false;
+                }
+
+                var children = ((PanelNode)node).Children;
+                for (int i = children.Count - 1; i >= 0; i--)
+                {
+                    pending.Push(children[i]);
+                }
+            }
+
+            if (placeholder != null)
+            {
+                target = placeholder;
+                return true;
+            }
+
+            pending.Push(root);
+            while (pending.TryPop(out var node))
+            {
+                if (node is not PanelNode panel)
+                {
+                    continue;
+                }
+                if (panel != source
+                    && Rectangle.OffsetAndSize(
+                        panel.ComputedRectangle.Left - panel.Padding.Left,
+                        panel.ComputedRectangle.Top - panel.Padding.Top,
+                        panel.ComputedRectangle.Width + panel.Padding.Left + panel.Padding.Right,
+                        panel.Padding.Top).Contains(pt))
+                {
+                    target = panel;
+                    return true;
+                }
+
+                var children = panel.Children;
+                for (int i = children.Count - 1; i >= 0; i--)
+                {
+                    pending.Push(children[i]);
+                }
+            }
+
+            target = null;
+            return true;
         }
 
         private static int FindInsertionIndex(TilingNode nodeAtPoint, Point pt)
@@ -568,8 +733,17 @@ namespace FancyWM
 
             var rootClone = (PanelNode)node.Desktop.Root!.Clone();
 
-            var nodeClone = rootClone.Nodes.First(x => x.GenerationID == node.GenerationID);
-            var newParentClone = (PanelNode)rootClone.Nodes.First(x => x.GenerationID == newParentNode.GenerationID);
+            if (!TryFindBuiltInCloneGenerations(
+                rootClone,
+                node.GenerationID,
+                newParentNode.GenerationID,
+                out var nodeClone,
+                out var newParentCandidate))
+            {
+                nodeClone = rootClone.Nodes.First(x => x.GenerationID == node.GenerationID);
+                newParentCandidate = rootClone.Nodes.First(x => x.GenerationID == newParentNode.GenerationID);
+            }
+            var newParentClone = (PanelNode)newParentCandidate;
             var testTree = new DesktopTree
             {
                 Root = rootClone,
@@ -577,7 +751,13 @@ namespace FancyWM
             };
 
             var nodeCloneParent = nodeClone.Parent!;
-            var newParentIsAncestor = nodeCloneParent.Ancestors.Contains(newParentClone);
+            bool newParentIsAncestor = false;
+            for (var ancestor = nodeCloneParent.Parent; ancestor != null; ancestor = ancestor.Parent)
+            {
+                if (!EqualityComparer<PanelNode>.Default.Equals(ancestor, newParentClone)) continue;
+                newParentIsAncestor = true;
+                break;
+            }
 
             nodeCloneParent.Detach(nodeClone);
             nodeCloneParent.Cleanup(collapse: AutoCollapse);
@@ -595,6 +775,78 @@ namespace FancyWM
             testTree.Arrange();
 
             return newParentClone.ComputedRectangle.Contains(pt);
+        }
+
+        private static bool TryFindBuiltInCloneGenerations(
+            TilingNode root,
+            long firstGeneration,
+            long secondGeneration,
+            out TilingNode first,
+            out TilingNode second)
+        {
+            TilingNode? firstMatch = null;
+            TilingNode? secondMatch = null;
+            var completed = TryFindBuiltInCloneGenerationsCore(
+                root,
+                firstGeneration,
+                secondGeneration,
+                ref firstMatch,
+                ref secondMatch);
+            first = firstMatch!;
+            second = secondMatch!;
+            return completed && firstMatch != null && secondMatch != null;
+        }
+
+        private static bool TryFindBuiltInCloneGenerationsCore(
+            TilingNode node,
+            long firstGeneration,
+            long secondGeneration,
+            ref TilingNode? first,
+            ref TilingNode? second)
+        {
+            var type = node.GetType();
+            if (type != typeof(SplitPanelNode)
+                && type != typeof(StackPanelNode)
+                && type != typeof(WindowNode)
+                && type != typeof(PlaceholderNode))
+            {
+                return false;
+            }
+
+            if (first == null && node.GenerationID == firstGeneration)
+            {
+                first = node;
+            }
+            if (second == null && node.GenerationID == secondGeneration)
+            {
+                second = node;
+            }
+            if (first != null && second != null)
+            {
+                return true;
+            }
+
+            if (node is PanelNode panel)
+            {
+                var children = panel.Children;
+                for (int i = 0; i < children.Count; i++)
+                {
+                    if (!TryFindBuiltInCloneGenerationsCore(
+                        children[i],
+                        firstGeneration,
+                        secondGeneration,
+                        ref first,
+                        ref second))
+                    {
+                        return false;
+                    }
+                    if (first != null && second != null)
+                    {
+                        return true;
+                    }
+                }
+            }
+            return true;
         }
 
         private static Rectangle TransferSize(Rectangle a, Rectangle b)
@@ -626,7 +878,15 @@ namespace FancyWM
             var desktop = sourceNode.Desktop!;
             var rootClone = (PanelNode)desktop.Root!.Clone();
 
-            var sourceNodeClone = rootClone.Nodes.First(x => x.GenerationID == sourceNode.GenerationID);
+            if (!TryFindBuiltInCloneGenerations(
+                rootClone,
+                sourceNode.GenerationID,
+                sourceNode.GenerationID,
+                out var sourceNodeClone,
+                out _))
+            {
+                sourceNodeClone = rootClone.Nodes.First(x => x.GenerationID == sourceNode.GenerationID);
+            }
             var testTree = new DesktopTree
             {
                 Root = rootClone,
@@ -646,10 +906,9 @@ namespace FancyWM
                 throw new TilingFailedException(TilingError.NoValidPlacementExists);
             }
 
-            foreach (var node in unconstrainedParentClone.Nodes)
-            {
-                node.ClearConstraints();
-            }
+            TilingNode? unconstrainedSourceNodeClone = null;
+            bool canReuseSource = true;
+            ClearPreviewConstraints(unconstrainedParentClone, sourceNode.GenerationID, ref unconstrainedSourceNodeClone, ref canReuseSource);
             unconstrainedParentClone.Padding = new();
             try
             {
@@ -659,9 +918,43 @@ namespace FancyWM
             {
                 throw new TilingFailedException(TilingError.NoValidPlacementExists);
             }
-            var unconstrainedSourceNodeClone = unconstrainedParentClone.Nodes.First(x => x.GenerationID == sourceNode.GenerationID);
+            if (!canReuseSource || unconstrainedSourceNodeClone == null)
+            {
+                unconstrainedSourceNodeClone = unconstrainedParentClone.Nodes.First(x => x.GenerationID == sourceNode.GenerationID);
+            }
 
             return (unconstrainedSourceNodeClone.ComputedRectangle, sourceNodeClone.ComputedRectangle);
+        }
+
+        private static void ClearPreviewConstraints(TilingNode node, long sourceGeneration, ref TilingNode? source, ref bool canReuseSource)
+        {
+            var type = node.GetType();
+            if (type != typeof(SplitPanelNode) && type != typeof(StackPanelNode)
+                && type != typeof(WindowNode) && type != typeof(PlaceholderNode))
+            {
+                // Custom Nodes enumerations can hide descendants, and layout
+                // callbacks can change which generation match is first. Keep
+                // their original walk and repeat the lookup after Arrange.
+                canReuseSource = false;
+                foreach (var descendant in node.Nodes)
+                {
+                    descendant.ClearConstraints();
+                }
+                return;
+            }
+
+            node.ClearConstraints();
+            if (source == null && node.GenerationID == sourceGeneration)
+            {
+                source = node;
+            }
+            if (node is PanelNode panel)
+            {
+                foreach (var child in (List<TilingNode>)panel.Children)
+                {
+                    ClearPreviewConstraints(child, sourceGeneration, ref source, ref canReuseSource);
+                }
+            }
         }
 
         public void ResizeWindow(IWindow window, Rectangle newPosition, Rectangle oldPosition)
@@ -678,10 +971,7 @@ namespace FancyWM
         {
             if (newPosition.Width != oldPosition.Width)
             {
-                GridLikeNode? p = node.Ancestors
-                    .Select(x => x as GridLikeNode)
-                    .Where(x => x != null)
-                    .FirstOrDefault(x => x!.CanResizeInOrientation(PanelOrientation.Horizontal));
+                var (p, child) = FindResizeParent(node, PanelOrientation.Horizontal);
 
                 if (p != null)
                 {
@@ -692,7 +982,6 @@ namespace FancyWM
                         : leftResizeAmount > rightResizeAmount
                             ? GrowDirection.TowardsStart
                             : GrowDirection.Both;
-                    var child = p.Children.First(x => x.Nodes.Contains(node));
                     var childIndex = p.IndexOf(child);
                     var sizeDelta = newPosition.Width - oldPosition.Width;
 
@@ -713,10 +1002,7 @@ namespace FancyWM
 
             if (newPosition.Height != oldPosition.Height)
             {
-                GridLikeNode? p = node.Ancestors
-                    .Select(x => x as GridLikeNode)
-                    .Where(x => x != null)
-                    .FirstOrDefault(x => x!.CanResizeInOrientation(PanelOrientation.Vertical));
+                var (p, child) = FindResizeParent(node, PanelOrientation.Vertical);
 
                 if (p != null)
                 {
@@ -727,7 +1013,6 @@ namespace FancyWM
                         : topResizeAmount > bottomResizeAmount
                             ? GrowDirection.TowardsStart
                             : GrowDirection.Both;
-                    var child = p.Children.First(x => x.Nodes.Contains(node));
                     var childIndex = p.IndexOf(child);
                     var sizeDelta = newPosition.Height - oldPosition.Height;
 
@@ -745,6 +1030,17 @@ namespace FancyWM
                     p.ResizeBy(child, sizeDelta, direction);
                 }
             }
+        }
+
+        private static (GridLikeNode? Panel, TilingNode Child) FindResizeParent(TilingNode node, PanelOrientation orientation)
+        {
+            var child = node;
+            for (var parent = node.Parent; parent != null; child = parent, parent = parent.Parent)
+            {
+                if (parent is GridLikeNode grid && grid.CanResizeInOrientation(orientation))
+                    return (grid, child);
+            }
+            return (null, node);
         }
 
         public TilingNode? GetFocus(IVirtualDesktop currentDesktop)

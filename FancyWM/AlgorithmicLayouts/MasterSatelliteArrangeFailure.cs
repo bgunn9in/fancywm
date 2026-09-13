@@ -68,6 +68,11 @@ namespace FancyWM.AlgorithmicLayouts
         private readonly HashSet<IntPtr> m_pendingHandles = [];
         private readonly object m_lock = new();
 
+        public bool HasPending
+        {
+            get { lock (m_lock) { return m_pendingHandles.Count > 0; } }
+        }
+
         public bool TryMark(IntPtr handle)
         {
             if (handle == IntPtr.Zero)
@@ -83,9 +88,10 @@ namespace FancyWM.AlgorithmicLayouts
         public void ReleaseResolved(IEnumerable<IntPtr> currentTreeHandles)
         {
             ArgumentNullException.ThrowIfNull(currentTreeHandles);
-            var retained = currentTreeHandles.ToHashSet();
             lock (m_lock)
             {
+                if (m_pendingHandles.Count == 0) { return; }
+                var retained = currentTreeHandles.ToHashSet();
                 m_pendingHandles.IntersectWith(retained);
             }
         }

@@ -66,6 +66,8 @@ namespace FancyWM.AlgorithmicLayouts
 
         int RemoveDisplay(IDisplay display);
 
+        int CountForDisplay(IDisplay display);
+
         IReadOnlyList<MasterSatelliteRuntimeEntry> SnapshotForDisplay(IDisplay display);
 
         void Clear();
@@ -109,6 +111,23 @@ namespace FancyWM.AlgorithmicLayouts
             return keys.Length;
         }
 
+        public int CountForDisplay(IDisplay display)
+        {
+            ArgumentNullException.ThrowIfNull(display);
+            int count = 0;
+            foreach (KeyValuePair<LayoutStateKey, MasterSatelliteRuntimeState> pair
+                in m_states)
+            {
+                if (MasterSatelliteDisplayEligibility.DisplaysMatch(
+                    pair.Key.Display,
+                    display))
+                {
+                    count++;
+                }
+            }
+            return count;
+        }
+
         public IReadOnlyList<MasterSatelliteRuntimeEntry> SnapshotForDisplay(IDisplay display)
         {
             ArgumentNullException.ThrowIfNull(display);
@@ -136,7 +155,7 @@ namespace FancyWM.AlgorithmicLayouts
 
         public MasterSatelliteLayoutSettings SettingsSnapshot { get; private set; } = new();
 
-        public int StateCount => m_registry.SnapshotForDisplay(Display).Count;
+        public int StateCount => m_registry.CountForDisplay(Display);
 
         public MasterSatelliteRuntimeSession(
             IDisplay display,

@@ -28,7 +28,6 @@ namespace FancyWM.ThemeEngine.Wpf
 
         public async Task<IReadOnlyDictionary<string, CssValue>> ConvertAsync(string htmlTemplate, string cssText)
         {
-            Dictionary<string, ICssStyleDeclaration> results = [];
             var styledDoc = await StyledDocument.CreateAsync(m_config);
             styledDoc.Parse(htmlTemplate, cssText);
             var stylesDict = styledDoc.GetComputedStyles();

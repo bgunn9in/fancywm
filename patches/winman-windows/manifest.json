@@ -1,0 +1,39 @@
+{
+  "perf_id": "PERF-001/PERF-002/PERF-022/PERF-016",
+  "submodule": "winman-windows",
+  "pinned_commit": "adb9f55b84b567db9f6e0ee8df4c33d11a12d91f",
+  "patch": "patches/winman-windows/PERF-001-recent-timer.patch",
+  "patch_sha256": "14ED4DC4C7729826D61972D1590C0B56F375EC9586543F903E0BA19EE29AF3D8",
+  "files": [
+    {
+      "path": "src/WinMan.Windows.DllImports/NativeMethods.txt",
+      "base_blob": "22b27c84664a7dbf7678cbcc868c826720dbca6a",
+      "applied_blob": "245c8de95b8c2d0d92223e4e05e63ac194e2abd4"
+    },
+    {
+      "path": "src/WinMan.Windows/Windows/Win32DisplayManager.cs",
+      "base_blob": "0720e228efe58afe7c6025cbece3196a7f1e6dc7",
+      "applied_blob": "b8edb7c1c34049158f3b95724d956f7cbbfada87"
+    },
+    {
+      "path": "src/WinMan.Windows/Windows/Win32VirtualDesktop.cs",
+      "base_blob": "534cf0ee32cf8ed74b2472264b88c21372f03983",
+      "applied_blob": "3feebba8e9dc395e9098cead74e664754802dba9"
+    },
+    {
+      "path": "src/WinMan.Windows/Windows/Win32VirtualDesktopManager.cs",
+      "base_blob": "97382a2a49a57de14ee3be719500b69e8b7edc69",
+      "applied_blob": "6fe0a3823b0d0020472604f083ac5a1462b4ec2b"
+    },
+    {
+      "path": "src/WinMan.Windows/Windows/Win32Workspace.cs",
+      "base_blob": "2ef281f944d553ae6f1371e11e997172064d6b98",
+      "applied_blob": "d73ead41a10093c49362d9766411722933fefcc4"
+    },
+    {
+      "path": "src/WinMan.Windows/Utilities/EventLoop.cs",
+      "base_blob": "361598683e7feedda9a033de5020c60766f889df",
+      "applied_blob": "9b852277130253419fa2c71c6ba95e5ede1429e9"
+    }
+  ]
+}

@@ -1,5 +1,7 @@
-﻿using System;
+using System;
+using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.ExceptionServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -20,14 +22,24 @@ namespace FancyWM.Windows
     {
         private readonly ILogger m_logger = App.Current.Logger;
         private readonly SettingsViewModel m_viewModel;
+        private readonly PageNavigation m_pages;
 
         public SettingsWindow(SettingsViewModel viewModel)
         {
             m_logger.Debug($"Initialising {nameof(SettingsWindow)}");
             m_viewModel = viewModel;
             DataContext = viewModel;
+            m_pages = new PageNavigation(Dispatcher,
+                type => (UIElement)Activator.CreateInstance(type, m_viewModel)!,
+                page => PageContent.Child = page,
+                error => m_logger.Error(error, "Failed to navigate settings pages"));
 
-            InitializeComponent();
+            try { InitializeComponent(); }
+            catch
+            {
+                m_pages.Dispose();
+                throw;
+            }
             m_logger.Debug($"Initialised {nameof(SettingsWindow)} successfully");
         }
 
@@ -51,23 +63,94 @@ namespace FancyWM.Windows
 
         protected override void OnClosed(EventArgs e)
         {
-            base.OnClosed(e);
-            m_viewModel.Dispose();
-            FocusManager.SetFocusedElement(this, null);
-            Keyboard.ClearFocus();
-            GCHelper.ScheduleCollection();
+            CompleteClose(
+                m_pages.Dispose,
+                error => m_logger.Error(error, "Failed to dispose settings pages"),
+                () => base.OnClosed(e),
+                m_viewModel.Dispose,
+                () => FocusManager.SetFocusedElement(this, null),
+                Keyboard.ClearFocus,
+                GCHelper.ScheduleCollection);
+        }
+
+        internal static void CompleteClose(
+            Action disposePages,
+            Action<Exception> reportPageFailure,
+            Action notifyClosed,
+            Action disposeViewModel,
+            Action clearLogicalFocus,
+            Action clearKeyboardFocus,
+            Action scheduleCollection)
+        {
+            ExceptionDispatchInfo? failure = null;
+            List<Exception>? laterFailures = null;
+            void release(Action action)
+            {
+                try
+                {
+                    action();
+                }
+                catch (Exception error)
+                {
+                    if (failure == null)
+                    {
+                        failure = ExceptionDispatchInfo.Capture(error);
+                    }
+                    else
+                    {
+                        (laterFailures ??= []).Add(error);
+                    }
+                }
+            }
+
+            try
+            {
+                disposePages();
+            }
+            catch (Exception error)
+            {
+                release(() => reportPageFailure(error));
+            }
+            release(notifyClosed);
+            release(disposeViewModel);
+            release(clearLogicalFocus);
+            release(clearKeyboardFocus);
+            release(scheduleCollection);
+
+            if (laterFailures != null)
+            {
+                AttachLaterCloseFailures(failure!.SourceException, laterFailures);
+            }
+            failure?.Throw();
+        }
+
+        private static void AttachLaterCloseFailures(Exception primary, List<Exception> laterFailures)
+        {
+            try
+            {
+                const string key = "SettingsWindow.OnClosedExceptions";
+                if (primary.Data[key] is AggregateException existing)
+                {
+                    laterFailures.InsertRange(0, existing.InnerExceptions);
+                }
+                primary.Data[key] = new AggregateException(laterFailures);
+            }
+            catch
+            {
+                // Supplemental close diagnostics must never replace the first
+                // error from the ordered close sequence.
+            }
         }
 
         private void PagesList_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
-            var item = e.AddedItems.Cast<PageItem>().First();
-            GoToPage(item.Page!);
+            var item = e.AddedItems.OfType<PageItem>().FirstOrDefault();
+            if (item?.Page != null) GoToPage(item.Page);
         }
 
         public void GoToPage(Type pageType)
         {
-            var page = (UIElement)Activator.CreateInstance(pageType, m_viewModel)!;
-            Dispatcher.InvokeAsync(() => PageContent.Child = page, DispatcherPriority.ContextIdle);
+            m_pages.Navigate(pageType);
         }
 
         private void OnQuitButtonClick(object sender, RoutedEventArgs e)

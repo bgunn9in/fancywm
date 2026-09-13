@@ -20,6 +20,8 @@ namespace FancyWM.Utilities
 
         private readonly KeyCode[] m_modifiers;
         private readonly bool[] m_pressedModifiers;
+        private readonly object m_lifetimeLock = new();
+        private volatile bool m_disposed;
         private bool m_keyDirty = false;
 
         public LowLevelHotkey(LowLevelKeyboardHook keyboardHook, IReadOnlyCollection<KeyCode> modifierKeys, KeyCode key)
@@ -51,31 +53,21 @@ namespace FancyWM.Utilities
 
         private void OnLowLevelKeyStateChanged(object? sender, ref LowLevelKeyboardHook.KeyStateChangedEventArgs e)
         {
+            if (m_disposed)
+            {
+                return;
+            }
             var inputKeyCode = RemapKeyCode(e.KeyCode);
             var mainKeyCode = RemapKeyCode(Key);
-
-            bool Scan(ref LowLevelKeyboardHook.KeyStateChangedEventArgs e)
-            {
-                if (m_pressedModifiers.All(x => x) && inputKeyCode == mainKeyCode)
-                {
-                    Dispatcher.BeginInvoke(() =>
-                    {
-                        Pressed?.Invoke(this, new EventArgs());
-                    });
-                    return true;
-                }
-                return false;
-            }
 
             if (e.IsPressed)
             {
                 // 1. Unless we want the trigger on release.
                 // 2. Check if the hotkey is triggered (requires main key).
                 // 3. And if so, if we need to hide the main key, do so.
-                if (!ScanOnRelease && Scan(ref e) && HideKeyPress)
+                if (!ScanOnRelease && Scan(inputKeyCode, mainKeyCode) && HideKeyPress)
                 {
-                    m_keyDirty = true;
-                    e.Handled = true;
+                    SuppressKey(isPressed: true, ref e);
                 }
 
                 int modifierIndex = Array.IndexOf(m_modifiers, e.KeyCode);
@@ -101,23 +93,73 @@ namespace FancyWM.Utilities
                 // Handle the dirty key.
                 if (inputKeyCode == mainKeyCode && m_keyDirty)
                 {
-                    m_keyDirty = false;
-                    e.Handled = true;
+                    SuppressKey(isPressed: false, ref e);
                 }
 
                 // 1. If we want to trigger on release.
                 // 2. Check if the hotkey is triggered (requires main key).
                 if (ScanOnRelease)
                 {
-                    Scan(ref e);
+                    Scan(inputKeyCode, mainKeyCode);
                 }
             }
         }
 
+        private bool Scan(KeyCode inputKeyCode, KeyCode mainKeyCode)
+        {
+            if (!m_pressedModifiers.All(x => x) || inputKeyCode != mainKeyCode)
+            {
+                return false;
+            }
+            lock (m_lifetimeLock)
+            {
+                if (m_disposed)
+                {
+                    return false;
+                }
+            }
+            // Posting can re-enter through Dispatcher.Hooks. An admitted post
+            // may finish after Dispose; its notification still checks lifetime.
+            Dispatcher.BeginInvoke(new Action(NotifyPressed));
+            return true;
+        }
+
+        private void SuppressKey(bool isPressed, ref LowLevelKeyboardHook.KeyStateChangedEventArgs e)
+        {
+            lock (m_lifetimeLock)
+            {
+                if (!m_disposed)
+                {
+                    m_keyDirty = isPressed;
+                    e.Handled = true;
+                }
+            }
+        }
+
+        private void NotifyPressed()
+        {
+            EventHandler<EventArgs>? handler;
+            lock (m_lifetimeLock)
+            {
+                if (m_disposed)
+                {
+                    return;
+                }
+                handler = Pressed;
+            }
+            // Already-claimed user code may complete across disposal. Never
+            // hold the owner gate while invoking arbitrary application handlers.
+            handler?.Invoke(this, new EventArgs());
+        }
+
         public void Dispose()
         {
-            Pressed = null;
-            KeyboardHook.KeyStateChanged -= OnLowLevelKeyStateChanged;
+            lock (m_lifetimeLock)
+            {
+                m_disposed = true;
+                Pressed = null;
+                KeyboardHook.KeyStateChanged -= OnLowLevelKeyStateChanged;
+            }
         }
     }
 }

@@ -510,11 +510,22 @@ namespace FancyWM.AlgorithmicLayouts
             MasterSatelliteRuntimeState state,
             MasterSatelliteLayoutSettings settings)
         {
+            return ValidateInvariant(tree, state, settings, capturedTreeDescription: null);
+        }
+
+        private MasterSatelliteInvariantResult ValidateInvariant(
+            DesktopTree tree,
+            MasterSatelliteRuntimeState state,
+            MasterSatelliteLayoutSettings settings,
+            string? capturedTreeDescription)
+        {
             ArgumentNullException.ThrowIfNull(tree);
             ArgumentNullException.ThrowIfNull(state);
             ArgumentNullException.ThrowIfNull(settings);
 
-            string description = DescribeTree(tree.Root);
+            // Callers may share a description captured at this same state boundary.
+            // All live invariant checks still run, and no result is cached across mutations.
+            string description = capturedTreeDescription ?? DescribeTree(tree.Root);
             var violations = new List<string>();
             if (!state.IsActive)
             {
@@ -554,12 +565,35 @@ namespace FancyWM.AlgorithmicLayouts
                 violations.Add("LayoutFunctionNode/static layout nodes are not allowed in a canonical tree.");
             }
 
-            var windowNodes = nodes.OfType<WindowNode>().ToList();
-            var duplicateWindows = windowNodes
-                .GroupBy(node => node.WindowReference)
-                .Where(group => group.Count() > 1)
-                .ToList();
-            if (duplicateWindows.Count > 0)
+            int windowNodeCount = 0;
+            foreach (var node in nodes)
+            {
+                if (node is WindowNode)
+                {
+                    windowNodeCount++;
+                }
+            }
+
+            var windowNodes = new List<WindowNode>(windowNodeCount);
+            foreach (var node in nodes)
+            {
+                if (node is WindowNode windowNode)
+                {
+                    windowNodes.Add(windowNode);
+                }
+            }
+            var distinctWindows = new HashSet<IWindow>(
+                windowNodeCount,
+                LookupCompatibleWindowComparer.Instance);
+            bool hasDuplicateWindows = false;
+            foreach (var node in windowNodes)
+            {
+                if (!distinctWindows.Add(node.WindowReference))
+                {
+                    hasDuplicateWindows = true;
+                }
+            }
+            if (hasDuplicateWindows)
             {
                 violations.Add("The tree contains duplicate WindowNode references for a logical window.");
             }
@@ -568,11 +602,23 @@ namespace FancyWM.AlgorithmicLayouts
             {
                 violations.Add($"The runtime state exceeds the satellite limit of {settings.MaxSatellites}.");
             }
-            if (state.Satellites.Distinct().Count() != state.Satellites.Count)
+            if (new HashSet<IWindow>(state.Satellites).Count != state.Satellites.Count)
             {
                 violations.Add("The runtime satellite list contains duplicates.");
             }
-            if (state.Master != null && state.Satellites.Any(window => WindowEquals(window, state.Master)))
+            bool masterIsSatellite = false;
+            if (state.Master != null)
+            {
+                foreach (var window in state.Satellites)
+                {
+                    if (WindowEquals(window, state.Master))
+                    {
+                        masterIsSatellite = true;
+                        break;
+                    }
+                }
+            }
+            if (masterIsSatellite)
             {
                 violations.Add("The master also appears in the satellite list.");
             }
@@ -596,10 +642,15 @@ namespace FancyWM.AlgorithmicLayouts
                 violations.Add($"The tree has {windowNodes.Count} windows; runtime state expects {expectedWindowCount}.");
             }
 
-            var matchingMasterNodes = windowNodes
-                .Where(node => WindowEquals(node.WindowReference, state.Master))
-                .ToList();
-            if (matchingMasterNodes.Count != 1)
+            int matchingMasterCount = 0;
+            foreach (var node in windowNodes)
+            {
+                if (WindowEquals(node.WindowReference, state.Master))
+                {
+                    matchingMasterCount++;
+                }
+            }
+            if (matchingMasterCount != 1)
             {
                 violations.Add("The tree must contain exactly one node for the runtime master.");
             }
@@ -612,7 +663,16 @@ namespace FancyWM.AlgorithmicLayouts
                 {
                     violations.Add("A master-only tree must contain exactly the master as the root's sole child.");
                 }
-                if (nodes.OfType<PanelNode>().Any(panel => !ReferenceEquals(panel, root)))
+                bool hasMasterOnlyNestedPanel = false;
+                foreach (var node in nodes)
+                {
+                    if (node is PanelNode panel && !ReferenceEquals(panel, root))
+                    {
+                        hasMasterOnlyNestedPanel = true;
+                        break;
+                    }
+                }
+                if (hasMasterOnlyNestedPanel)
                 {
                     violations.Add("A master-only tree cannot contain a nested panel.");
                 }
@@ -650,10 +710,18 @@ namespace FancyWM.AlgorithmicLayouts
                 violations.Add("Every satellite panel child must be a direct WindowNode.");
             }
 
-            var extraPanels = nodes.OfType<PanelNode>()
-                .Where(panel => !ReferenceEquals(panel, root) && !ReferenceEquals(panel, satellitePanel))
-                .ToList();
-            if (extraPanels.Count > 0)
+            bool hasNonCanonicalPanel = false;
+            foreach (var node in nodes)
+            {
+                if (node is PanelNode panel
+                    && !ReferenceEquals(panel, root)
+                    && !ReferenceEquals(panel, satellitePanel))
+                {
+                    hasNonCanonicalPanel = true;
+                    break;
+                }
+            }
+            if (hasNonCanonicalPanel)
             {
                 violations.Add("Nested panels are not allowed below the canonical satellite panel.");
             }
@@ -668,10 +736,28 @@ namespace FancyWM.AlgorithmicLayouts
                 }
             }
 
-            var stateWindows = state.Satellites.Prepend(state.Master).ToList();
-            foreach (var treeWindow in windowNodes.Select(node => node.WindowReference))
+            var satellites = state.Satellites;
+            var master = state.Master;
+            int stateWindowCount = unchecked(satellites.Count + 1);
+            var stateWindows = new List<IWindow?>(stateWindowCount) { master };
+            if (stateWindowCount != 1)
             {
-                if (!stateWindows.Any(stateWindow => WindowEquals(stateWindow, treeWindow)))
+                stateWindows.AddRange(satellites);
+            }
+            foreach (var treeNode in windowNodes)
+            {
+                var treeWindow = treeNode.WindowReference;
+                bool tracked = false;
+                foreach (var stateWindow in stateWindows)
+                {
+                    if (WindowEquals(stateWindow, treeWindow))
+                    {
+                        tracked = true;
+                        break;
+                    }
+                }
+
+                if (!tracked)
                 {
                     violations.Add("The tree contains a window that is not tracked by runtime state.");
                     break;
@@ -691,7 +777,7 @@ namespace FancyWM.AlgorithmicLayouts
             ArgumentNullException.ThrowIfNull(settings);
 
             var before = CreateSnapshot(tree, state);
-            var beforeInvariant = ValidateInvariant(tree, state, settings);
+            var beforeInvariant = ValidateInvariant(tree, state, settings, before.TreeDescription);
             if (!state.IsActive)
             {
                 return Failure(tree, state, settings, MasterSatelliteFailureReason.Inactive,
@@ -777,7 +863,7 @@ namespace FancyWM.AlgorithmicLayouts
                 tree.Root = plan.Root;
                 state.CopyFrom(recoveredState);
                 var after = CreateSnapshot(tree, state);
-                var invariant = ValidateInvariant(tree, state, settings);
+                var invariant = ValidateInvariant(tree, state, settings, after.TreeDescription);
                 AssertInvariant(invariant);
                 m_diagnosticLog?.Invoke($"Master + Satellites recovery before:{Environment.NewLine}{before.TreeDescription}{Environment.NewLine}after:{Environment.NewLine}{after.TreeDescription}");
                 return MasterSatelliteOperationResult.Success(true, before, after, invariant, "The canonical layout was recovered.");
@@ -921,7 +1007,7 @@ namespace FancyWM.AlgorithmicLayouts
                     "Master + Satellites is not active for this desktop and display.");
             }
 
-            var currentInvariant = ValidateInvariant(tree, state, settings);
+            var currentInvariant = ValidateInvariant(tree, state, settings, before.TreeDescription);
             if (requireValidCurrentTree && !currentInvariant.IsValid)
             {
 #if DEBUG
@@ -938,7 +1024,7 @@ namespace FancyWM.AlgorithmicLayouts
                     return recovery;
                 }
                 before = CreateSnapshot(tree, state);
-                currentInvariant = ValidateInvariant(tree, state, settings);
+                currentInvariant = ValidateInvariant(tree, state, settings, before.TreeDescription);
 #endif
             }
 
@@ -1007,7 +1093,7 @@ namespace FancyWM.AlgorithmicLayouts
 
                 state.CopyFrom(committedState);
                 AssertInvariant(invariant);
-                var after = CreateSnapshot(tree, state);
+                var after = new MasterSatelliteLayoutSnapshot(state, tree.WorkArea, invariant.TreeDescription);
                 return MasterSatelliteOperationResult.Success(true, before, after, invariant);
             }
             catch (Exception e)
@@ -1233,7 +1319,7 @@ namespace FancyWM.AlgorithmicLayouts
             state.IsRecovering = false;
             state.Revision++;
             var after = CreateSnapshot(tree, state);
-            var invariant = ValidateInvariant(tree, state, settings);
+            var invariant = ValidateInvariant(tree, state, settings, after.TreeDescription);
             m_diagnosticLog?.Invoke($"Master + Satellites recovery failed: {message}{Environment.NewLine}{before.TreeDescription}");
             return new MasterSatelliteOperationResult(
                 false,
@@ -1252,7 +1338,7 @@ namespace FancyWM.AlgorithmicLayouts
             string message)
         {
             var snapshot = CreateSnapshot(tree, state);
-            var invariant = ValidateInvariant(tree, state, settings);
+            var invariant = ValidateInvariant(tree, state, settings, snapshot.TreeDescription);
             if (!state.IsActive)
             {
                 return MasterSatelliteOperationResult.Failure(
@@ -1284,7 +1370,7 @@ namespace FancyWM.AlgorithmicLayouts
                 reason,
                 message,
                 snapshot,
-                ValidateInvariant(tree, state, settings));
+                ValidateInvariant(tree, state, settings, snapshot.TreeDescription));
         }
 
         private static (SplitPanelNode Root, WindowNode Master, SplitPanelNode SatellitePanel) GetCanonicalNodes(
@@ -1328,8 +1414,20 @@ namespace FancyWM.AlgorithmicLayouts
 
         private static bool ContainsWindow(MasterSatelliteRuntimeState state, IWindow window)
         {
-            return WindowEquals(state.Master, window)
-                || state.Satellites.Any(satellite => WindowEquals(satellite, window));
+            if (WindowEquals(state.Master, window))
+            {
+                return true;
+            }
+
+            foreach (var satellite in state.Satellites)
+            {
+                if (WindowEquals(satellite, window))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private static int IndexOfWindow(IReadOnlyList<IWindow> windows, IWindow window)
@@ -1347,6 +1445,23 @@ namespace FancyWM.AlgorithmicLayouts
         private static bool WindowEquals(IWindow? left, IWindow? right)
         {
             return EqualityComparer<IWindow?>.Default.Equals(left, right);
+        }
+
+        private sealed class LookupCompatibleWindowComparer : IEqualityComparer<IWindow>
+        {
+            public static LookupCompatibleWindowComparer Instance { get; } = new();
+
+            public bool Equals(IWindow? left, IWindow? right)
+            {
+                return EqualityComparer<IWindow?>.Default.Equals(left, right);
+            }
+
+            public int GetHashCode(IWindow window)
+            {
+                return window == null
+                    ? 0
+                    : EqualityComparer<IWindow>.Default.GetHashCode(window) & int.MaxValue;
+            }
         }
 
         private static PanelOrientation ToPanelOrientation(SatelliteLayoutOrientation orientation)

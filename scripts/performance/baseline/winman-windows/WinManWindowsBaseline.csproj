@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows7.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AssemblyName>WinMan.Windows</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="$(BaselineSourceRoot)/winman-windows/src/WinMan.Windows/**/*.cs"
+             Exclude="$(BaselineSourceRoot)/winman-windows/src/WinMan.Windows/bin/**;$(BaselineSourceRoot)/winman-windows/src/WinMan.Windows/obj/**" />
+    <Reference Include="WinMan">
+      <HintPath>../../../../winman/src/WinMan/bin/Release/netstandard2.1/WinMan.dll</HintPath>
+    </Reference>
+    <Reference Include="WinMan.Windows.DllImports">
+      <HintPath>../../../../winman-windows/src/WinMan.Windows.DllImports/bin/Release/net10.0/WinMan.Windows.DllImports.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+  <Target Name="RequireBaselineSource" BeforeTargets="CoreCompile">
+    <Error Condition="!Exists('$(BaselineSourceRoot)/winman-windows/src/WinMan.Windows/Windows/Win32Workspace.cs')" Text="Pass BaselineSourceRoot pointing to a preserved, verified baseline snapshot." />
+  </Target>
+</Project>

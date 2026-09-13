@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WindowsPerformanceRecorder Version="1.0" Author="FancyWM">
+  <Profiles>
+    <EventCollector Id="FullAppMarkers" Name="FancyWM Full App Markers">
+      <BufferSize Value="64" />
+      <Buffers Value="64" />
+    </EventCollector>
+    <EventProvider Id="FullAppProvider" Name="a5bbdb9a-4198-4e10-b6d9-8a50ef9e7656" Level="5" />
+    <Profile Id="AnimationFullApp.Verbose.File" Name="AnimationFullApp" Description="Production full-app transition boundaries" DetailLevel="Verbose" LoggingMode="File">
+      <Collectors>
+        <EventCollectorId Value="FullAppMarkers">
+          <EventProviders>
+            <EventProviderId Value="FullAppProvider" />
+          </EventProviders>
+        </EventCollectorId>
+      </Collectors>
+    </Profile>
+  </Profiles>
+</WindowsPerformanceRecorder>

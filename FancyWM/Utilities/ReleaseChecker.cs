@@ -7,7 +7,7 @@ using System.Threading.Tasks;
 
 namespace FancyWM.Utilities
 {
-    public class ReleaseChecker
+    public class ReleaseChecker : IDisposable
     {
         private class GitHubRelease
         {

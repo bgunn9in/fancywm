@@ -3,9 +3,9 @@ using System.Windows.Media;
 
 namespace FancyWM.Utilities
 {
-    internal static partial class ThemeEngineManager
+    internal sealed partial class ThemeEngineManager
     {
-        private const string HtmlTemplate = @"
+        internal const string HtmlTemplate = @"
 <panel>
     <panel-bar>
         <panel-bar-header>
@@ -21,7 +21,7 @@ namespace FancyWM.Utilities
 </panel>
 <panel class=""preview""></panel>
 ";
-        private static string GetDefaultCss(Func<string, object> R)
+        internal static string GetDefaultCss(Func<string, object> R, bool isDarkTheme, bool isRounded)
         {
             var accent = (Color)R("SystemAccentColor");
             var accentLight1 = (Color)R("SystemAccentColorLight1");
@@ -30,8 +30,6 @@ namespace FancyWM.Utilities
             var accentDark1 = (Color)R("SystemAccentColorDark1");
             var accentDark2 = (Color)R("SystemAccentColorDark2");
             var accentDark3 = (Color)R("SystemAccentColorDark3");
-            var isDarkTheme = ModernWpf.ThemeManager.Current.ActualApplicationTheme == ModernWpf.ApplicationTheme.Dark;
-            var isRounded = Environment.OSVersion.Version.Build >= 22000;
 
             var previewBorderColor = accentLight2;
             var previewRectangleFill = accentLight1.WithOpacity(0.1);

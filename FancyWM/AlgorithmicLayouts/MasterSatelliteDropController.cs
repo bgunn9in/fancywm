@@ -58,7 +58,7 @@ namespace FancyWM.AlgorithmicLayouts
     /// Converts pointer locations into the small set of mutations supported by the
     /// canonical Master + Satellites tree. It never invokes generic MoveNode/MoveWindow.
     /// </summary>
-    internal sealed class MasterSatelliteDropController
+    internal sealed partial class MasterSatelliteDropController
     {
         private readonly MasterSatelliteLayoutEngine m_previewEngine = new();
 
@@ -70,12 +70,38 @@ namespace FancyWM.AlgorithmicLayouts
             IWindow source,
             Point pointer)
         {
+            MasterSatelliteDropPlan? plan = null;
+            try
+            {
+                plan = CreateWindowDropPlanCore(
+                    backend, desktop, runtimeState, settings, source, pointer, useCache: true);
+                return plan;
+            }
+            finally
+            {
+                if (plan?.IsAccepted != true)
+                {
+                    ClearPreviewCache();
+                }
+            }
+        }
+
+        private MasterSatelliteDropPlan CreateWindowDropPlanCore(
+            TilingWorkspace backend,
+            IVirtualDesktop desktop,
+            MasterSatelliteRuntimeState runtimeState,
+            MasterSatelliteLayoutSettings settings,
+            IWindow source,
+            Point pointer,
+            bool useCache)
+        {
             ArgumentNullException.ThrowIfNull(backend);
             ArgumentNullException.ThrowIfNull(desktop);
             ArgumentNullException.ThrowIfNull(runtimeState);
             ArgumentNullException.ThrowIfNull(settings);
             ArgumentNullException.ThrowIfNull(source);
 
+            long cacheGeneration = m_previewCacheGeneration;
             if (!runtimeState.IsActive)
             {
                 return Reject(
@@ -143,9 +169,13 @@ namespace FancyWM.AlgorithmicLayouts
                     "Dropping a canonical window outside the layout is not supported.");
             }
 
+            PreviewAttempt? cacheAttempt = useCache
+                ? new PreviewAttempt(backend, cacheGeneration)
+                : null;
             if (WindowsMatch(previewState.Master, source))
             {
                 return PlanMasterDrop(
+                    cacheAttempt,
                     desktop,
                     previewTree,
                     previewState,
@@ -155,6 +185,7 @@ namespace FancyWM.AlgorithmicLayouts
                     runtimeState.Revision);
             }
             return PlanSatelliteDrop(
+                cacheAttempt,
                 desktop,
                 previewTree,
                 previewState,
@@ -169,6 +200,7 @@ namespace FancyWM.AlgorithmicLayouts
             MasterSatelliteRuntimeState runtimeState,
             PanelNode panel)
         {
+            ClearPreviewCache();
             ArgumentNullException.ThrowIfNull(desktop);
             ArgumentNullException.ThrowIfNull(runtimeState);
             ArgumentNullException.ThrowIfNull(panel);
@@ -193,13 +225,15 @@ namespace FancyWM.AlgorithmicLayouts
             IWindow source,
             Point pointer)
         {
-            var plan = CreateWindowDropPlan(
+            ClearPreviewCache();
+            var plan = CreateWindowDropPlanCore(
                 backend,
                 desktop,
                 runtimeState,
                 settings,
                 source,
-                pointer);
+                pointer,
+                useCache: false);
             return Apply(
                 backend,
                 desktop,
@@ -215,6 +249,7 @@ namespace FancyWM.AlgorithmicLayouts
             MasterSatelliteLayoutSettings settings,
             MasterSatelliteDropPlan plan)
         {
+            ClearPreviewCache();
             ArgumentNullException.ThrowIfNull(backend);
             ArgumentNullException.ThrowIfNull(desktop);
             ArgumentNullException.ThrowIfNull(runtimeState);
@@ -289,6 +324,7 @@ namespace FancyWM.AlgorithmicLayouts
         }
 
         private MasterSatelliteDropPlan PlanMasterDrop(
+            PreviewAttempt? cacheAttempt,
             IVirtualDesktop desktop,
             DesktopTree previewTree,
             MasterSatelliteRuntimeState previewState,
@@ -311,6 +347,7 @@ namespace FancyWM.AlgorithmicLayouts
                     ? MasterSide.Right
                     : MasterSide.Left;
                 return Simulate(
+                    cacheAttempt,
                     desktop,
                     previewTree,
                     previewState,
@@ -328,6 +365,7 @@ namespace FancyWM.AlgorithmicLayouts
             if (target != null)
             {
                 return Simulate(
+                    cacheAttempt,
                     desktop,
                     previewTree,
                     previewState,
@@ -350,6 +388,7 @@ namespace FancyWM.AlgorithmicLayouts
         }
 
         private MasterSatelliteDropPlan PlanSatelliteDrop(
+            PreviewAttempt? cacheAttempt,
             IVirtualDesktop desktop,
             DesktopTree previewTree,
             MasterSatelliteRuntimeState previewState,
@@ -362,6 +401,7 @@ namespace FancyWM.AlgorithmicLayouts
             if (masterNode?.ComputedRectangle.Contains(pointer) == true)
             {
                 return Simulate(
+                    cacheAttempt,
                     desktop,
                     previewTree,
                     previewState,
@@ -410,6 +450,7 @@ namespace FancyWM.AlgorithmicLayouts
             }
 
             return Simulate(
+                cacheAttempt,
                 desktop,
                 previewTree,
                 previewState,
@@ -424,6 +465,7 @@ namespace FancyWM.AlgorithmicLayouts
         }
 
         private MasterSatelliteDropPlan Simulate(
+            PreviewAttempt? cacheAttempt,
             IVirtualDesktop desktop,
             DesktopTree previewTree,
             MasterSatelliteRuntimeState previewState,
@@ -436,6 +478,27 @@ namespace FancyWM.AlgorithmicLayouts
             MasterSide? targetSide,
             long sourceRevision)
         {
+            // The caller has already copied, validated, measured and arranged
+            // the current tree, including fresh native minimum-size sampling.
+            // Only the additional detached simulation can be reused.
+            PreviewKey? key = null;
+            if (cacheAttempt is { } attempt && attempt.Generation == m_previewCacheGeneration
+                && HasBuiltInPreviewNodes(attempt.Backend.GetTree(desktop)?.Root))
+            {
+                if (m_previewCache is { } cached && cached.Plan.SourceRevision == sourceRevision
+                    && cached.Key.Matches(
+                    attempt.Backend, desktop, previewTree, previewState, settings,
+                    source, target, kind, fromIndex, toIndex, targetSide)
+                    && attempt.Generation == m_previewCacheGeneration)
+                {
+                    return cached.Plan;
+                }
+                key = PreviewKey.TryCapture(
+                    attempt.Backend, desktop, previewTree, previewState, settings,
+                    source, target, kind, fromIndex, toIndex, targetSide);
+            }
+            m_previewCache = null;
+
             MasterSatelliteOperationResult operation = kind switch
             {
                 MasterSatelliteDropKind.ReorderSatellite => m_previewEngine.ReorderSatellite(
@@ -480,7 +543,7 @@ namespace FancyWM.AlgorithmicLayouts
             var previewWindows = target == null || WindowsMatch(source, target)
                 ? new[] { source }
                 : new[] { source, target };
-            return new MasterSatelliteDropPlan
+            var plan = new MasterSatelliteDropPlan
             {
                 IsAccepted = true,
                 Kind = kind,
@@ -497,6 +560,13 @@ namespace FancyWM.AlgorithmicLayouts
                 Message = operation.Message,
                 PreviewOperation = operation,
             };
+            // Native minimum-size probes can re-enter an interaction cancellation
+            // while the backend lock is held. Never publish for that old gesture.
+            if (key != null && cacheAttempt?.Generation == m_previewCacheGeneration)
+            {
+                m_previewCache = new PreviewCacheEntry(key, plan);
+            }
+            return plan;
         }
 
         private static MasterSatelliteDropPlan Reject(

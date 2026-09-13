@@ -4,7 +4,9 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reactive.Linq;
+using System.Reflection;
 using System.Windows.Threading;
+using System.Threading.Tasks;
 
 using FancyWM.AlgorithmicLayouts;
 using FancyWM.Layouts.Tiling;
@@ -22,8 +24,56 @@ using WinMan;
 namespace FancyWM.Tests.AlgorithmicLayouts
 {
     [TestClass]
-    public class MultiDisplayTilingServiceIntegrationTest
+    public partial class MultiDisplayTilingServiceIntegrationTest
     {
+        [DataTestMethod]
+        [DataRow(true, false, false, true)]
+        [DataRow(false, false, false, false)]
+        [DataRow(true, true, true, true)]
+        [DataRow(false, true, true, true)]
+        [DataRow(false, false, true, true)]
+        public void DiscoveryVisitsEveryDisplayExactlyOnce(
+            bool firstResult, bool secondResult, bool thirdResult, bool expectedResult)
+        {
+            using var fixture = new ServiceFixture(includeSecondDisplay: true);
+            var thirdDisplay = fixture.CreateDisplay(new Rectangle(2000, 0, 2999, 999));
+            fixture.AddDisplay(thirdDisplay);
+            var services = new[]
+            {
+                fixture.GetService(fixture.PrimaryDisplay),
+                fixture.GetService(fixture.SecondDisplay),
+                fixture.GetService(thirdDisplay),
+            };
+            var results = new[] { firstResult, secondResult, thirdResult };
+            var calls = new List<int>();
+            for (int index = 0; index < services.Length; index++)
+            {
+                int capturedIndex = index;
+                services[index].Discover = () =>
+                {
+                    calls.Add(capturedIndex);
+                    return results[capturedIndex];
+                };
+            }
+
+            Assert.AreEqual(expectedResult, fixture.Service.DiscoverWindows());
+            CollectionAssert.AreEqual(new[] { 0, 1, 2 }, calls);
+        }
+
+        [TestMethod]
+        public void DiscoveryPropagatesChildExceptionWithoutVisitingLaterDisplays()
+        {
+            using var fixture = new ServiceFixture(includeSecondDisplay: true);
+            var calls = new List<int>();
+            var failure = new InvalidOperationException("discovery failed");
+            fixture.GetService(fixture.PrimaryDisplay).Discover = () => throw failure;
+            fixture.GetService(fixture.SecondDisplay).Discover = () => { calls.Add(1); return true; };
+
+            Assert.AreSame(failure, Assert.ThrowsException<InvalidOperationException>(
+                () => fixture.Service.DiscoverWindows()));
+            Assert.AreEqual(0, calls.Count);
+        }
+
         [TestMethod]
         public void MasterSatelliteCommandsFollowFocusedWindowAcrossDisplays()
         {
@@ -104,6 +154,111 @@ namespace FancyWM.Tests.AlgorithmicLayouts
             Assert.AreEqual(2, fixture.CreatedServiceCount);
         }
 
+        [TestMethod]
+        public void UnknownAndDuplicateDisplayRemovalsDoNotRequestGarbageCollection()
+        {
+            using var fixture = new ServiceFixture(includeSecondDisplay: true);
+            var unknown = fixture.CreateDisplay(new Rectangle(2000, 0, 2999, 999));
+            fixture.RemoveDisplay(unknown);
+            Assert.AreEqual(0, fixture.GarbageCollectionRequests);
+            var removed = fixture.GetService(fixture.SecondDisplay);
+            fixture.RemoveDisplay(fixture.SecondDisplay);
+            Assert.AreEqual(1, fixture.GarbageCollectionRequests);
+            for (int index = 0; index < 100; index++)
+            {
+                fixture.RemoveDisplay(unknown);
+                fixture.RemoveDisplay(fixture.SecondDisplay);
+            }
+            Assert.AreEqual(1, fixture.GarbageCollectionRequests);
+            Assert.AreEqual(1, removed.StopCount);
+            Assert.AreEqual(1, removed.DisposeCount);
+        }
+
+        [DataTestMethod]
+        [DataRow(false, false)]
+        [DataRow(true, false)]
+        [DataRow(false, true)]
+        [DataRow(true, true)]
+        public void RemovedOwnerStillRequestsOneCollectionAfterCleanupFailures(bool failStop, bool failDispose)
+        {
+            using var fixture = new ServiceFixture(includeSecondDisplay: true);
+            var removed = fixture.GetService(fixture.SecondDisplay);
+            removed.OnStop = () => { if (failStop) throw new InvalidOperationException("stop"); };
+            removed.OnDispose = () => { if (failDispose) throw new InvalidOperationException("dispose"); };
+            fixture.RemoveDisplay(fixture.SecondDisplay);
+            fixture.RemoveDisplay(fixture.SecondDisplay);
+            Assert.AreEqual(1, removed.StopCount);
+            Assert.AreEqual(1, removed.DisposeCount);
+            Assert.AreEqual(1, fixture.GarbageCollectionRequests);
+        }
+
+        [TestMethod]
+        public void ReentrantDuplicateDuringStopDoesNotRequestAnotherCollection()
+        {
+            using var fixture = new ServiceFixture(includeSecondDisplay: true);
+            var removed = fixture.GetService(fixture.SecondDisplay);
+            removed.OnStop = () => fixture.RemoveDisplay(fixture.SecondDisplay);
+            fixture.RemoveDisplay(fixture.SecondDisplay);
+            Assert.AreEqual(1, removed.StopCount);
+            Assert.AreEqual(1, removed.DisposeCount);
+            Assert.AreEqual(1, fixture.GarbageCollectionRequests);
+        }
+
+        [TestMethod]
+        public void CapturedDisplayRemovalAfterDisposeDoesNotRequestCollection()
+        {
+            using var fixture = new ServiceFixture(includeSecondDisplay: true);
+            var method = typeof(MultiDisplayTilingService).GetMethod("OnDisplayRemoved", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var callback = method.CreateDelegate<Action<object?, DisplayChangedEventArgs>>(fixture.Service);
+            fixture.Service.Dispose();
+            for (int index = 0; index < 100; index++) callback(null, new DisplayChangedEventArgs(fixture.SecondDisplay));
+            Assert.AreEqual(0, fixture.GarbageCollectionRequests);
+            Assert.AreEqual(1, fixture.GetService(fixture.SecondDisplay).DisposeCount);
+        }
+
+        [TestMethod]
+        public void ReaddedDisplayHasANewOwnerAndOneCollectionForEachRemoval()
+        {
+            using var fixture = new ServiceFixture(includeSecondDisplay: true);
+            var first = fixture.GetService(fixture.SecondDisplay);
+            fixture.RemoveDisplay(fixture.SecondDisplay);
+            fixture.AddDisplay(fixture.SecondDisplay);
+            var second = fixture.GetService(fixture.SecondDisplay);
+            Assert.AreNotSame(first, second);
+            fixture.RemoveDisplay(fixture.SecondDisplay);
+            fixture.RemoveDisplay(fixture.SecondDisplay);
+            Assert.AreEqual(2, fixture.GarbageCollectionRequests);
+            Assert.AreEqual(1, first.StopCount);
+            Assert.AreEqual(1, first.DisposeCount);
+            Assert.AreEqual(1, second.StopCount);
+            Assert.AreEqual(1, second.DisposeCount);
+        }
+
+        [TestMethod]
+        public void DisplayRemovalGarbageCollectionCounterScenario()
+        {
+            int requests = 0;
+            for (int cycle = 0; cycle < 100; cycle++)
+            {
+                using var fixture = new ServiceFixture(includeSecondDisplay: true);
+                var removed = fixture.GetService(fixture.SecondDisplay);
+                fixture.RemoveDisplay(fixture.SecondDisplay);
+                for (int duplicate = 0; duplicate < 100; duplicate++) fixture.RemoveDisplay(fixture.SecondDisplay);
+                requests += fixture.GarbageCollectionRequests;
+                Assert.AreEqual(1, removed.StopCount);
+                Assert.AreEqual(1, removed.DisposeCount);
+                fixture.Service.ToggleMasterSatelliteLayout();
+                CollectionAssert.AreEqual(new[] { nameof(ITilingService.ToggleMasterSatelliteLayout) }, fixture.GetService(fixture.PrimaryDisplay).CommandCalls);
+                fixture.Service.Dispose();
+                fixture.RemoveDisplay(fixture.SecondDisplay);
+                Assert.AreEqual(1, fixture.GetService(fixture.PrimaryDisplay).DisposeCount);
+            }
+            Console.WriteLine($"PERFCOUNTER display-removal-gc collection-requests {requests}");
+            Console.WriteLine("PERFCOUNTER display-removal-gc removed-owners 100");
+            Console.WriteLine("PERFCOUNTER display-removal-gc duplicate-events 10000");
+            Console.WriteLine("PERFCOUNTER display-removal-gc cycles 100");
+        }
+
         private static readonly string[] ExpectedMasterSatelliteCalls =
         [
             nameof(ITilingService.CanToggleMasterSatelliteLayout),
@@ -148,10 +303,13 @@ namespace FancyWM.Tests.AlgorithmicLayouts
             public IDisplay PrimaryDisplay { get; }
             public IDisplay SecondDisplay { get; }
             public int CreatedServiceCount { get; private set; }
+            public int GarbageCollectionRequests { get; private set; }
             public AlgorithmicLayoutCoordinator Coordinator { get; }
             public MultiDisplayTilingService Service { get; }
+            public Action<FakeTilingService>? OnServiceCreated { get; set; }
+            public Action<ITilingService>? OnAutoRegisterWindows { get; set; }
 
-            public ServiceFixture(bool includeSecondDisplay)
+            public ServiceFixture(bool includeSecondDisplay, Action? onGarbageCollectionRequest = null)
             {
                 PrimaryDisplay = CreateDisplay(new Rectangle(0, 0, 999, 999));
                 SecondDisplay = CreateDisplay(new Rectangle(1000, 0, 1999, 999));
@@ -184,8 +342,15 @@ namespace FancyWM.Tests.AlgorithmicLayouts
                     new Mock<ILogger>(MockBehavior.Loose).Object,
                     CreateTilingService,
                     (service, value) =>
-                        ((FakeTilingService)service).AutoRegisterWindowsValues.Add(value),
-                    () => { });
+                    {
+                        ((FakeTilingService)service).AutoRegisterWindowsValues.Add(value);
+                        OnAutoRegisterWindows?.Invoke(service);
+                    },
+                    () =>
+                    {
+                        GarbageCollectionRequests++;
+                        onGarbageCollectionRequest?.Invoke();
+                    });
             }
 
             public FakeTilingService GetService(IDisplay display)
@@ -234,11 +399,12 @@ namespace FancyWM.Tests.AlgorithmicLayouts
             {
                 CreatedServiceCount++;
                 var service = new FakeTilingService(m_workspace.Object, display);
-                m_services.Add(display, service);
+                m_services[display] = service;
+                OnServiceCreated?.Invoke(service);
                 return service;
             }
 
-            private IDisplay CreateDisplay(Rectangle bounds)
+            public IDisplay CreateDisplay(Rectangle bounds)
             {
                 var display = new Mock<IDisplay>(MockBehavior.Loose);
                 display.SetupGet(item => item.Workspace).Returns(m_workspace.Object);
@@ -291,12 +457,18 @@ namespace FancyWM.Tests.AlgorithmicLayouts
             public int StopCount { get; private set; }
             public int DisposeCount { get; private set; }
             public int RefreshCount { get; private set; }
+            public Action? OnStop { get; set; }
+            public Action? OnDispose { get; set; }
+            public Action? OnStart { get; set; }
+            public Func<Task> OnPrepareForShutdown { get; set; } = () => Task.CompletedTask;
+            public int PrepareForShutdownCount { get; private set; }
 
             public bool CanSplit(bool vertical) => true;
             public void Split(bool vertical) { }
             public bool CanStack() => true;
             public void Stack() { }
-            public bool DiscoverWindows() => false;
+            public Func<bool> Discover { get; set; } = () => false;
+            public bool DiscoverWindows() => Discover();
             public void Refresh() => RefreshCount++;
             public bool CanFloat() => true;
             public void Float() { }
@@ -352,18 +524,31 @@ namespace FancyWM.Tests.AlgorithmicLayouts
             {
                 StartCount++;
                 Active = true;
+                OnStart?.Invoke();
+            }
+
+            public Task PrepareForShutdownAsync()
+            {
+                PrepareForShutdownCount++;
+                Active = false;
+                return OnPrepareForShutdown();
             }
 
             public void Stop()
             {
                 StopCount++;
                 Active = false;
+                OnStop?.Invoke();
             }
 
             public IWindow? GetFocus() => null;
             public Rectangle GetBounds() => display.Bounds;
             public IWindow? FindClosest(Point center) => null;
-            public void Dispose() => DisposeCount++;
+            public void Dispose()
+            {
+                DisposeCount++;
+                OnDispose?.Invoke();
+            }
 
             private bool RecordCapability(string command)
             {

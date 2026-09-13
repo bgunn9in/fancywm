@@ -13,12 +13,41 @@ namespace FancyWM.Pages.Settings
     /// <summary>
     /// Interaction logic for HelpPage.xaml
     /// </summary>
-    public partial class HelpPage : UserControl
+    public partial class HelpPage : UserControl, IDisposable
     {
+        private IDisposable? m_browserOwner;
+
         public HelpPage(SettingsViewModel viewModel)
         {
             DataContext = viewModel;
-            InitializeComponent();
+            try
+            {
+                InitializeComponent();
+                m_browserOwner = Browser;
+            }
+            catch
+            {
+                Browser?.Dispose();
+                throw;
+            }
+        }
+
+        internal HelpPage(IDisposable browserOwner)
+        {
+            m_browserOwner = browserOwner;
+        }
+
+        public void Dispose()
+        {
+            Dispatcher.VerifyAccess();
+            var browser = m_browserOwner;
+            m_browserOwner = null;
+            try
+            {
+                Content = null;
+                DataContext = null;
+            }
+            finally { browser?.Dispose(); }
         }
 
         private void OpenUrl(object sender, RoutedEventArgs e)

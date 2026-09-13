@@ -103,7 +103,12 @@ namespace FancyWM.Tests.Models
             var entity = new TestObservableJsonEntity(filePath, () => new TestModel { Value = "initial" });
 
             var receivedValues = new List<TestModel>();
-            entity.Subscribe(receivedValues.Add);
+            using var subscription = entity.Subscribe(receivedValues.Add);
+
+            // Initial file creation is asynchronous; count save notifications only
+            // after observing the initial replay, not while it is still loading.
+            await entity.Value.FirstAsync();
+            Assert.AreEqual(1, receivedValues.Count);
 
             var countBefore = receivedValues.Count;
 

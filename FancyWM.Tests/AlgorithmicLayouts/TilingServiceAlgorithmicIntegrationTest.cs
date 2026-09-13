@@ -2,7 +2,9 @@
 
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
+using System.Reflection;
 using System.Reactive.Subjects;
 using System.Windows;
 using System.Windows.Threading;
@@ -23,8 +25,789 @@ using WinMan;
 namespace FancyWM.Tests.AlgorithmicLayouts
 {
     [TestClass]
-    public class TilingServiceAlgorithmicIntegrationTest
+    public partial class TilingServiceAlgorithmicIntegrationTest
     {
+        public TestContext TestContext { get; set; } = null!;
+
+        [TestMethod]
+        public void SettingsRuntimeCounterScenario()
+        {
+            foreach (bool enabled in new[] { false, true })
+            {
+                var counters = MeasureSettingsRuntimeCounters(enabled);
+                string scenario = enabled ? "settings-runtime-enabled" : "settings-runtime-disabled";
+                TestContext.WriteLine($"PERFCOUNTER {scenario} view-invalidations {counters.ViewInvalidations}");
+                TestContext.WriteLine($"PERFCOUNTER {scenario} scaling-reads {counters.ScalingReads}");
+                TestContext.WriteLine($"PERFCOUNTER {scenario} publications {counters.Publications}");
+                TestContext.WriteLine($"PERFCOUNTER {scenario} iterations 100");
+            }
+        }
+
+        [TestMethod]
+        public void ArrangeFailureBookkeepingCounterScenario()
+        {
+            foreach (bool enabled in new[] { false, true })
+            {
+                foreach (int windowCount in new[] { 1, 4, 10 })
+                {
+                    foreach (bool pending in new[] { false, true })
+                    {
+                        MeasureArrangeFailureBookkeepingCounters(enabled, windowCount, pending);
+                    }
+                }
+            }
+        }
+
+        private void MeasureArrangeFailureBookkeepingCounters(bool enabled, int windowCount, bool pending)
+        {
+            const int warmupCount = 256;
+            const int iterations = 100;
+            using var fixture = new ServiceFixture(EnabledSettings(enabled, maxSatellites: 9));
+            var windows = Enumerable.Range(0, windowCount)
+                .Select(index => fixture.AddWindow($"Bookkeeping window {index}"))
+                .ToArray();
+            fixture.DrainDispatcher();
+            fixture.HoldLayoutForSettingsObservation();
+            var tree = GetBackend(fixture).GetTree(fixture.Desktop)!;
+            tree.Measure();
+            tree.Arrange();
+            var root = tree.Root!;
+            var originalNodes = root.Nodes.ToArray();
+            var originalParents = originalNodes.Select(node => node.Parent).ToArray();
+            var originalRectangles = originalNodes.Select(node => node.ComputedRectangle).ToArray();
+            var originalWindowNodes = root.Windows.ToArray();
+            var originalWindows = originalWindowNodes.Select(node => node.WindowReference).ToArray();
+            Assert.AreEqual(windowCount, originalWindowNodes.Length);
+            CollectionAssert.AreEquivalent(windows, originalWindows);
+
+            var key = new LayoutStateKey(fixture.Desktop, fixture.Display);
+            bool hasState = fixture.Coordinator.TryGet(key, out var originalState);
+            Assert.AreEqual(enabled, hasState);
+            long originalRevision = hasState ? originalState.Revision : 0;
+            var originalMaster = hasState ? originalState.Master : null;
+            var originalSatellites = hasState ? originalState.Satellites.ToArray() : [];
+            var newWindows = fixture.GetServiceField<HashSet<IWindow>>("m_newWindowSet");
+            using (fixture.GetServiceField<DebugLock>("m_newWindowSetLock").EnterScope())
+            {
+                newWindows.Clear();
+            }
+            var notifications = fixture.GetServiceField<ArrangeFailureNotificationTracker>(
+                "m_arrangeFailureNotifications");
+            Assert.IsFalse(notifications.HasPending);
+            var handles = windows.Select(window => window.Handle).ToArray();
+            IntPtr pendingHandle = handles[0];
+            if (pending) { Assert.IsTrue(notifications.TryMark(pendingHandle)); }
+
+            bool recording = false;
+            long handleReads = 0;
+            long minSizeReads = 0;
+            for (int index = 0; index < windows.Length; index++)
+            {
+                IntPtr handle = handles[index];
+                var minimumSize = windows[index].MinSize;
+                var mock = Mock.Get(windows[index]);
+                mock.SetupGet(window => window.Handle).Returns(() =>
+                {
+                    if (recording) { handleReads++; }
+                    return handle;
+                });
+                mock.SetupGet(window => window.MinSize).Returns(() =>
+                {
+                    if (recording) { minSizeReads++; }
+                    return minimumSize;
+                });
+            }
+            int placementNotifications = 0;
+            int fallbackNotifications = 0;
+            int algorithmicNotifications = 0;
+            fixture.Service.PlacementFailed += (_, args) =>
+            {
+                placementNotifications++;
+                if (args.FailReason == TilingError.NoValidPlacementExists) { fallbackNotifications++; }
+            };
+            fixture.Service.AlgorithmicLayoutChanged += (_, _) => algorithmicNotifications++;
+            var updateTree = (Func<DesktopTree, bool>)typeof(TilingService)
+                .GetMethod("UpdateTree", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .CreateDelegate(typeof(Func<DesktopTree, bool>), fixture.Service);
+            for (int index = 0; index < warmupCount; index++)
+            {
+                Assert.IsTrue(updateTree(tree));
+            }
+
+            long allocatedBytes = 0;
+            int arrangedPasses = 0;
+            uint geometryChecksum = 2166136261;
+            long revisionDelta = 0;
+            for (int iteration = 0; iteration < iterations; iteration++)
+            {
+                bool arranged;
+                long previousHandleReads = handleReads;
+                long before = GC.GetAllocatedBytesForCurrentThread();
+                recording = true;
+                try
+                {
+                    arranged = updateTree(tree);
+                }
+                finally
+                {
+                    allocatedBytes += GC.GetAllocatedBytesForCurrentThread() - before;
+                    recording = false;
+                }
+
+                // Only UpdateTree and its fake adapters are inside the allocation
+                // interval. These complete result checks cannot inflate that count.
+                Assert.IsTrue(arranged);
+                arrangedPasses++;
+                if (pending)
+                {
+                    Assert.AreEqual((long)windowCount, handleReads - previousHandleReads);
+                    Assert.IsFalse(notifications.TryMark(pendingHandle),
+                        "A pending handle still present in the tree must remain suppressed.");
+                }
+                Assert.AreEqual(pending, notifications.HasPending);
+                Assert.AreEqual(0, newWindows.Count);
+                Assert.AreSame(root, tree.Root);
+                var currentNodes = tree.Root!.Nodes.ToArray();
+                CollectionAssert.AreEqual(originalNodes, currentNodes);
+                for (int index = 0; index < currentNodes.Length; index++)
+                {
+                    Assert.AreSame(originalParents[index], currentNodes[index].Parent);
+                    var rectangle = currentNodes[index].ComputedRectangle;
+                    Assert.AreEqual(originalRectangles[index], rectangle);
+                    geometryChecksum = unchecked((geometryChecksum ^ (uint)rectangle.Left) * 16777619);
+                    geometryChecksum = unchecked((geometryChecksum ^ (uint)rectangle.Top) * 16777619);
+                    geometryChecksum = unchecked((geometryChecksum ^ (uint)rectangle.Right) * 16777619);
+                    geometryChecksum = unchecked((geometryChecksum ^ (uint)rectangle.Bottom) * 16777619);
+                }
+                var currentWindowNodes = root.Windows.ToArray();
+                CollectionAssert.AreEqual(originalWindowNodes, currentWindowNodes);
+                for (int index = 0; index < currentWindowNodes.Length; index++)
+                {
+                    Assert.AreSame(originalWindows[index], currentWindowNodes[index].WindowReference);
+                    Assert.IsFalse(fixture.Coordinator.FloatingWindows.Contains(handles[index]));
+                }
+                Assert.AreEqual(hasState, fixture.Coordinator.TryGet(key, out var currentState));
+                if (hasState)
+                {
+                    Assert.AreSame(originalState, currentState);
+                    revisionDelta = currentState.Revision - originalRevision;
+                    Assert.AreEqual(0L, revisionDelta);
+                    Assert.AreSame(originalMaster, currentState.Master);
+                    CollectionAssert.AreEqual(originalSatellites, currentState.Satellites.ToArray());
+                }
+                Assert.AreEqual(0, fixture.Coordinator.ActiveTransferCount);
+                Assert.AreEqual(0, fixture.Coordinator.ReservationCount);
+            }
+            Assert.AreEqual((long)windowCount * iterations, minSizeReads);
+            Assert.AreEqual(0, placementNotifications);
+            Assert.AreEqual(0, fallbackNotifications);
+            Assert.AreEqual(0, algorithmicNotifications);
+            Assert.AreNotEqual(2166136261U, geometryChecksum);
+
+            string scenario = $"arrange-bookkeeping-{(enabled ? "ms" : "ordinary")}-"
+                + windowCount.ToString(CultureInfo.InvariantCulture)
+                + $"-{(pending ? "pending" : "stable")}";
+            (string Metric, long Value)[] counters =
+            [
+                ("iterations", iterations),
+                ("arranged-passes", arrangedPasses),
+                ("allocated-bytes", allocatedBytes),
+                ("handle-reads", handleReads),
+                ("minsize-reads", minSizeReads),
+                ("geometry-checks", iterations),
+                ("geometry-checksum", geometryChecksum),
+                ("identity-checks", iterations),
+                ("revision-checks", iterations),
+                ("revision-delta", revisionDelta),
+                ("fallback-notifications", fallbackNotifications),
+                ("placement-notifications", placementNotifications),
+                ("algorithmic-notifications", algorithmicNotifications),
+                ("floating-windows", windows.Count(window => fixture.Coordinator.FloatingWindows.Contains(window))),
+                ("pending-notifications", notifications.HasPending ? 1 : 0),
+                ("new-window-count", newWindows.Count),
+            ];
+            foreach (var counter in counters)
+            {
+                TestContext.WriteLine($"PERFCOUNTER {scenario} {counter.Metric} "
+                    + counter.Value.ToString(CultureInfo.InvariantCulture));
+            }
+        }
+
+        private static (int ViewInvalidations, int ScalingReads, int Publications)
+            MeasureSettingsRuntimeCounters(bool enabled)
+        {
+            var settings = EnabledSettings(enabled);
+            using var fixture = new ServiceFixture(settings);
+            var master = fixture.AddWindow("Master");
+            var first = fixture.AddWindow("First satellite");
+            var second = fixture.AddWindow("Second satellite");
+            fixture.DrainDispatcher();
+            fixture.HoldLayoutForSettingsObservation();
+            var tree = GetBackend(fixture).GetTree(fixture.Desktop)!;
+            tree.Measure();
+            tree.Arrange();
+            var originalRoot = tree.Root!;
+            var originalNodes = originalRoot.Nodes.ToArray();
+            var originalRectangles = originalNodes.Select(node => node.ComputedRectangle).ToArray();
+            var key = new LayoutStateKey(fixture.Desktop, fixture.Display);
+            long revision = 0;
+            if (enabled)
+            {
+                Assert.IsTrue(fixture.Coordinator.TryGet(key, out var initialState));
+                revision = initialState.Revision;
+            }
+            int scalingReads = 0;
+            int publications = 0;
+            Mock.Get(fixture.Display).SetupGet(item => item.Scaling).Returns(() =>
+            {
+                scalingReads++;
+                return 1.0;
+            });
+            fixture.CapacityPublicationHook = (_, _, _) => publications++;
+            for (int index = 0; index < 20; index++)
+            {
+                fixture.PublishWithoutDispatch(settings with { PanelFontSize = 12 + index });
+            }
+            fixture.DrainDispatcher();
+            scalingReads = 0;
+            publications = 0;
+            int beforeInvalidations = fixture.Overlay.InvalidateViewCount;
+
+            for (int index = 0; index < 100; index++)
+            {
+                fixture.PublishWithoutDispatch(settings with { PanelFontSize = 12 + index });
+            }
+            fixture.DrainDispatcher();
+
+            var counters = (fixture.Overlay.InvalidateViewCount - beforeInvalidations, scalingReads, publications);
+            Assert.AreSame(originalRoot, tree.Root);
+            CollectionAssert.AreEqual(originalNodes, tree.Root!.Nodes.ToArray());
+            CollectionAssert.AreEqual(originalRectangles,
+                tree.Root.Nodes.Select(node => node.ComputedRectangle).ToArray());
+            CollectionAssert.AreEquivalent(new[] { master, first, second },
+                tree.Root.Windows.Select(node => node.WindowReference).ToArray());
+            Assert.AreEqual(settings.WindowPadding, fixture.Overlay.PanelSpacing);
+            Assert.AreEqual(new Thickness(0, settings.WindowPadding + settings.PanelHeight, 0, 0),
+                fixture.Overlay.PanelPadding);
+            Assert.AreEqual(0, fixture.Coordinator.ActiveTransferCount);
+            Assert.AreEqual(0, fixture.Coordinator.ReservationCount);
+            if (enabled)
+            {
+                Assert.IsTrue(fixture.Coordinator.TryGet(key, out var state));
+                Assert.AreEqual(revision, state.Revision);
+                Assert.AreSame(master, state.Master);
+                CollectionAssert.AreEqual(new[] { first, second }, state.Satellites.ToArray());
+                Assert.AreEqual(settings.MasterSatelliteLayout.DefaultSatelliteOrientation, state.SatelliteOrientation);
+                Assert.AreEqual(settings.MasterSatelliteLayout.DefaultMasterSide, state.MasterSide);
+                Assert.AreEqual(settings.MasterSatelliteLayout.MasterRatio, state.RequestedMasterRatio);
+                AssertCapacity(fixture, 3);
+            }
+            return counters;
+        }
+
+        [DataTestMethod]
+        [DataRow(false, false)]
+        [DataRow(false, true)]
+        [DataRow(true, false)]
+        [DataRow(true, true)]
+        public void UnrelatedSettingsBurstDoesNotTouchLayoutOrQueueDispatcherWork(
+            bool enabled, bool workerThread)
+        {
+            var settings = EnabledSettings(enabled);
+            using var fixture = new ServiceFixture(settings);
+            var master = fixture.AddWindow("Master");
+            var satellite = fixture.AddWindow("Satellite");
+            fixture.DrainDispatcher();
+            fixture.HoldLayoutForSettingsObservation();
+            var tree = GetBackend(fixture).GetTree(fixture.Desktop)!;
+            var originalRoot = tree.Root;
+            var originalNodes = tree.Root!.Windows.ToArray();
+            int originalInvalidations = fixture.Overlay.InvalidateViewCount;
+            int publications = 0;
+            fixture.CapacityPublicationHook = (_, _, _) => publications++;
+            Mock.Get(fixture.Display).Invocations.Clear();
+            int posted = 0;
+            DispatcherHookEventHandler onPosted = (_, args) =>
+            {
+                if (args.Operation.Priority != DispatcherPriority.ApplicationIdle)
+                {
+                    System.Threading.Interlocked.Increment(ref posted);
+                }
+            };
+            var dispatcher = Dispatcher.CurrentDispatcher;
+            dispatcher.Hooks.OperationPosted += onPosted;
+            try
+            {
+                void PublishBurst()
+                {
+                    for (int index = 0; index < 100; index++)
+                    {
+                        fixture.PublishWithoutDispatch(settings with
+                        {
+                            PanelFontSize = 12 + index,
+                            MasterSatelliteLayout = settings.MasterSatelliteLayout with { },
+                        });
+                    }
+                    fixture.PublishWithoutDispatch(settings with { });
+                }
+                if (workerThread)
+                {
+                    System.Threading.Tasks.Task.Run(PublishBurst).GetAwaiter().GetResult();
+                }
+                else
+                {
+                    PublishBurst();
+                }
+            }
+            finally
+            {
+                dispatcher.Hooks.OperationPosted -= onPosted;
+            }
+            // DispatcherFrame.Continue=false posts its own Send wakeup. Observe
+            // all publication posts before pumping the fixture control frame.
+            fixture.DrainDispatcher();
+
+            Assert.AreEqual(0, posted, "Unrelated and content-identical settings must not queue runtime work.");
+            Assert.AreEqual(originalInvalidations, fixture.Overlay.InvalidateViewCount);
+            Assert.AreEqual(0, publications);
+            Assert.IsFalse(fixture.LayoutInvalidated);
+            Mock.Get(fixture.Display).VerifyGet(item => item.Scaling, Times.Never);
+            Assert.AreSame(originalRoot, tree.Root);
+            CollectionAssert.AreEqual(originalNodes, tree.Root!.Windows.ToArray());
+            if (enabled)
+            {
+                Assert.IsTrue(fixture.Coordinator.TryGet(
+                    new LayoutStateKey(fixture.Desktop, fixture.Display), out var state));
+                Assert.AreSame(master, state.Master);
+                CollectionAssert.AreEqual(new[] { satellite }, state.Satellites.ToArray());
+            }
+        }
+
+        [DataTestMethod]
+        [DataRow(false, true, false)]
+        [DataRow(false, false, true)]
+        [DataRow(false, true, true)]
+        [DataRow(true, true, false)]
+        [DataRow(true, false, true)]
+        [DataRow(true, true, true)]
+        public void GeometrySettingsUpdateBothPanelDimensionsWithOneViewInvalidation(
+            bool enabled, bool changePadding, bool changeHeight)
+        {
+            var settings = EnabledSettings(enabled);
+            using var fixture = new ServiceFixture(settings);
+            var master = fixture.AddWindow("Master");
+            var first = fixture.AddWindow("First satellite");
+            var second = fixture.AddWindow("Second satellite");
+            fixture.DrainDispatcher();
+            fixture.HoldLayoutForSettingsObservation();
+            int originalInvalidations = fixture.Overlay.InvalidateViewCount;
+            var updated = settings with
+            {
+                WindowPadding = changePadding ? 9 : settings.WindowPadding,
+                PanelHeight = changeHeight ? 27 : settings.PanelHeight,
+            };
+
+            fixture.Publish(updated);
+
+            Assert.AreEqual(originalInvalidations + 1, fixture.Overlay.InvalidateViewCount);
+            Assert.IsTrue(fixture.LayoutInvalidated);
+            Assert.AreEqual(updated.WindowPadding, fixture.Overlay.PanelSpacing);
+            Assert.AreEqual(new Thickness(0, updated.PanelHeight + updated.WindowPadding, 0, 0),
+                fixture.Overlay.PanelPadding);
+            var tree = GetBackend(fixture).GetTree(fixture.Desktop)!;
+            foreach (var panel in tree.Root!.Nodes.OfType<PanelNode>())
+            {
+                Assert.AreEqual(updated.WindowPadding, panel.Spacing);
+                Assert.AreEqual(new Rectangle(0, updated.PanelHeight + updated.WindowPadding, 0, 0), panel.Padding);
+            }
+            if (enabled)
+            {
+                Assert.IsTrue(fixture.Coordinator.TryGet(
+                    new LayoutStateKey(fixture.Desktop, fixture.Display), out var state));
+                Assert.AreSame(master, state.Master);
+                CollectionAssert.AreEqual(new[] { first, second }, state.Satellites.ToArray());
+                Assert.AreEqual(settings.MasterSatelliteLayout.DefaultMasterSide, state.MasterSide);
+                Assert.AreEqual(settings.MasterSatelliteLayout.MasterRatio, state.RequestedMasterRatio);
+                AssertCapacity(fixture, 3);
+            }
+            fixture.Publish(updated with { MasterSatelliteLayout = updated.MasterSatelliteLayout with { } });
+            Assert.AreEqual(originalInvalidations + 1, fixture.Overlay.InvalidateViewCount);
+        }
+
+        [TestMethod]
+        public void NonGeometryTilingSettingsApplyWithoutPanelOrCapacityWork()
+        {
+            var settings = EnabledSettings(true);
+            using var fixture = new ServiceFixture(settings);
+            fixture.AddWindow("Master");
+            fixture.DrainDispatcher();
+            fixture.HoldLayoutForSettingsObservation();
+            int originalInvalidations = fixture.Overlay.InvalidateViewCount;
+            int publications = 0;
+            fixture.CapacityPublicationHook = (_, _, _) => publications++;
+            Mock.Get(fixture.Display).Invocations.Clear();
+            var updated = settings with
+            {
+                AllocateNewPanelSpace = !settings.AllocateNewPanelSpace,
+                AnimateWindowMovement = !settings.AnimateWindowMovement,
+                AutoSplitCount = settings.AutoSplitCount + 1,
+                DelayReposition = !settings.DelayReposition,
+                AutoFloatNewWindows = true,
+                AutoCollapsePanels = true,
+            };
+
+            fixture.Publish(updated);
+
+            Assert.AreEqual(originalInvalidations, fixture.Overlay.InvalidateViewCount);
+            Assert.AreEqual(0, publications);
+            Assert.IsFalse(fixture.LayoutInvalidated);
+            Mock.Get(fixture.Display).VerifyGet(item => item.Scaling, Times.Never);
+            Assert.AreEqual(updated.AllocateNewPanelSpace, fixture.GetServiceField<bool>("m_allocateNewPanelSpace"));
+            Assert.AreEqual(updated.AnimateWindowMovement, fixture.GetServiceField<bool>("m_animateWindowMovement"));
+            Assert.AreEqual(updated.AutoSplitCount, fixture.GetServiceField<int>("m_autoSplitCount"));
+            Assert.AreEqual(updated.DelayReposition, fixture.GetServiceField<bool>("m_delayReposition"));
+            Assert.IsTrue(GetBackend(fixture).AutoCollapse);
+            var floating = fixture.AddWindow("Auto floated");
+            Assert.IsTrue(fixture.Coordinator.FloatingWindows.Contains(floating));
+        }
+
+        [TestMethod]
+        public void ShowFocusSettingInvalidatesLayoutWithoutTraversingPanels()
+        {
+            var settings = EnabledSettings(true);
+            using var fixture = new ServiceFixture(settings);
+            fixture.AddWindow("Master");
+            fixture.DrainDispatcher();
+            fixture.HoldLayoutForSettingsObservation();
+            int originalInvalidations = fixture.Overlay.InvalidateViewCount;
+            int publications = 0;
+            fixture.CapacityPublicationHook = (_, _, _) => publications++;
+            Mock.Get(fixture.Display).Invocations.Clear();
+
+            fixture.Publish(settings with { ShowFocus = true });
+
+            Assert.IsTrue(fixture.GetServiceField<bool>("m_showFocus"));
+            Assert.IsTrue(fixture.LayoutInvalidated);
+            Assert.AreEqual(originalInvalidations, fixture.Overlay.InvalidateViewCount);
+            Assert.AreEqual(0, publications);
+            Mock.Get(fixture.Display).VerifyGet(item => item.Scaling, Times.Never);
+        }
+
+        [DataTestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public void QueuedDistinctSettingsApplyIsSuppressedAfterServiceDisposal(bool disposeBeforeApply)
+        {
+            var settings = EnabledSettings(false);
+            using var fixture = new ServiceFixture(settings);
+            fixture.DrainDispatcher();
+            int originalInvalidations = fixture.Overlay.InvalidateViewCount;
+            int originalSpacing = fixture.Overlay.PanelSpacing;
+            int posted = 0;
+            var dispatcher = Dispatcher.CurrentDispatcher;
+            DispatcherHookEventHandler onPosted = (_, args) =>
+            {
+                if (args.Operation.Priority == DispatcherPriority.Normal)
+                {
+                    System.Threading.Interlocked.Increment(ref posted);
+                }
+            };
+            dispatcher.Hooks.OperationPosted += onPosted;
+            try
+            {
+                System.Threading.Tasks.Task.Run(() =>
+                {
+                    for (int index = 0; index < 100; index++)
+                    {
+                        fixture.PublishWithoutDispatch(settings with { WindowPadding = 12 });
+                    }
+                }).GetAwaiter().GetResult();
+            }
+            finally
+            {
+                dispatcher.Hooks.OperationPosted -= onPosted;
+            }
+            Assert.AreEqual(1, posted);
+            if (disposeBeforeApply) { fixture.Service.Dispose(); }
+            fixture.DrainDispatcher();
+            Assert.AreEqual(disposeBeforeApply ? originalSpacing : 12, fixture.Overlay.PanelSpacing);
+            Assert.AreEqual(originalInvalidations + (disposeBeforeApply ? 0 : 1), fixture.Overlay.InvalidateViewCount);
+            fixture.Service.Dispose();
+            fixture.Publish(settings with { WindowPadding = 15 });
+            Assert.AreEqual(originalInvalidations + (disposeBeforeApply ? 0 : 1), fixture.Overlay.InvalidateViewCount);
+        }
+
+        [TestMethod]
+        public void ReturningToCurrentSettingsReplacesDeferredCapacityShrinkSettings()
+        {
+            var settings = EnabledSettings(true, maxSatellites: 3);
+            using var fixture = new ServiceFixture(settings, includeSecondDesktop: true);
+            fixture.DrainDispatcher();
+            var master = fixture.AddWindow("Master");
+            var retained = fixture.AddWindow("Retained satellite");
+            var firstTail = fixture.AddWindow("First tail");
+            var lastTail = fixture.AddWindow("Last tail");
+            var shrink = settings with
+            {
+                MasterSatelliteLayout = settings.MasterSatelliteLayout with { MaxSatellites = 1 },
+            };
+            var temporary = shrink with
+            {
+                MasterSatelliteLayout = shrink.MasterSatelliteLayout with
+                {
+                    DefaultSatelliteOrientation = SatelliteLayoutOrientation.Horizontal,
+                },
+            };
+            int reentrantCalls = 0;
+            fixture.TargetMoveAfterOwnershipChange = _ =>
+            {
+                fixture.TargetMoveAfterOwnershipChange = null;
+                reentrantCalls++;
+                fixture.PublishWithoutDispatch(temporary);
+                Assert.AreEqual(temporary.MasterSatelliteLayout,
+                    fixture.GetServiceField<MasterSatelliteLayoutSettings>("m_deferredMasterSatelliteSettings"));
+                fixture.PublishWithoutDispatch(shrink);
+                Assert.AreEqual(shrink.MasterSatelliteLayout,
+                    fixture.GetServiceField<MasterSatelliteLayoutSettings>("m_deferredMasterSatelliteSettings"));
+            };
+
+            fixture.Publish(shrink);
+
+            Assert.AreEqual(1, reentrantCalls);
+            Assert.IsTrue(fixture.Coordinator.TryGet(
+                new LayoutStateKey(fixture.Desktop, fixture.Display), out var state));
+            Assert.AreSame(master, state.Master);
+            CollectionAssert.AreEqual(new[] { retained }, state.Satellites.ToArray());
+            Assert.AreEqual(SatelliteLayoutOrientation.Vertical, state.SatelliteOrientation);
+            Assert.AreEqual(0, fixture.Coordinator.ReservationCount);
+            Assert.AreEqual(0, fixture.Coordinator.ActiveTransferCount);
+            Assert.AreSame(fixture.TargetDesktop, fixture.GetWindowDesktop(firstTail));
+            Assert.AreSame(fixture.TargetDesktop, fixture.GetWindowDesktop(lastTail));
+            Assert.IsNull(fixture.GetServiceField<MasterSatelliteLayoutSettings?>("m_deferredMasterSatelliteSettings"));
+            fixture.Publish(temporary);
+            Assert.AreEqual(SatelliteLayoutOrientation.Horizontal, state.SatelliteOrientation);
+        }
+
+        [DataTestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public void FailedSettingsPropagationCanRetryTheSameSnapshot(bool enabled)
+        {
+            var settings = EnabledSettings(enabled);
+            using var fixture = new ServiceFixture(settings);
+            var master = fixture.AddWindow("Master");
+            var satellite = fixture.AddWindow("Satellite");
+            fixture.DrainDispatcher();
+            fixture.HoldLayoutForSettingsObservation();
+            int originalInvalidations = fixture.Overlay.InvalidateViewCount;
+            int scalingReads = 0;
+            Mock.Get(fixture.Display).SetupGet(item => item.Scaling).Returns(() =>
+            {
+                if (++scalingReads == 1) { throw new InvalidOperationException("Transient scaling failure"); }
+                return 1.0;
+            });
+            var updated = settings with { WindowPadding = 11, PanelHeight = 23 };
+
+            fixture.Publish(updated);
+            Assert.AreEqual(1, scalingReads);
+            Assert.AreEqual(originalInvalidations, fixture.Overlay.InvalidateViewCount);
+            fixture.Publish(updated with { });
+
+            Assert.AreEqual(originalInvalidations + 1, fixture.Overlay.InvalidateViewCount);
+            Assert.IsTrue(fixture.LayoutInvalidated);
+            Assert.AreEqual(11, fixture.Overlay.PanelSpacing);
+            Assert.AreEqual(new Thickness(0, 34, 0, 0), fixture.Overlay.PanelPadding);
+            var tree = GetBackend(fixture).GetTree(fixture.Desktop)!;
+            foreach (var panel in tree.Root!.Nodes.OfType<PanelNode>())
+            {
+                Assert.AreEqual(11, panel.Spacing);
+                Assert.AreEqual(new Rectangle(0, 34, 0, 0), panel.Padding);
+            }
+            if (enabled)
+            {
+                Assert.IsTrue(fixture.Coordinator.TryGet(
+                    new LayoutStateKey(fixture.Desktop, fixture.Display), out var state));
+                Assert.AreSame(master, state.Master);
+                CollectionAssert.AreEqual(new[] { satellite }, state.Satellites.ToArray());
+                AssertCapacity(fixture, 2);
+            }
+            int readsAfterRetry = scalingReads;
+            fixture.Publish(updated with { });
+            Assert.AreEqual(readsAfterRetry, scalingReads);
+            Assert.AreEqual(originalInvalidations + 1, fixture.Overlay.InvalidateViewCount);
+        }
+
+        [DataTestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public void QueuedOlderSettingsCannotReplaceAnAlreadyAppliedNewerValue(bool newerOnOwnerThread)
+        {
+            var settings = EnabledSettings(true);
+            using var fixture = new ServiceFixture(settings);
+            var master = fixture.AddWindow("Master");
+            var satellite = fixture.AddWindow("Satellite");
+            fixture.DrainDispatcher();
+            fixture.HoldLayoutForSettingsObservation();
+            Assert.IsTrue(fixture.Coordinator.TryGet(
+                new LayoutStateKey(fixture.Desktop, fixture.Display), out var state));
+            long revision = state.Revision;
+            int invalidations = fixture.Overlay.InvalidateViewCount;
+            var older = settings with
+            {
+                WindowPadding = 9,
+                MasterSatelliteLayout = settings.MasterSatelliteLayout with
+                {
+                    DefaultSatelliteOrientation = SatelliteLayoutOrientation.Horizontal,
+                },
+            };
+            var newer = settings with { WindowPadding = 11 };
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                fixture.PublishWithoutDispatch(older);
+                if (!newerOnOwnerThread) { fixture.PublishWithoutDispatch(newer); }
+            }).GetAwaiter().GetResult();
+
+            if (newerOnOwnerThread) { fixture.PublishWithoutDispatch(newer); }
+            fixture.DrainDispatcher();
+
+            Assert.AreEqual(11, fixture.Overlay.PanelSpacing);
+            Assert.AreEqual(new Thickness(0, settings.PanelHeight + 11, 0, 0), fixture.Overlay.PanelPadding);
+            Assert.AreEqual(invalidations + (newerOnOwnerThread ? 1 : 2), fixture.Overlay.InvalidateViewCount);
+            Assert.AreSame(master, state.Master);
+            CollectionAssert.AreEqual(new[] { satellite }, state.Satellites.ToArray());
+            Assert.AreEqual(SatelliteLayoutOrientation.Vertical, state.SatelliteOrientation);
+            Assert.AreEqual(revision + (newerOnOwnerThread ? 0 : 2), state.Revision,
+                "Worker-only publications must retain their original order; only an already superseded callback is skipped.");
+            AssertCapacity(fixture, 2);
+        }
+
+        [DataTestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public void DiscoverySkipsDesktopSnapshotWhenNoWindowIsEligible(bool enabled)
+        {
+            using var fixture = new ServiceFixture(EnabledSettings(enabled));
+            var window = fixture.AddWindow("Minimized after registration");
+            fixture.DrainDispatcher();
+            Mock.Get(window).SetupGet(item => item.State).Returns(WinMan.WindowState.Minimized);
+            fixture.VirtualDesktopManagerMock.Invocations.Clear();
+
+            Assert.IsFalse(fixture.Service.DiscoverWindows());
+
+            fixture.VirtualDesktopManagerMock.VerifyGet(item => item.Desktops, Times.Never);
+            Assert.IsTrue(GetBackend(fixture).HasWindow(window));
+        }
+
+        [DataTestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public void DiscoverySharesOneSnapshotAndRetriesItsFailurePerWindow(bool enabled)
+        {
+            using var fixture = new ServiceFixture(EnabledSettings(enabled));
+            var first = fixture.AddWindow("First");
+            var second = fixture.AddWindow("Second");
+            fixture.DrainDispatcher();
+            fixture.VirtualDesktopManagerMock.Invocations.Clear();
+
+            Assert.IsFalse(fixture.Service.DiscoverWindows());
+
+            fixture.VirtualDesktopManagerMock.VerifyGet(item => item.Desktops, Times.Once);
+            fixture.VirtualDesktopManagerMock.Invocations.Clear();
+            fixture.VirtualDesktopManagerMock.SetupSequence(item => item.Desktops)
+                .Throws(new InvalidOperationException("transient snapshot failure"))
+                .Returns(new[] { fixture.Desktop })
+                .Returns(new[] { fixture.Desktop });
+
+            Assert.IsFalse(fixture.Service.DiscoverWindows());
+
+            fixture.VirtualDesktopManagerMock.VerifyGet(item => item.Desktops, Times.Exactly(3));
+            Assert.IsTrue(GetBackend(fixture).HasWindow(first));
+            Assert.IsTrue(GetBackend(fixture).HasWindow(second));
+        }
+
+        private static TilingWorkspace GetBackend(ServiceFixture fixture) =>
+            (TilingWorkspace)typeof(TilingService)
+                .GetField("m_backend", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .GetValue(fixture.Service)!;
+
+        [TestMethod]
+        public void ArrangeFailureUsesNewWindowEligibilityCapturedBeforeMeasure()
+        {
+            using var fixture = new ServiceFixture(EnabledSettings(true));
+            var window = fixture.AddWindow("Existing master");
+            fixture.DrainDispatcher();
+            var backend = (TilingWorkspace)typeof(TilingService)
+                .GetField("m_backend", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .GetValue(fixture.Service)!;
+            var newWindows = (HashSet<IWindow>)typeof(TilingService)
+                .GetField("m_newWindowSet", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .GetValue(fixture.Service)!;
+            newWindows.Clear();
+            var tree = backend.GetTree(fixture.Desktop)!;
+            var originalNodes = tree.Root!.Windows.ToArray();
+            Mock.Get(window).SetupGet(item => item.MinSize).Returns(() =>
+            {
+                newWindows.Add(window);
+                return new WinMan.Point(10000, 10000);
+            });
+            var updateTree = (Func<DesktopTree, bool>)typeof(TilingService)
+                .GetMethod("UpdateTree", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .CreateDelegate(typeof(Func<DesktopTree, bool>), fixture.Service);
+
+            Assert.IsFalse(updateTree(tree));
+            CollectionAssert.AreEqual(originalNodes, tree.Root.Windows.ToArray());
+            Assert.IsFalse(fixture.Coordinator.FloatingWindows.Contains(window));
+            Assert.IsTrue(fixture.Coordinator.TryGet(new LayoutStateKey(fixture.Desktop, fixture.Display), out var state));
+            Assert.AreSame(window, state.Master);
+        }
+
+        [TestMethod]
+        public void ArrangeFailureRetainsEligibilityRemovedDuringMeasure()
+        {
+            using var fixture = new ServiceFixture(EnabledSettings(true));
+            var master = fixture.AddWindow("Master");
+            var satellite = fixture.AddWindow("New satellite");
+            fixture.DrainDispatcher();
+            var backend = GetBackend(fixture);
+            var newWindows = fixture.GetServiceField<HashSet<IWindow>>("m_newWindowSet");
+            newWindows.Clear();
+            newWindows.Add(satellite);
+            var tree = backend.GetTree(fixture.Desktop)!;
+            bool removedDuringMeasure = false;
+            Mock.Get(satellite).SetupGet(item => item.MinSize).Returns(() =>
+            {
+                removedDuringMeasure = newWindows.Remove(satellite) || removedDuringMeasure;
+                return new WinMan.Point(10000, 10000);
+            });
+            int placementFailures = 0;
+            IWindow? failedWindow = null;
+            fixture.Service.PlacementFailed += (_, args) =>
+            {
+                placementFailures++;
+                failedWindow = args.FailSource;
+                Assert.AreEqual(TilingError.NoValidPlacementExists, args.FailReason);
+            };
+            var updateTree = (Func<DesktopTree, bool>)typeof(TilingService)
+                .GetMethod("UpdateTree", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .CreateDelegate(typeof(Func<DesktopTree, bool>), fixture.Service);
+
+            Assert.IsTrue(updateTree(tree));
+
+            Assert.IsTrue(removedDuringMeasure);
+            Assert.AreEqual(0, newWindows.Count);
+            Assert.AreEqual(1, placementFailures);
+            Assert.AreSame(satellite, failedWindow);
+            CollectionAssert.AreEqual(
+                new[] { master },
+                tree.Root!.Windows.Select(node => node.WindowReference).ToArray());
+            Assert.IsTrue(fixture.Coordinator.FloatingWindows.Contains(satellite));
+            Assert.IsTrue(fixture.Coordinator.TryGet(
+                new LayoutStateKey(fixture.Desktop, fixture.Display),
+                out var state));
+            Assert.AreSame(master, state.Master);
+            Assert.AreEqual(0, state.Satellites.Count);
+        }
+
         [TestMethod]
         public void SettingsAndCommandsPublishEnabledDisabledEventsThroughService()
         {
@@ -2570,7 +3353,9 @@ namespace FancyWM.Tests.AlgorithmicLayouts
                 ITilingServiceSettings initialSettings,
                 bool includeSecondDesktop = false,
                 bool canManageVirtualDesktops = true,
-                bool includeThirdDesktop = false)
+                bool includeThirdDesktop = false,
+                ILogger? logger = null,
+                IAnimationThread? animationThread = null)
             {
                 m_workspaceMock = new Mock<IWorkspace>(MockBehavior.Loose);
                 VirtualDesktopManagerMock = new Mock<IVirtualDesktopManager>(
@@ -2686,11 +3471,11 @@ namespace FancyWM.Tests.AlgorithmicLayouts
                 Service = new TilingService(
                     m_workspaceMock.Object,
                     Display,
-                    new FakeAnimationThread(),
+                    animationThread ?? new FakeAnimationThread(),
                     m_settings,
                     Coordinator,
                     autoRegisterWindows: true,
-                    new Mock<ILogger>(MockBehavior.Loose).Object,
+                    logger ?? new Mock<ILogger>(MockBehavior.Loose).Object,
                     (_, _) => Overlay,
                     PublishCapacity,
                     EventTracker);
@@ -3017,6 +3802,9 @@ namespace FancyWM.Tests.AlgorithmicLayouts
 
             public void RaisePositionChangeStart(IWindow window)
             {
+                // Initial placement includes asynchronous fake-window writes.
+                // Settle those writes before callers capture a same-size move.
+                DrainMouseLayoutPipeline();
                 var position = window.Position;
                 m_windowMocks[window].Raise(
                     item => item.PositionChangeStart += null,
@@ -3101,18 +3889,85 @@ namespace FancyWM.Tests.AlgorithmicLayouts
                 DrainMouseLayoutPipeline();
             }
 
-            private void DrainMouseLayoutPipeline()
+            public void DrainMouseLayoutPipeline()
             {
-                // Layout invalidation is async-void and its reposition work uses
-                // the thread pool. An ApplicationIdle sentinel can therefore run
-                // before the dispatcher continuation that unfreezes and queues
-                // the coalesced preview pass. Pump a few bounded turns so this
-                // fixture observes the same completed pipeline as the real UI.
-                for (int i = 0; i < 3; i++)
+                var dispatcher = Dispatcher.CurrentDispatcher;
+                var queue = GetServiceField<LayoutInvalidationQueue>("m_layoutInvalidations");
+                var queueType = typeof(LayoutInvalidationQueue);
+                var flags = BindingFlags.NonPublic | BindingFlags.Instance;
+                var queueLock = queueType.GetField("m_lock", flags)!.GetValue(queue)!;
+                var queueDirty = queueType.GetField("m_dirty", flags)!;
+                var queueScheduled = queueType.GetField("m_scheduled", flags)!;
+                var frozen = GetServiceField<Counter>("m_frozen");
+                var frame = new DispatcherFrame();
+                DispatcherOperation? readinessCheck = null;
+                bool timedOut = false;
+
+                (bool ServiceDirty, int Frozen, bool QueueDirty, bool Scheduled) ReadState()
                 {
-                    System.Threading.Thread.Sleep(20);
-                    DrainDispatcher();
+                    lock (queueLock)
+                    {
+                        return (LayoutInvalidated, frozen.Count,
+                            (bool)queueDirty.GetValue(queue)!,
+                            (bool)queueScheduled.GetValue(queue)!);
+                    }
                 }
+
+                void ScheduleReadinessCheck()
+                {
+                    if (!frame.Continue || readinessCheck != null) { return; }
+                    readinessCheck = dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, new Action(() =>
+                    {
+                        var state = ReadState();
+                        if (!state.ServiceDirty && state.Frozen == 0 && !state.QueueDirty && !state.Scheduled)
+                        {
+                            frame.Continue = false;
+                        }
+                    }));
+                }
+
+                void OnDispatcherOperationFinished(object? sender, DispatcherHookEventArgs args)
+                {
+                    if (ReferenceEquals(args.Operation, readinessCheck))
+                    {
+                        readinessCheck = null;
+                        return;
+                    }
+                    ScheduleReadinessCheck();
+                }
+
+                var timeout = new DispatcherTimer(DispatcherPriority.Send, dispatcher)
+                {
+                    Interval = TimeSpan.FromSeconds(5)
+                };
+                void OnTimeout(object? sender, EventArgs args)
+                {
+                    timedOut = true;
+                    frame.Continue = false;
+                }
+
+                // A completed dispatcher turn may precede an asynchronous layout
+                // continuation. Observe actual ownership until it becomes idle;
+                // the timer is only a failure guard, never completion evidence.
+                dispatcher.Hooks.OperationCompleted += OnDispatcherOperationFinished;
+                dispatcher.Hooks.OperationAborted += OnDispatcherOperationFinished;
+                timeout.Tick += OnTimeout;
+                try
+                {
+                    timeout.Start();
+                    ScheduleReadinessCheck();
+                    Dispatcher.PushFrame(frame);
+                }
+                finally
+                {
+                    timeout.Stop();
+                    timeout.Tick -= OnTimeout;
+                    dispatcher.Hooks.OperationCompleted -= OnDispatcherOperationFinished;
+                    dispatcher.Hooks.OperationAborted -= OnDispatcherOperationFinished;
+                    readinessCheck?.Abort();
+                }
+                Assert.IsFalse(timedOut,
+                    $"The layout pipeline did not finish: active={Service.Active}, disposed={m_disposed}, state={ReadState()}.");
             }
 
             public void Pin(IWindow window)
@@ -3124,6 +3979,26 @@ namespace FancyWM.Tests.AlgorithmicLayouts
             {
                 m_settings.OnNext(settings);
                 DrainDispatcher();
+            }
+
+            public void PublishWithoutDispatch(ITilingServiceSettings settings)
+                => m_settings.OnNext(settings);
+
+            public T GetServiceField<T>(string name) => (T)typeof(TilingService)
+                .GetField(name, BindingFlags.NonPublic | BindingFlags.Instance)!
+                .GetValue(Service)!;
+
+            public bool LayoutInvalidated => GetServiceField<bool>("m_dirty");
+
+            public void HoldLayoutForSettingsObservation()
+            {
+                // Exercise the active service's real dirty flag while retaining
+                // the normal frozen-layout guard against async placement work.
+                GetServiceField<Counter>("m_frozen").Increment();
+                typeof(TilingService).GetField("m_active", BindingFlags.NonPublic | BindingFlags.Instance)!
+                    .SetValue(Service, true);
+                typeof(TilingService).GetField("m_dirty", BindingFlags.NonPublic | BindingFlags.Instance)!
+                    .SetValue(Service, false);
             }
 
             public void DrainDispatcher()
@@ -3139,14 +4014,22 @@ namespace FancyWM.Tests.AlgorithmicLayouts
             {
                 for (int i = 0; i < 8; i++)
                 {
-                    System.Threading.Thread.Sleep(60);
                     DrainDispatcher();
-                    if (SourceOwnershipProbeFailuresRemaining == 0)
+                    var probes = ProbeMap(this).Values.Cast<object>().ToArray();
+                    if (probes.Length == 0) return;
+                    foreach (var probe in probes)
                     {
-                        DrainDispatcher();
-                        return;
+                        // A failed HasWindow read can consume the final fake error
+                        // while still scheduling another probe. Drive the actual
+                        // owned callback until completion, independently of wall time.
+                        var timer = (DispatcherTimer)probe.GetType().GetProperty("Timer")!.GetValue(probe)!;
+                        var tick = (EventHandler)probe.GetType().GetProperty("Tick")!.GetValue(probe)!;
+                        timer.Stop();
+                        tick(timer, EventArgs.Empty);
                     }
                 }
+                DrainDispatcher();
+                Assert.AreEqual(0, ProbeMap(this).Count, "Incoming ownership probes did not reach a terminal state.");
             }
 
             public void DrainIncomingOwnershipProbesUntil(
@@ -3385,6 +4268,11 @@ namespace FancyWM.Tests.AlgorithmicLayouts
             public Rectangle? PreviewRectangle { get; set; }
             public IWindow? IntentSourceWindow { get; set; }
             public bool IsDisposed { get; private set; }
+            public int InvalidateViewCount { get; private set; }
+            public int UpdateOverlayCount { get; private set; }
+            public int HideCount { get; private set; }
+            public Action? OnHide { get; set; }
+            public Action? OnUpdateOverlay { get; set; }
             public IReadOnlyCollection<TilingNode> LastSnapshot { get; private set; }
                 = Array.Empty<TilingNode>();
 
@@ -3392,7 +4280,9 @@ namespace FancyWM.Tests.AlgorithmicLayouts
                 IReadOnlyCollection<TilingNode> snapshot,
                 IReadOnlyCollection<TilingNode> focusedPath)
             {
+                UpdateOverlayCount++;
                 LastSnapshot = snapshot.ToArray();
+                OnUpdateOverlay?.Invoke();
             }
 
             public Rectangle GetWindowRectangle(IWindow window)
@@ -3405,6 +4295,7 @@ namespace FancyWM.Tests.AlgorithmicLayouts
 
             public void InvalidateView()
             {
+                InvalidateViewCount++;
             }
 
             public void Show()
@@ -3413,6 +4304,8 @@ namespace FancyWM.Tests.AlgorithmicLayouts
 
             public void Hide()
             {
+                HideCount++;
+                OnHide?.Invoke();
             }
 
             public void Dispose()

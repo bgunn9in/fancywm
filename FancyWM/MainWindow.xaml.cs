@@ -46,6 +46,7 @@ namespace FancyWM
     public partial class MainWindow : Window, IDisposable
     {
         private readonly Win32Workspace m_workspace;
+        private readonly IVirtualDesktopManager m_subscribedDesktopManager;
         private readonly AlgorithmicLayoutCoordinator m_algorithmicLayoutCoordinator;
         private ITilingService m_tiling;
         private readonly CompositeDisposable m_subscriptions;
@@ -89,194 +90,243 @@ namespace FancyWM
         private bool m_notifyVirtualDesktopServiceIncompatibility;
         private LowLevelHotkey[] m_directHks = [];
         private DispatcherTimer m_dispatcherTimer;
+        private readonly CancellationTokenSource m_shutdownCancellation = new();
+        private readonly BindingErrorListener m_bindingErrorListener;
+        private bool m_disposed;
+        private readonly MainWindowLifetime m_lifetime;
+        private readonly LoadedUpdateCheck m_loadedUpdateCheck;
+        private Task m_tilingShutdown = Task.CompletedTask;
+        private bool m_restoreLayoutOnShutdown;
 
 #pragma warning disable CS8618 // Non-nullable field must contain a non-null value when exiting constructor. Consider declaring as nullable.
         public MainWindow()
 #pragma warning restore CS8618 // Non-nullable field must contain a non-null value when exiting constructor. Consider declaring as nullable.
         {
-            InitializeComponent();
+            m_lifetime = new MainWindowLifetime(DisposeOwnedResources,
+                CompleteOwnedOperationsAsync,
+                DisposeDependentResources, DispatchCleanupAsync);
+            try
+            {
+                m_lifetime.Run(InitializeComponent);
 
-            m_logger = App.Current.Logger;
+                m_logger = App.Current.Logger;
 
-            m_unmanagedResourceGuard = ApplySystemParameters();
+                m_loadedUpdateCheck = new LoadedUpdateCheck(
+                    m_lifetime,
+                    callback => Dispatcher.InvokeAsync(callback).Task.Unwrap(),
+                    error => m_logger.Error(error, "Update check loop failed!"),
+                    () => m_shutdownCancellation.IsCancellationRequested);
 
-            BindingErrorListener.Listen(OnBindingError);
+                m_lifetime.Acquire(out m_unmanagedResourceGuard, ApplySystemParameters);
 
-            m_hwnd = new WindowInteropHelper(this).EnsureHandle();
+                m_lifetime.Acquire(out m_bindingErrorListener, () => BindingErrorListener.Listen(OnBindingError));
 
-            m_workspace = new Win32Workspace();
-            m_workspace.UnhandledException += OnWorkspaceUnhandledException;
+                m_hwnd = new WindowInteropHelper(this).EnsureHandle();
 
-            m_workspace.Open();
+                m_lifetime.Acquire(out m_workspace, () => new Win32Workspace());
+                m_lifetime.Run(() => m_workspace.UnhandledException += OnWorkspaceUnhandledException);
 
-            m_algorithmicLayoutCoordinator = new AlgorithmicLayoutCoordinator(
-                m_workspace,
-                Dispatcher);
+                m_lifetime.Run(m_workspace.Open);
 
-            m_toasts = new ToastService(m_workspace);
+                m_lifetime.Acquire(out m_algorithmicLayoutCoordinator, () => new AlgorithmicLayoutCoordinator(
+                    m_workspace,
+                    Dispatcher));
 
-            m_animationThread = new AnimationThread(m_workspace.DisplayManager.Displays.Select(x => x.RefreshRate).Max());
+                m_lifetime.Acquire(out m_toasts, () => new ToastService(m_workspace));
 
-            m_workspace.VirtualDesktopManager.CurrentDesktopChanged += OnVirtualDesktopChanged;
-            m_workspace.VirtualDesktopManager.DesktopRemoved += OnVirtualDesktopRemoved;
-            m_workspace.FocusedWindowChanged += OnFocusedWindowChanged;
+                m_lifetime.Acquire(out m_animationThread, () => new AnimationThread(m_workspace.DisplayManager.Displays.Select(x => x.RefreshRate).Max()));
 
-            m_mvm = new ModifierWindowMover(m_workspace, App.Current.Services.GetRequiredService<LowLevelMouseHook>());
+                // Keep the already acquired borrowed manager for cleanup; its
+                // workspace getter would otherwise initialize COM during unwind.
+                m_subscribedDesktopManager = m_workspace.VirtualDesktopManager;
+                m_lifetime.Run(() => m_subscribedDesktopManager.CurrentDesktopChanged += OnVirtualDesktopChanged);
+                m_lifetime.Run(() => m_subscribedDesktopManager.DesktopRemoved += OnVirtualDesktopRemoved);
+                m_lifetime.Run(() => m_workspace.FocusedWindowChanged += OnFocusedWindowChanged);
 
-            var settings = App.Current.AppState.Settings
-                .Do(x => m_keybindings = x.Keybindings)
-                .Do(x => m_enableRateReviewRequests = x.RemindToRateReview)
-                .Do(x => m_showContextHints = x.ShowContextHints)
-                .Do(x => m_soundOnFailure = x.SoundOnFailure)
-                .Do(x => m_checkForUpdates = x.CheckForUpdates)
-                .Do(x => m_showFocusDuringAction = x.ShowFocusDuringAction)
-                .Do(x => m_notifyVirtualDesktopServiceIncompatibility = x.NotifyVirtualDesktopServiceIncompatibility)
-                .Do(x =>
-                {
-                    m_mvm.IsEnabled = x.ModifierMoveWindow;
-                    m_mvm.AutoFocus = x.ModifierMoveWindowAutoFocus;
-                })
-                .DistinctUntilChanged()
-                .Do(async x =>
-                {
-                    await Dispatcher.InvokeAsync(() =>
+                m_lifetime.Acquire(out m_mvm, () => new ModifierWindowMover(m_workspace, App.Current.Services.GetRequiredService<LowLevelMouseHook>()));
+
+                var settings = App.Current.AppState.Settings;
+                var runtimeSettings = RuntimeSettingsSubscription.Observe(
+                    settings,
+                    value =>
                     {
-                        if (x.OverrideAccentColor)
+                        if (m_disposed) { return; }
+                        m_keybindings = value.Keybindings;
+                        m_enableRateReviewRequests = value.RemindToRateReview;
+                        m_showContextHints = value.ShowContextHints;
+                        m_soundOnFailure = value.SoundOnFailure;
+                        m_checkForUpdates = value.CheckForUpdates;
+                        m_showFocusDuringAction = value.ShowFocusDuringAction;
+                        m_notifyVirtualDesktopServiceIncompatibility = value.NotifyVirtualDesktopServiceIncompatibility;
+                        m_mvm.IsEnabled = value.ModifierMoveWindow;
+                        m_mvm.AutoFocus = value.ModifierMoveWindowAutoFocus;
+                    },
+                    (value, cancellationToken) => Dispatcher.InvokeAsync(() =>
+                    {
+                        if (m_disposed) { return; }
+                        if (value.OverrideAccentColor)
                         {
-                            ThemeManager.Current.AccentColor = x.CustomAccentColor;
+                            ThemeManager.Current.AccentColor = value.CustomAccentColor;
                         }
                         else
                         {
                             ThemeManager.Current.AccentColor = null;
                         }
-                    });
-                });
+                    }, DispatcherPriority.Normal, cancellationToken).Task);
 
-            var startupSettings = settings
-                .Take(1)
-                .Do(x =>
-                {
-                    if (x.ShowStartupWindow)
+                var startupSettings = settings
+                    .Take(1)
+                    .Do(x =>
                     {
-                        Dispatcher.Invoke(() =>
+                        if (x.ShowStartupWindow)
                         {
-                            new StartupWindow(new ViewModels.SettingsViewModel(App.Current.AppState.Settings)).Show();
-                        }, System.Windows.Threading.DispatcherPriority.ApplicationIdle);
-                    }
-                });
+                            Dispatcher.Invoke(() =>
+                            {
+                                if (m_disposed) { return; }
+                                new StartupWindow(new ViewModels.SettingsViewModel(App.Current.AppState.Settings)).Show();
+                            }, System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+                        }
+                    });
 
-            var activationHotkeySettings = settings
-                .Select(x => x.ActivationHotkey)
-                .DistinctUntilChanged()
-                .Do(_ => Dispatcher.BeginInvoke(() => RebindActivationHotkey(_)));
-
-            var activateOnCapsLockSetting = settings
-                .Select(x => x.ActivateOnCapsLock)
-                .DistinctUntilChanged()
-                .Do(_ => Dispatcher.BeginInvoke(() => RebindCapsLockHotkey(_)));
-
-            var keybindingsSettings = settings
-                .Select(x => x.Keybindings)
-                .DistinctUntilChanged()
-                .Do(_ => Dispatcher.BeginInvoke(() => RebindDirectHotkeys(_)));
-
-            var multiMonitorObservable = settings
-                .Select(x => x.MultiMonitorSupport)
-                .Take(1)
-                .Do(async multiMonitorSupport => await Dispatcher.InvokeAsync(() =>
-                {
-                    if (multiMonitorSupport)
+                var activationHotkeySettings = RuntimeSettingsSubscription.ApplyLatest(
+                    settings.Select(x => x.ActivationHotkey).DistinctUntilChanged(),
+                    (value, cancellationToken) => Dispatcher.InvokeAsync(() =>
                     {
-                        m_tiling = new MultiDisplayTilingService(
-                            m_workspace,
-                            m_animationThread,
-                            settings,
-                            m_algorithmicLayoutCoordinator);
-                    }
-                    else
+                        if (m_disposed) { return; }
+                        RebindActivationHotkey(value);
+                    }, DispatcherPriority.Normal, cancellationToken).Task);
+
+                var activateOnCapsLockSetting = RuntimeSettingsSubscription.ApplyLatest(
+                    settings.Select(x => x.ActivateOnCapsLock).DistinctUntilChanged(),
+                    (value, cancellationToken) => Dispatcher.InvokeAsync(() =>
                     {
-                        m_tiling = new TilingService(
-                            m_workspace,
-                            m_workspace.DisplayManager.PrimaryDisplay,
-                            m_animationThread,
-                            settings,
-                            m_algorithmicLayoutCoordinator,
-                            true);
-                    }
+                        if (m_disposed) { return; }
+                        RebindCapsLockHotkey(value);
+                    }, DispatcherPriority.Normal, cancellationToken).Task);
 
-                    m_tiling.PlacementFailed += OnTilingFailed;
-                    m_tiling.AlgorithmicLayoutChanged += OnAlgorithmicLayoutChanged;
-                    m_tiling.Start();
-                }))
-                .Select(_ => Unit.Default);
+                var keybindingsSettings = RuntimeSettingsSubscription.ApplyLatest(
+                    RuntimeSettingsSubscription.DirectHotkeys(settings),
+                    (value, cancellationToken) => Dispatcher.InvokeAsync(() =>
+                    {
+                        if (m_disposed) { return; }
+                        RebindDirectHotkeys(value);
+                    }, DispatcherPriority.Normal, cancellationToken).Task);
 
-            var exclusionListSettings = settings
-                .DistinctUntilChanged(x => (x.ProcessIgnoreList, x.ClassIgnoreList))
-                .Do(async x => await Dispatcher.InvokeAsync(() =>
+                var multiMonitorObservable = RuntimeSettingsSubscription.Initialize(
+                    settings,
+                    (initialSettings, cancellationToken) => Dispatcher.InvokeAsync(() =>
+                    {
+                        if (m_disposed) { return; }
+                        m_lifetime.Initialize(() =>
+                        {
+                            if (initialSettings.MultiMonitorSupport)
+                            {
+                                m_lifetime.Acquire<ITilingService>(out m_tiling, () => new MultiDisplayTilingService(
+                                    m_workspace,
+                                    m_animationThread,
+                                    settings,
+                                    m_algorithmicLayoutCoordinator));
+                            }
+                            else
+                            {
+                                m_lifetime.Acquire<ITilingService>(out m_tiling, () => new TilingService(
+                                    m_workspace,
+                                    m_workspace.DisplayManager.PrimaryDisplay,
+                                    m_animationThread,
+                                    settings,
+                                    m_algorithmicLayoutCoordinator,
+                                    true));
+                            }
+
+                            m_lifetime.Run(() => m_tiling.PlacementFailed += OnTilingFailed);
+                            m_lifetime.Run(() => m_tiling.AlgorithmicLayoutChanged += OnAlgorithmicLayoutChanged);
+                            m_lifetime.Run(m_tiling.Start);
+                        });
+                    }, DispatcherPriority.Normal, cancellationToken).Task);
+
+                var exclusionListSettings = RuntimeSettingsSubscription.ApplyLatest(
+                    RuntimeSettingsSubscription.Exclusions(settings),
+                    (x, cancellationToken) => Dispatcher.InvokeAsync(() =>
+                    {
+                        if (m_disposed) { return; }
+                        var processMatchers = x.ProcessIgnoreList.Select(x => new ByProcessNameMatcher(x));
+                        var classMatchers = x.ClassIgnoreList.Select(x => new ByClassNameMatcher(x));
+                        m_tiling!.ExclusionMatchers = m_tiling.ExclusionMatchers
+                            .Where(m => m is not ByProcessNameMatcher && m is not ByClassNameMatcher)
+                            .Concat(processMatchers)
+                            .Concat(classMatchers)
+                            .ToArray();
+                    }, DispatcherPriority.Normal, cancellationToken).Task);
+
+                m_llkbdHook = App.Current.Services.GetRequiredService<LowLevelKeyboardHook>();
+
+                m_lifetime.Acquire(out m_subscriptions, () => m_lifetime.SubscribeAll(
+                    () => runtimeSettings.Subscribe(new NotifyUnhandledObserver<Settings>()),
+                    () => startupSettings.Subscribe(new NotifyUnhandledObserver<Settings>()),
+                    () => activationHotkeySettings.Subscribe(new NotifyUnhandledObserver<Unit>()),
+                    () => activateOnCapsLockSetting.Subscribe(new NotifyUnhandledObserver<Unit>()),
+                    () => keybindingsSettings.Subscribe(new NotifyUnhandledObserver<Unit>()),
+                    () => multiMonitorObservable
+                        .Concat(exclusionListSettings)
+                        .Subscribe(_ => { }, OnTilingInitializationFailed)), MainWindowLifetime.ReleaseSubscriptions);
+
+                m_lifetime.Acquire(out m_notifyIcon, () => new TaskbarIcon());
+                m_lifetime.Run(() => m_notifyIcon.Icon = Files.Icon);
+                m_lifetime.Run(() => m_notifyIcon.TrayLeftMouseDown += OnNotifyIconLeftMouseDown);
+                m_lifetime.Run(() => m_notifyIcon.TrayRightMouseDown += OnNotifyIconRightMouseDown);
+                m_lifetime.Run(() => m_notifyIcon.Visibility = Visibility.Visible);
+                m_lifetime.Run(() => m_notifyIcon.TrayBalloonTipClicked += OnBalloonTipClicked);
+
+                m_hideCountdownTimer = new CountdownTimer();
+                m_contextMenu = (ContextMenu)FindResource("NotifierContextMenu");
+                m_explorerHasVirtualDesktopTooltip = ExplorerFeature.HasVirtualDesktopTooltip();
+
+                m_stopwatch = new Stopwatch();
+                m_stopwatch.Start();
+
+                m_lifetime.Acquire(out m_dispatcherTimer,
+                    () => new DispatcherTimer(DispatcherPriority.Background), timer => timer.Stop());
+                m_lifetime.Run(() => m_dispatcherTimer.Interval = TimeSpan.FromMilliseconds(250));
+                m_lifetime.Run(() => m_dispatcherTimer.Tick += OnDispatcherTimerTick);
+                m_lifetime.Run(m_dispatcherTimer.Start);
+
+                m_lifetime.Run(() => PInvoke.SetWindowLong(new(m_hwnd), GetWindowLongPtr_nIndex.GWL_EXSTYLE,
+                    (int)(WINDOWS_EX_STYLE.WS_EX_TOOLWINDOW | WINDOWS_EX_STYLE.WS_EX_TOPMOST)));
+
+                if (App.Current.Services.GetService<IMicaProvider>() is IMicaProvider micaProvider)
                 {
-                    var processMatchers = x.ProcessIgnoreList.Select(x => new ByProcessNameMatcher(x));
-                    var classMatchers = x.ClassIgnoreList.Select(x => new ByClassNameMatcher(x));
-                    m_tiling!.ExclusionMatchers = m_tiling.ExclusionMatchers
-                        .Where(m => m is not ByProcessNameMatcher && m is not ByClassNameMatcher)
-                        .Concat(processMatchers)
-                        .Concat(classMatchers)
-                        .ToArray();
-                }))
-                .Select(_ => Unit.Default);
+                    m_micaProvider = micaProvider;
+                    m_lifetime.Run(() => App.Current.Resources["MicaPrimaryColor"] = m_micaProvider.PrimaryColor);
+                    m_lifetime.Run(() => m_micaProvider.PrimaryColorChanged += OnMicaProviderPrimaryColorChanged);
+                }
 
-            m_llkbdHook = App.Current.Services.GetRequiredService<LowLevelKeyboardHook>();
+                m_lifetime.Run(() => Loaded += OnLoaded);
+                m_lifetime.Run(Show);
+                m_lifetime.Run(Hide);
+                m_lifetime.Run(() => ((HwndSource)PresentationSource.FromVisual(this)).AddHook(WndProc));
 
-            m_subscriptions =
-            [
-                settings.Subscribe(new NotifyUnhandledObserver<Settings>()),
-                startupSettings.Subscribe(new NotifyUnhandledObserver<Settings>()),
-                activationHotkeySettings.Subscribe(new NotifyUnhandledObserver<ActivationHotkey>()),
-                activateOnCapsLockSetting.Subscribe(new NotifyUnhandledObserver<bool>()),
-                keybindingsSettings.Subscribe(new NotifyUnhandledObserver<KeybindingDictionary>()),
-                multiMonitorObservable
-                    .Concat(exclusionListSettings)
-                    .Subscribe(new NotifyUnhandledObserver<Unit>()),
-            ];
-
-            m_notifyIcon = new TaskbarIcon
-            {
-                Icon = Files.Icon
-            };
-            m_notifyIcon.TrayLeftMouseDown += OnNotifyIconLeftMouseDown;
-            m_notifyIcon.TrayRightMouseDown += OnNotifyIconRightMouseDown;
-            m_notifyIcon.Visibility = Visibility.Visible;
-            m_notifyIcon.TrayBalloonTipClicked += OnBalloonTipClicked;
-
-            m_hideCountdownTimer = new CountdownTimer();
-            m_contextMenu = (ContextMenu)FindResource("NotifierContextMenu");
-            m_explorerHasVirtualDesktopTooltip = ExplorerFeature.HasVirtualDesktopTooltip();
-
-            m_stopwatch = new Stopwatch();
-            m_stopwatch.Start();
-
-            m_dispatcherTimer = new DispatcherTimer(DispatcherPriority.Background)
-            {
-                Interval = TimeSpan.FromMilliseconds(250)
-            };
-            m_dispatcherTimer.Tick += new EventHandler(OnDispatcherTimerTick);
-            m_dispatcherTimer.Start();
-
-            _ = PInvoke.SetWindowLong(new(m_hwnd), GetWindowLongPtr_nIndex.GWL_EXSTYLE,
-                (int)(WINDOWS_EX_STYLE.WS_EX_TOOLWINDOW | WINDOWS_EX_STYLE.WS_EX_TOPMOST));
-
-            if (App.Current.Services.GetService<IMicaProvider>() is IMicaProvider micaProvider)
-            {
-                m_micaProvider = micaProvider;
-                App.Current.Resources["MicaPrimaryColor"] = m_micaProvider.PrimaryColor;
-                m_micaProvider.PrimaryColorChanged += OnMicaProviderPrimaryColorChanged;
+                m_lifetime.Run(() => m_subscriptions.Add(ThemeEngineManager.Initialize(Path.GetFullPath("themes"), "custom.css")));
             }
+            catch (Exception error)
+            {
+                m_disposed = true;
+                m_lifetime.ConstructionFailed(error);
+                throw;
+            }
+        }
 
-            Loaded += OnLoaded;
-            Show();
-            Hide();
-            ((HwndSource)PresentationSource.FromVisual(this)).AddHook(WndProc);
-
-            ThemeEngineManager.Initialize(Path.GetFullPath("themes"), "custom.css");
+        private void OnTilingInitializationFailed(Exception error)
+        {
+            m_lifetime.InitializationFailed(error, new NotifyUnhandledObserver<Unit>().OnError, cleanup =>
+            {
+                void HandleFailure()
+                {
+                    m_disposed = true;
+                    cleanup();
+                }
+                if (Dispatcher.CheckAccess()) { HandleFailure(); }
+                else { _ = Dispatcher.InvokeAsync(HandleFailure, DispatcherPriority.Send); }
+            });
         }
 
         private UnmanagedResourceGuard? ApplySystemParameters()
@@ -299,7 +349,7 @@ namespace FancyWM
 
         private void OnDispatcherTimerTick(object? sender, EventArgs e)
         {
-            if (m_tiling == null)
+            if (m_disposed || m_tiling == null)
             {
                 return;
             }
@@ -320,12 +370,13 @@ namespace FancyWM
 
         private void OnFocusedWindowChanged(object? sender, FocusedWindowChangedEventArgs e)
         {
+            if (m_disposed) { return; }
             if (e.NewFocusedWindow != null)
             {
-                Dispatcher.InvokeAsync(() =>
+                Dispatcher.InvokeAsync(() => m_lifetime.RunIfActive(() =>
                 {
-                    m_contextMenu.IsOpen = false;
-                });
+                    if (m_contextMenu != null) { m_contextMenu.IsOpen = false; }
+                }));
 
                 var currentDisplay = m_workspace.DisplayManager.Displays.FirstOrDefault(x => x.Bounds.Contains(e.NewFocusedWindow.Position.Center));
                 if (currentDisplay != null)
@@ -346,29 +397,40 @@ namespace FancyWM
 
         private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
         {
-            if (msg == Constants.WM_COPYDATA)
+            if (!m_disposed && msg == Constants.WM_COPYDATA)
             {
                 byte[] message = WindowCopyDataHelper.Receive(lParam);
-                _ = Dispatcher.InvokeAsync(async () =>
+                _ = Dispatcher.InvokeAsync(() => m_lifetime.RunIfActiveAsync(async () =>
                 {
                     var actionName = Encoding.Default.GetString(message);
                     await ExecuteActionFromStringAsync(actionName);
-                });
+                }));
             }
             handled = false;
             return IntPtr.Zero;
         }
 
         private void OnMicaProviderPrimaryColorChanged(object? sender, MicaOptionsChangedEventArgs e)
+            => HandleMicaPrimaryColorChanged(
+                m_lifetime,
+                callback => { _ = Dispatcher.InvokeAsync(callback); },
+                () =>
+                {
+                    if (m_disposed) { return; }
+                    App.Current.Resources["MicaPrimaryColor"] = m_micaProvider.PrimaryColor;
+                });
+
+        internal static void HandleMicaPrimaryColorChanged(
+            MainWindowLifetime lifetime,
+            Action<Action> post,
+            Action apply)
         {
-            Dispatcher.Invoke(() =>
-            {
-                App.Current.Resources["MicaPrimaryColor"] = m_micaProvider.PrimaryColor;
-            });
+            lifetime.RunIfActive(() => post(() => lifetime.RunIfActive(apply)));
         }
 
         private void OnLoaded(object sender, RoutedEventArgs e)
         {
+            if (m_disposed) { return; }
             if (m_workspace.VirtualDesktopManager.GetType().Name == "DummyVirtualDesktopManager" && Environment.OSVersion.Version.Build >= 17661 && m_notifyVirtualDesktopServiceIncompatibility)
             {
                 if (new Windows.MessageBox { IconGlyph = "\xF1AD", Title = Strings.Messages_WindowsVersionNotSupported_Caption + " OS Build: " + Environment.OSVersion.Version.Build, Message = Strings.Messages_WindowsVersionNotSupported_Description }.ShowDialog() == true)
@@ -379,29 +441,19 @@ namespace FancyWM
 
             if (App.Current.Services.GetService<ReleaseChecker>() is ReleaseChecker releaseChecker)
             {
-                _ = Dispatcher.BeginInvoke(async () =>
-                {
-                    try
-                    {
-                        await UpdateCheckLoopAsync(releaseChecker);
-                    }
-                    catch (Exception e)
-                    {
-                        m_logger.Error(e, "Update check loop failed!");
-                    }
-                });
+                m_loadedUpdateCheck.Start(() => UpdateCheckLoopAsync(releaseChecker));
             }
         }
 
         private async Task UpdateCheckLoopAsync(ReleaseChecker releaseChecker)
         {
-            while (m_checkForUpdates)
+            while (m_checkForUpdates && !m_shutdownCancellation.IsCancellationRequested)
             {
                 if (ShouldCheckForUpdatesToday())
                 {
                     await CheckForUpdatesAsync(releaseChecker);
                 }
-                await Task.Delay(TimeSpan.FromHours(3));
+                await Task.Delay(TimeSpan.FromHours(3), m_shutdownCancellation.Token);
             }
         }
 
@@ -409,12 +461,15 @@ namespace FancyWM
         {
             try
             {
-                var latestVersion = await releaseChecker.GetLatestStableVersionAsync("fancywm", "FancyWM");
+                var latestVersion = await releaseChecker.GetLatestStableVersionAsync("fancywm", "FancyWM", m_shutdownCancellation.Token);
                 var currentVersion = new Version(App.Current.VersionString);
-                if (latestVersion > currentVersion)
+                if (!m_disposed && latestVersion > currentVersion)
                 {
                     await ShowToastAsync($"{Strings.Messages_NewerVersionAvailable}: {latestVersion}", ToastDurationLong);
                 }
+            }
+            catch (OperationCanceledException) when (m_shutdownCancellation.IsCancellationRequested)
+            {
             }
             catch (Exception ex)
             {
@@ -568,94 +623,121 @@ namespace FancyWM
         }
 
         private async void OnDirectHotkeyPressed(BindableAction action)
+            => await HandleDirectHotkeyPressedAsync(
+                m_lifetime,
+                action,
+                ExecuteAction,
+                HandleCommandExceptionAsync);
+
+        internal delegate void DirectHotkeyActionExecutor(
+            BindableAction action,
+            ref string? friendlyActionName);
+
+        internal static Task HandleDirectHotkeyPressedAsync(
+            MainWindowLifetime lifetime,
+            BindableAction action,
+            DirectHotkeyActionExecutor executeAction,
+            Func<TilingFailedException, string?, Task> presentFailure)
         {
-            string? friendlyActionName = null;
-            try
+            async Task HandleAsync()
             {
-                ExecuteAction(action, ref friendlyActionName);
+                string? friendlyActionName = null;
+                try
+                {
+                    executeAction(action, ref friendlyActionName);
+                }
+                catch (TilingFailedException e)
+                {
+                    await presentFailure(e, friendlyActionName);
+                }
             }
-            catch (TilingFailedException e)
-            {
-                await HandleCommandExceptionAsync(e, friendlyActionName);
-            }
+
+            return lifetime.RunIfActiveAsync(HandleAsync);
         }
 
         private async void OnTilingFailed(object? sender, TilingFailedEventArgs e)
-        {
-            try
+            => await HandleTilingNotificationAsync(m_lifetime, async () =>
             {
-                if (e.FailReason == TilingError.NoValidPlacementExists)
+                try
                 {
-                    if (e.FailSource == null)
+                    if (e.FailReason == TilingError.NoValidPlacementExists)
                     {
-                        throw new ArgumentException($"{nameof(e.FailSource)} is required for {nameof(e.FailReason)}!");
-                    }
+                        if (e.FailSource == null)
+                        {
+                            throw new ArgumentException($"{nameof(e.FailSource)} is required for {nameof(e.FailReason)}!");
+                        }
 
-                    PlayBeepSound();
-                    await ShowToastAsync(
-                        $"{Strings.Messages_FloatingModeEnabledFor} {e.FailSource.Title}",
-                        Strings.Messages_CannotBeResizedToFit,
-                        ToastDurationLong);
-                }
-                else
-                {
-                    var reason = GetTilingErrorText(e.FailReason) ?? Strings.Messages_OperationFailed;
-                    var hint = !string.IsNullOrWhiteSpace(e.PresentationSafeHint)
-                        ? e.PresentationSafeHint
-                        : e.FailSource != null
-                            ? e.FailSource.GetCachedProcessName() + " " + Strings.Common_Window
-                            : null;
-
-                    if (e.RequestsFailureSound)
-                    {
                         PlayBeepSound();
+                        await ShowToastAsync(
+                            $"{Strings.Messages_FloatingModeEnabledFor} {e.FailSource.Title}",
+                            Strings.Messages_CannotBeResizedToFit,
+                            ToastDurationLong);
                     }
-                    await ShowToastAsync(reason, hint, ToastDurationLong);
+                    else
+                    {
+                        var reason = GetTilingErrorText(e.FailReason) ?? Strings.Messages_OperationFailed;
+                        var hint = !string.IsNullOrWhiteSpace(e.PresentationSafeHint)
+                            ? e.PresentationSafeHint
+                            : e.FailSource != null
+                                ? e.FailSource.GetCachedProcessName() + " " + Strings.Common_Window
+                                : null;
+
+                        if (e.RequestsFailureSound)
+                        {
+                            PlayBeepSound();
+                        }
+                        await ShowToastAsync(reason, hint, ToastDurationLong);
+                    }
                 }
-            }
-            catch (Exception exception)
-            {
-                m_logger.Error(
-                    exception,
-                    "Failed to present tiling failure {FailureReason}",
-                    e.FailReason);
-            }
-        }
+                catch (Exception exception)
+                {
+                    m_logger.Error(
+                        exception,
+                        "Failed to present tiling failure {FailureReason}",
+                        e.FailReason);
+                }
+            });
 
         private async void OnAlgorithmicLayoutChanged(
             object? sender,
             AlgorithmicLayoutEvent e)
-        {
-            try
+            => await HandleTilingNotificationAsync(m_lifetime, async () =>
             {
-                var notification = AlgorithmicLayoutNotificationFormatter.Format(
-                    e,
-                    Strings.Common_Window,
-                    GetAlgorithmicDesktopLabel);
-                if (!notification.ShouldShow)
+                try
                 {
-                    return;
+                    var notification = AlgorithmicLayoutNotificationFormatter.Format(
+                        e,
+                        Strings.Common_Window,
+                        GetAlgorithmicDesktopLabel);
+                    if (!notification.ShouldShow)
+                    {
+                        return;
+                    }
+                    if (AlgorithmicLayoutNotificationFormatter.ShouldPlayFailureSound(
+                        notification,
+                        m_soundOnFailure))
+                    {
+                        PlayBeepSound();
+                    }
+                    await ShowToastAsync(
+                        notification.Message!,
+                        notification.Hint,
+                        ToastDurationLong);
                 }
-                if (AlgorithmicLayoutNotificationFormatter.ShouldPlayFailureSound(
-                    notification,
-                    m_soundOnFailure))
+                catch (Exception exception)
                 {
-                    PlayBeepSound();
+                    m_logger.Error(
+                        exception,
+                        "Failed to present Master + Satellites event {EventKind}; correlation={CorrelationId}",
+                        e.Kind,
+                        e.CorrelationId);
                 }
-                await ShowToastAsync(
-                    notification.Message!,
-                    notification.Hint,
-                    ToastDurationLong);
-            }
-            catch (Exception exception)
-            {
-                m_logger.Error(
-                    exception,
-                    "Failed to present Master + Satellites event {EventKind}; correlation={CorrelationId}",
-                    e.Kind,
-                    e.CorrelationId);
-            }
-        }
+            });
+
+        internal static Task HandleTilingNotificationAsync(
+            MainWindowLifetime lifetime,
+            Func<Task> callback)
+            => lifetime.RunIfActiveAsync(callback);
 
         private string GetAlgorithmicDesktopLabel(IVirtualDesktop? desktop)
         {
@@ -724,10 +806,14 @@ namespace FancyWM
         }
 
         private async void OnCommandKey(IReadOnlySet<KeyCode> keys)
-        {
-            // This is to allow for focus to return to the window before movement
-            await Task.Delay(50);
+            => await m_lifetime.RunDelayedIfActiveAsync(
+                // Allow focus to return to the target window before movement.
+                static cancellationToken => Task.Delay(50, cancellationToken),
+                m_shutdownCancellation.Token,
+                () => ExecuteCommandKeyAsync(keys));
 
+        private async Task ExecuteCommandKeyAsync(IReadOnlySet<KeyCode> keys)
+        {
             var matches = m_keybindings.Where(x => x.Value != null && x.Value.Keys.SetEqualsSideInsensitive(keys));
             var action = matches.FirstOrDefault().Key;
             string? friendlyActionName = null;
@@ -1142,18 +1228,22 @@ namespace FancyWM
 
         private async void OnBalloonTipClicked(object? sender, RoutedEventArgs e)
         {
-            if (DateTime.UtcNow - m_reviewTooltipShown < TimeSpan.FromSeconds(10))
+            await m_lifetime.RunIfActiveAsync(async () =>
             {
-                new AboutWindow().Show();
-                await App.Current.AppState.Settings.SaveAsync(x =>
+                if (DateTime.UtcNow - m_reviewTooltipShown < TimeSpan.FromSeconds(10))
                 {
-                    return x with { RemindToRateReview = false };
-                });
-            }
+                    new AboutWindow().Show();
+                    await App.Current.AppState.Settings.SaveAsync(x =>
+                    {
+                        return x with { RemindToRateReview = false };
+                    });
+                }
+            });
         }
 
         private async void OnCmdSequenceBegin(object? sender, EventArgs e)
         {
+            if (m_disposed) { return; }
             long currentId = ++m_cmdSequenceId;
 
             m_logger.Debug($"Command sequence {m_cmdSequenceId} started");
@@ -1164,52 +1254,73 @@ namespace FancyWM
                 m_notifyIcon.ShowBalloonTip(Strings.Messages_EnjoyingFancyWM, Strings.Messages_AskForReview, BalloonIcon.None);
             }
 
-            await Dispatcher.InvokeAsync(async () =>
+            try
             {
-                var cts = new CancellationTokenSource(m_showContextHints ? ToastDurationCommandSequenceWithContextHints : ToastDurationCommandSequence);
-                var toast = Dispatcher.RunAsync(async () =>
+                await await Dispatcher.InvokeAsync(() => m_lifetime.RunIfActiveAsync(async () =>
                 {
+                    using var cts = CancellationTokenSource.CreateLinkedTokenSource(m_shutdownCancellation.Token);
+                    cts.CancelAfter(m_showContextHints ? ToastDurationCommandSequenceWithContextHints : ToastDurationCommandSequence);
+                    var cancellationToken = cts.Token;
+                    using var keyListener = new LowLevelKeyPatternListener(m_llkbdHook);
+                    void OnPatternChanged(object? patternSender, KeyPatternChangedEventArgs pattern)
+                    {
+                        if (m_disposed || m_shutdownCancellation.IsCancellationRequested) { return; }
+                        m_logger.Debug($"Command sequence {currentId} detected");
+                        cts.Cancel();
+                        keyListener.Dispose();
+                        m_lifetime.RunIfActive(() =>
+                        {
+                            if (currentId == m_cmdSequenceId) { OnCommandKey(pattern.Keys); }
+                        });
+                    }
+                    keyListener.PatternChanged += OnPatternChanged;
                     try
                     {
-                        // Yield so that the UI elements for the action toast are created on the next event loop tick,
-                        // without slowing down LowLevelKeyPatternListener hooking.
-                        await Task.Yield();
-                        await ShowWaitingForActionToast(m_showContextHints, cts.Token);
-                    }
-                    catch (Exception e)
-                    {
-                        Dispatcher.RethrowOnDispatcher(e);
-                    }
-                });
+                        var toast = Dispatcher.RunAsync(async () =>
+                        {
+                            try
+                            {
+                                // Yield before constructing the toast, then reject a
+                                // sequence cancelled while its callback was queued.
+                                await Task.Yield();
+                                if (m_disposed || cancellationToken.IsCancellationRequested) { return; }
+                                await ShowWaitingForActionToast(m_showContextHints, cancellationToken);
+                            }
+                            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                            {
+                            }
+                            catch (Exception error)
+                            {
+                                Dispatcher.RethrowOnDispatcher(error);
+                            }
+                        });
 
-                using var keyListener = new LowLevelKeyPatternListener(m_llkbdHook);
-                keyListener.PatternChanged += (s, e) =>
-                {
-                    m_logger.Debug($"Command sequence {currentId} detected");
-                    cts.Cancel();
-                    keyListener.Dispose();
-                    if (currentId == m_cmdSequenceId)
-                    {
-                        OnCommandKey(e.Keys);
+                        bool showFocus = m_showFocusDuringAction;
+                        if (showFocus) { m_tiling.ShowPreviewFocus = true; }
+                        await toast;
+                        if (m_disposed || m_shutdownCancellation.IsCancellationRequested) { return; }
+                        if (showFocus)
+                        {
+                            await Task.Delay(TimeSpan.FromMilliseconds(300), m_shutdownCancellation.Token);
+                            m_lifetime.RunIfActive(() =>
+                            {
+                                if (m_cmdSequenceId == currentId) { m_tiling.ShowPreviewFocus = false; }
+                            });
+                        }
+                        m_logger.Debug($"Command sequence {currentId} ended");
                     }
-                };
-
-                bool showFocus = m_showFocusDuringAction;
-                if (showFocus)
-                {
-                    m_tiling.ShowPreviewFocus = true;
-                }
-                await toast;
-                if (showFocus)
-                {
-                    await Task.Delay(TimeSpan.FromMilliseconds(300));
-                    if (m_cmdSequenceId == currentId)
+                    finally
                     {
-                        m_tiling.ShowPreviewFocus = false;
+                        // The listener may already have queued PatternChanged.
+                        // Detach before disposing the linked timeout source.
+                        keyListener.PatternChanged -= OnPatternChanged;
+                        cts.Cancel();
                     }
-                }
-                m_logger.Debug($"Command sequence {currentId} ended");
-            });
+                }));
+            }
+            catch (OperationCanceledException) when (m_shutdownCancellation.IsCancellationRequested)
+            {
+            }
         }
 
         private Task ShowToastAsync(string messageText, TimeSpan duration)
@@ -1219,11 +1330,12 @@ namespace FancyWM
 
         private async Task ShowToastAsync(string messageText, string? hintText, TimeSpan duration)
         {
+            using var cancellation = new CancellationTokenSource(duration);
             await Dispatcher.RunAsync(() => m_toasts.ShowToastAsync(new MessageBoxContent
             {
                 Text = messageText,
                 HintText = hintText,
-            }, new CancellationTokenSource(duration).Token));
+            }, cancellation.Token));
         }
 
         private async Task ShowToastAsync(string messageText, string? hintText, CancellationToken cancellationToken)
@@ -1237,6 +1349,7 @@ namespace FancyWM
 
         private async Task ShowWaitingForActionToast(bool showContextHints, CancellationToken cancellationToken)
         {
+            if (m_disposed || cancellationToken.IsCancellationRequested) { return; }
             var container = new StackPanel
             {
                 Orientation = Orientation.Vertical,
@@ -1252,15 +1365,26 @@ namespace FancyWM
 
                 _ = Dispatcher.RunAsync(async () =>
                 {
-                    await Task.Delay(ToastDurationShort);
+                    try
+                    {
+                        await Task.Delay(ToastDurationShort, cancellationToken);
+                        if (m_disposed || cancellationToken.IsCancellationRequested) { return; }
 
-                    extraContent.Visibility = Visibility.Visible;
-                    extraContent.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
-                    var extraContentHeight = extraContent.DesiredSize.Height + 32;
-                    DoubleAnimation opacityAnimation = new(0, 1, TimeSpan.FromMilliseconds(200));
-                    DoubleAnimation heightAnimation = new(0, extraContentHeight, TimeSpan.FromMilliseconds(200));
-                    extraContent.BeginAnimation(OpacityProperty, opacityAnimation);
-                    extraContent.BeginAnimation(MaxHeightProperty, heightAnimation);
+                        extraContent.Visibility = Visibility.Visible;
+                        extraContent.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+                        var extraContentHeight = extraContent.DesiredSize.Height + 32;
+                        DoubleAnimation opacityAnimation = new(0, 1, TimeSpan.FromMilliseconds(200));
+                        DoubleAnimation heightAnimation = new(0, extraContentHeight, TimeSpan.FromMilliseconds(200));
+                        extraContent.BeginAnimation(OpacityProperty, opacityAnimation);
+                        extraContent.BeginAnimation(MaxHeightProperty, heightAnimation);
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                    }
+                    catch (Exception error)
+                    {
+                        Dispatcher.RethrowOnDispatcher(error);
+                    }
                 });
 
                 container.Children.Add(extraContent);
@@ -1464,32 +1588,63 @@ namespace FancyWM
 
         private void OnNotifyIconLeftMouseDown(object? sender, RoutedEventArgs e)
         {
-            m_contextMenu.IsOpen = false;
-            OpenSettings();
+            m_lifetime.RunIfActive(() =>
+            {
+                m_contextMenu.IsOpen = false;
+                OpenSettings();
+            });
         }
 
         private void OnNotifyIconRightMouseDown(object? sender, RoutedEventArgs e)
         {
-            m_contextMenu.IsOpen = true;
+            m_lifetime.RunIfActive(() => m_contextMenu.IsOpen = true);
         }
 
         private async void OnVirtualDesktopChanged(object? sender, CurrentDesktopChangedEventArgs e)
+            => await HandleVirtualDesktopChangedAsync(m_lifetime,
+                () => m_logger.Debug("Virtual desktop changed..."),
+                () => m_prevDesktop = e.OldDesktop,
+                ExplorerFeature.HasVirtualDesktopTooltip,
+                () => e.NewDesktop.Name,
+                name => ShowToastAsync(name, ToastDurationShort));
+
+        internal static async Task HandleVirtualDesktopChangedAsync(
+            MainWindowLifetime lifetime,
+            Action logChange,
+            Action updatePrevious,
+            Func<bool> hasTooltip,
+            Func<string> getName,
+            Func<string, Task> showToast)
         {
-            m_logger.Debug("Virtual desktop changed...");
-            m_prevDesktop = e.OldDesktop;
-            if (!ExplorerFeature.HasVirtualDesktopTooltip())
+            await lifetime.RunIfActiveAsync(async () =>
             {
-                await ShowToastAsync(e.NewDesktop.Name, ToastDurationShort);
-            }
+                logChange();
+                updatePrevious();
+                if (!hasTooltip())
+                {
+                    await showToast(getName());
+                }
+            });
         }
 
         private void OnVirtualDesktopRemoved(object? sender, DesktopChangedEventArgs e)
-        {
-            if (m_prevDesktop == e.Source)
+            => HandleVirtualDesktopRemoved(m_lifetime,
+                () => m_prevDesktop,
+                e,
+                () => m_prevDesktop = null);
+
+        internal static void HandleVirtualDesktopRemoved(
+            MainWindowLifetime lifetime,
+            Func<IVirtualDesktop?> getPrevious,
+            DesktopChangedEventArgs e,
+            Action clearPrevious)
+            => lifetime.RunIfActive(() =>
             {
-                m_prevDesktop = null;
-            }
-        }
+                if (getPrevious() == e.Source)
+                {
+                    clearPrevious();
+                }
+            });
 
         private void SwitchToDesktop(IVirtualDesktop desktop)
         {
@@ -1730,27 +1885,36 @@ namespace FancyWM
 
         private void OnSettingsClick(object? sender, RoutedEventArgs e)
         {
-            m_contextMenu.IsOpen = false;
-            OpenSettings();
+            m_lifetime.RunIfActive(() =>
+            {
+                m_contextMenu.IsOpen = false;
+                OpenSettings();
+            });
         }
 
         private void OnExitClick(object? sender, RoutedEventArgs e)
         {
-            m_logger.Debug("Application exit requested!");
-            m_contextMenu.IsOpen = false;
-            App.Current.Terminate();
+            m_lifetime.RunIfActive(() =>
+            {
+                m_logger.Debug("Application exit requested!");
+                m_contextMenu.IsOpen = false;
+                App.Current.Terminate();
+            });
         }
 
         private void OnSponsorClick(object? sender, RoutedEventArgs e)
         {
-            App.Sponsor();
+            m_lifetime.RunIfActive(App.Sponsor);
         }
 
         private void OnAboutClick(object? sender, RoutedEventArgs e)
         {
-            m_logger.Debug("Opening about window...");
-            m_contextMenu.IsOpen = false;
-            new AboutWindow().Show();
+            m_lifetime.RunIfActive(() =>
+            {
+                m_logger.Debug("Opening about window...");
+                m_contextMenu.IsOpen = false;
+                new AboutWindow().Show();
+            });
         }
 
         protected override void OnClosing(CancelEventArgs e)
@@ -1759,46 +1923,110 @@ namespace FancyWM
             e.Cancel = true;
         }
 
+        internal Task ShutdownCompletion => m_lifetime.Completion;
+
 #pragma warning disable CA1816 // Dispose methods should call SuppressFinalize
         public void Dispose()
 #pragma warning restore CA1816 // Dispose methods should call SuppressFinalize
         {
-            m_unmanagedResourceGuard?.Dispose();
+            if (m_disposed) { return; }
+            m_disposed = true;
+            m_lifetime.Dispose();
+        }
 
-            m_workspace.VirtualDesktopManager.CurrentDesktopChanged -= OnVirtualDesktopChanged;
-            m_workspace.VirtualDesktopManager.DesktopRemoved -= OnVirtualDesktopRemoved;
-            m_workspace.FocusedWindowChanged -= OnFocusedWindowChanged;
-
-            m_logger.Debug($"Disposing of {nameof(MainWindow)}...");
-
-            if (m_tiling?.Active == true)
+        private void DisposeOwnedResources(Action<Action> release)
+        {
+            release(FocusHelper.Stop);
+            release(() => m_shutdownCancellation.Cancel());
+            if (m_notifyIcon != null)
             {
-                m_tiling.Stop();
+                release(() => m_notifyIcon.TrayLeftMouseDown -= OnNotifyIconLeftMouseDown);
+                release(() => m_notifyIcon.TrayRightMouseDown -= OnNotifyIconRightMouseDown);
+                release(() => m_notifyIcon.TrayBalloonTipClicked -= OnBalloonTipClicked);
+            }
+            release(() => { if (m_contextMenu != null) { m_contextMenu.IsOpen = false; } });
+            release(() => m_notifyIcon?.Dispose());
+            release(() => m_toasts?.Dispose());
+            MainWindowLifetime.DisposeSubscriptions(m_subscriptions, release);
+            release(() => m_bindingErrorListener?.Dispose());
+            release(() => Loaded -= OnLoaded);
+            if (m_hwnd != IntPtr.Zero)
+            {
+                release(() => HwndSource.FromHwnd(m_hwnd)?.RemoveHook(WndProc));
+            }
+            if (m_micaProvider != null)
+            {
+                release(() => m_micaProvider.PrimaryColorChanged -= OnMicaProviderPrimaryColorChanged);
+            }
+            release(() => m_mvm?.Dispose());
+            release(() => m_capsLockHk?.Dispose());
+            foreach (var hotkey in m_cmdHks ?? []) { release(hotkey.Dispose); }
+            if (m_workspace != null)
+            {
+                release(() => m_workspace.UnhandledException -= OnWorkspaceUnhandledException);
+            }
+            release(() => m_unmanagedResourceGuard?.Dispose());
+
+            if (m_subscribedDesktopManager != null)
+            {
+                release(() => m_subscribedDesktopManager.CurrentDesktopChanged -= OnVirtualDesktopChanged);
+                release(() => m_subscribedDesktopManager.DesktopRemoved -= OnVirtualDesktopRemoved);
+            }
+            if (m_workspace != null)
+            {
+                release(() => m_workspace.FocusedWindowChanged -= OnFocusedWindowChanged);
             }
 
-            m_animationThread?.Dispose();
+            release(() => m_logger?.Debug($"Disposing of {nameof(MainWindow)}..."));
+
+            release(() => m_restoreLayoutOnShutdown = m_tiling?.Active == true);
+            release(() => m_tilingShutdown = m_tiling?.PrepareForShutdownAsync() ?? Task.CompletedTask);
+
+            release(() => m_animationThread?.Dispose());
 
             foreach (var hk in m_directHks)
             {
-                hk.Dispose();
+                release(hk.Dispose);
             }
 
-            m_dispatcherTimer.Tick -= OnDispatcherTimerTick;
-            m_dispatcherTimer?.Stop();
+            if (m_dispatcherTimer != null)
+            {
+                release(() => m_dispatcherTimer.Tick -= OnDispatcherTimerTick);
+            }
+            release(() => m_dispatcherTimer?.Stop());
+        }
 
-            m_logger.Debug($"Stopping the tiling window manager...");
+        private Task CompleteOwnedOperationsAsync()
+            => Task.WhenAll(m_mvm?.Completion ?? Task.CompletedTask,
+                m_animationThread?.Completion ?? Task.CompletedTask,
+                m_loadedUpdateCheck?.Completion ?? Task.CompletedTask,
+                m_tilingShutdown);
+
+        private Task DispatchCleanupAsync(Action cleanup)
+        {
+            if (Dispatcher.CheckAccess())
+            {
+                cleanup();
+                return Task.CompletedTask;
+            }
+            return Dispatcher.InvokeAsync(cleanup, DispatcherPriority.Send).Task;
+        }
+
+        private void DisposeDependentResources(Action<Action> release)
+        {
+            // Both direct placement and animation updates have returned. Restore
+            // original rectangles only now, so an old frame cannot overwrite them.
+            if (m_restoreLayoutOnShutdown) { release(() => m_tiling?.Stop()); }
+            release(() => m_logger?.Debug($"Stopping the tiling window manager..."));
             if (m_tiling != null)
             {
-                m_tiling.AlgorithmicLayoutChanged -= OnAlgorithmicLayoutChanged;
+                release(() => m_tiling.PlacementFailed -= OnTilingFailed);
+                release(() => m_tiling.AlgorithmicLayoutChanged -= OnAlgorithmicLayoutChanged);
             }
-            m_tiling?.Dispose();
-            m_algorithmicLayoutCoordinator?.Dispose();
-            m_logger.Debug($"Closing the workspace...");
-            m_workspace?.Dispose();
-            m_logger.Debug($"Closing all other subscriptions...");
-            m_subscriptions?.Dispose();
-
-            m_notifyIcon?.Dispose();
+            release(() => m_tiling?.Dispose());
+            release(() => m_algorithmicLayoutCoordinator?.Dispose());
+            release(() => m_logger?.Debug($"Closing the workspace..."));
+            release(() => m_workspace?.Dispose());
         }
     }
 }

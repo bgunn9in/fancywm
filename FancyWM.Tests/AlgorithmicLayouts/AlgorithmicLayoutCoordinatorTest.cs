@@ -2,6 +2,7 @@
 
 using System;
 using System.Linq;
+using System.Reflection;
 using System.Threading.Tasks;
 using System.Windows.Threading;
 
@@ -19,6 +20,357 @@ namespace FancyWM.Tests.AlgorithmicLayouts
     [TestClass]
     public class AlgorithmicLayoutCoordinatorTest
     {
+        public TestContext TestContext { get; set; } = null!;
+
+        [TestMethod]
+        public void EmptyCoordinatorDoesNotArmCleanupTimer()
+        {
+            using var coordinator = CreateCoordinator();
+            Assert.IsFalse(GetCleanupTimer(coordinator).IsEnabled);
+            for (int tick = 0; tick < 40; tick++) { Assert.AreEqual(0, coordinator.CleanupExpired()); }
+            Assert.IsFalse(GetCleanupTimer(coordinator).IsEnabled);
+        }
+
+        [TestMethod]
+        public void EmptyCleanupDoesNotAllocate()
+        {
+            using var coordinator = CreateCoordinator();
+            long allocated = MeasureEmptyCleanup(coordinator);
+            Assert.AreEqual(0L, allocated);
+        }
+
+        [TestMethod]
+        public void EmptyCleanupCounterScenario()
+        {
+            using var coordinator = CreateCoordinator();
+            long allocated = MeasureEmptyCleanup(coordinator);
+            TestContext.WriteLine($"PERFCOUNTER coordinator-empty allocated-bytes {allocated}");
+            TestContext.WriteLine($"PERFCOUNTER coordinator-empty calls 10000");
+            Assert.AreEqual(0, coordinator.ReservationCount);
+            Assert.AreEqual(0, coordinator.ActiveTransferCount);
+        }
+
+        [TestMethod]
+        public void NonemptyCleanupBeforeDeadlineDoesNotAllocate()
+        {
+            Assert.AreEqual(0L, MeasureNonemptyCleanup());
+        }
+
+        [TestMethod]
+        public void NonemptyCleanupCounterScenario()
+        {
+            long allocated = MeasureNonemptyCleanup();
+            TestContext.WriteLine($"PERFCOUNTER coordinator-nonempty allocated-bytes {allocated}");
+            TestContext.WriteLine("PERFCOUNTER coordinator-nonempty calls 10000");
+        }
+
+        private static long MeasureNonemptyCleanup()
+        {
+            var time = new ManualTimeProvider(DateTimeOffset.UnixEpoch);
+            using var coordinator = CreateCoordinator(time, TimeSpan.FromSeconds(10));
+            var display = CreateDisplay();
+            var source = CreateDesktop("Source");
+            var target = new LayoutStateKey(CreateDesktop("Target"), display);
+            using var registration = coordinator.RegisterDisplay(display, new object());
+            coordinator.PublishCapacity(target, EmptyCapacity(2), 1);
+            Assert.IsTrue(Reserve(coordinator, source, display, target, 1, out var transfer));
+            Assert.IsTrue(coordinator.TryGetReservation(transfer.ReservationId!.Value, out var reservation));
+            long allocated = MeasureEmptyCleanup(coordinator);
+            Assert.AreEqual(1, coordinator.ActiveTransferCount);
+            Assert.AreEqual(1, coordinator.ReservationCount);
+            Assert.IsTrue(coordinator.TryGetTransfer(transfer.CorrelationId, out var current));
+            Assert.AreSame(transfer, current);
+            Assert.IsTrue(coordinator.TryGetReservation(reservation.ReservationId, out var currentReservation));
+            Assert.AreSame(reservation, currentReservation);
+            Assert.AreEqual(ReservedRole.Master, currentReservation.Role);
+            Assert.IsNull(currentReservation.SatelliteIndex);
+            return allocated;
+        }
+
+        [TestMethod]
+        public void CleanupTimerKeepsEarliestDeadlineAcrossArrivalsAndCancellation()
+        {
+            var time = new ManualTimeProvider(DateTimeOffset.UnixEpoch);
+            using var coordinator = CreateCoordinator(time, TimeSpan.FromSeconds(10));
+            var timer = GetCleanupTimer(coordinator);
+            var display = CreateDisplay();
+            var source = CreateDesktop("Source");
+            var target = new LayoutStateKey(CreateDesktop("Target"), display);
+            using var registration = coordinator.RegisterDisplay(display, new object());
+            coordinator.PublishCapacity(target, EmptyCapacity(2), 1);
+            Assert.IsTrue(coordinator.TryPlan(Guid.NewGuid(), new IntPtr(1), source, display, target, out var first));
+            Assert.AreEqual(TimeSpan.FromSeconds(10), timer.Interval);
+            time.Advance(TimeSpan.FromSeconds(3));
+            Assert.IsTrue(coordinator.TryPlan(Guid.NewGuid(), new IntPtr(2), source, display, target, out var second));
+            Assert.AreEqual(TimeSpan.FromSeconds(10), timer.Interval);
+            Assert.IsTrue(coordinator.Cancel(first.CorrelationId, first.WindowHandle, "Cancelled"));
+            Assert.AreEqual(TimeSpan.FromSeconds(10), timer.Interval);
+            time.Advance(TimeSpan.FromSeconds(9));
+            Assert.AreEqual(0, coordinator.CleanupExpired());
+            Assert.IsTrue(coordinator.TryGetActiveTransfer(second.WindowHandle, out _));
+            time.Advance(TimeSpan.FromSeconds(1));
+            Assert.AreEqual(1, coordinator.CleanupExpired());
+            Assert.AreEqual(TimeSpan.FromSeconds(110), timer.Interval);
+            time.Advance(TimeSpan.FromSeconds(110));
+            Assert.AreEqual(0, coordinator.CleanupExpired());
+            Assert.IsFalse(coordinator.TryGetTransfer(first.CorrelationId, out _));
+            Assert.IsTrue(coordinator.TryGetTransfer(second.CorrelationId, out _));
+            Assert.AreEqual(TimeSpan.FromSeconds(10), timer.Interval);
+        }
+
+        [TestMethod]
+        public void EarlyTimerTickRearmsAfterClockMovesBackward()
+        {
+            var time = new ManualTimeProvider(DateTimeOffset.UnixEpoch);
+            using var coordinator = CreateCoordinator(time, TimeSpan.FromSeconds(10));
+            var display = CreateDisplay();
+            var source = CreateDesktop("Source");
+            var target = new LayoutStateKey(CreateDesktop("Target"), display);
+            using var registration = coordinator.RegisterDisplay(display, new object());
+            coordinator.PublishCapacity(target, EmptyCapacity(2), 1);
+            Assert.IsTrue(Reserve(coordinator, source, display, target, 1, out _));
+            time.Advance(TimeSpan.FromSeconds(-20));
+            GetCleanupTick(coordinator)(null, EventArgs.Empty);
+            Assert.AreEqual(TimeSpan.FromSeconds(30), GetCleanupTimer(coordinator).Interval);
+            Assert.AreEqual(1, coordinator.ActiveTransferCount);
+            time.Advance(TimeSpan.FromSeconds(30));
+            GetCleanupTick(coordinator)(null, EventArgs.Empty);
+            Assert.AreEqual(0, coordinator.ActiveTransferCount);
+            Assert.AreEqual(TimeSpan.FromMinutes(2), GetCleanupTimer(coordinator).Interval);
+        }
+
+        [TestMethod]
+        public void LateSourceRemovalExtendsTerminalRetentionWithoutLosingCleanup()
+        {
+            var time = new ManualTimeProvider(DateTimeOffset.UnixEpoch);
+            using var coordinator = CreateCoordinator(time, TimeSpan.FromSeconds(10));
+            var display = CreateDisplay();
+            var source = CreateDesktop("Source");
+            var target = new LayoutStateKey(CreateDesktop("Target"), display);
+            using var registration = coordinator.RegisterDisplay(display, new object());
+            coordinator.PublishCapacity(target, EmptyCapacity(2), 1);
+            Assert.IsTrue(Reserve(coordinator, source, display, target, 1, out var transfer));
+            Assert.IsTrue(coordinator.Cancel(transfer.CorrelationId, transfer.WindowHandle, "Cancelled"));
+            time.Advance(TimeSpan.FromSeconds(60));
+            Assert.IsTrue(coordinator.ObserveSourceRemoved(transfer.WindowHandle, source, display, out _));
+            time.Advance(TimeSpan.FromSeconds(60));
+            coordinator.CleanupExpired();
+            Assert.IsTrue(coordinator.TryGetRecentTransfer(transfer.WindowHandle, out _));
+            Assert.AreEqual(TimeSpan.FromSeconds(60), GetCleanupTimer(coordinator).Interval);
+            time.Advance(TimeSpan.FromSeconds(60));
+            coordinator.CleanupExpired();
+            Assert.IsFalse(coordinator.TryGetTransfer(transfer.CorrelationId, out _));
+            Assert.IsFalse(GetCleanupTimer(coordinator).IsEnabled);
+        }
+
+        [TestMethod]
+        public void CommittedShadowPublicationRearmsForTerminalRetention()
+        {
+            var time = new ManualTimeProvider(DateTimeOffset.UnixEpoch);
+            using var coordinator = CreateCoordinator(time, TimeSpan.FromSeconds(10));
+            var display = CreateDisplay();
+            var source = CreateDesktop("Source");
+            var target = new LayoutStateKey(CreateDesktop("Target"), display);
+            using var registration = coordinator.RegisterDisplay(display, new object());
+            coordinator.PublishCapacity(target, EmptyCapacity(2), 1);
+            Assert.IsTrue(Reserve(coordinator, source, display, target, 1, out var transfer));
+            Assert.IsTrue(coordinator.ObserveDestination(transfer.CorrelationId, transfer.WindowHandle));
+            time.Advance(TimeSpan.FromSeconds(2));
+            Assert.IsTrue(coordinator.Commit(transfer.CorrelationId, transfer.WindowHandle));
+            Assert.AreEqual(TimeSpan.FromSeconds(10), GetCleanupTimer(coordinator).Interval);
+            coordinator.PublishCapacity(target, new MasterSatelliteCapacitySnapshot(
+                WorkspaceLayoutKind.Canonical, true, MasterSatelliteWindowRole.Satellite,
+                0, 1, 2, 1, null), 2);
+            Assert.AreEqual(TimeSpan.FromMinutes(2), GetCleanupTimer(coordinator).Interval);
+            time.Advance(TimeSpan.FromSeconds(10));
+            coordinator.CleanupExpired();
+            Assert.IsTrue(coordinator.TryGetCapacity(target, out var capacity));
+            Assert.AreEqual(1, capacity.OccupiedSlots);
+            Assert.AreEqual(0, capacity.ReservedSlots);
+        }
+
+        [DataTestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public void DeadlineSchedulingRunsOnlyExpiryAndRetentionCallbacks(bool reserve)
+        {
+            Assert.AreEqual(200, MeasureDeadlineCallbacks(reserve));
+        }
+
+        [TestMethod]
+        public void DeadlineCleanupCounterScenario()
+        {
+            int callbacks = MeasureDeadlineCallbacks(reserve: true);
+            TestContext.WriteLine($"PERFCOUNTER coordinator-deadlines calls {callbacks}");
+            TestContext.WriteLine("PERFCOUNTER coordinator-deadlines cycles 100");
+        }
+
+        private static int MeasureDeadlineCallbacks(bool reserve)
+        {
+            var time = new ManualTimeProvider(DateTimeOffset.UnixEpoch);
+            using var coordinator = CreateCoordinator(time, TimeSpan.FromSeconds(10));
+            var timer = GetCleanupTimer(coordinator);
+            var tick = GetCleanupTick(coordinator);
+            var display = CreateDisplay();
+            var source = CreateDesktop("Source");
+            var target = new LayoutStateKey(CreateDesktop("Target"), display);
+            using var registration = coordinator.RegisterDisplay(display, new object());
+            coordinator.PublishCapacity(target, EmptyCapacity(2), 1);
+            var notifications = new System.Collections.Generic.List<PendingWindowTransfer>();
+            bool notificationUnderLock = false;
+            coordinator.TransferTerminated += transfer =>
+            {
+                notificationUnderLock |= coordinator.IsMutationLockHeldByCurrentThread;
+                notifications.Add(transfer);
+            };
+            int ticks = 0;
+            for (int cycle = 0; cycle < 100; cycle++)
+            {
+                var cycleStart = time.GetUtcNow();
+                var correlation = Guid.NewGuid();
+                var handle = new IntPtr(cycle + 1);
+                Assert.IsTrue(reserve
+                    ? coordinator.TryPlanAndReserve(correlation, handle, source, display, target, out var admitted)
+                    : coordinator.TryPlan(correlation, handle, source, display, target, out admitted));
+                while (timer.IsEnabled)
+                {
+                    Assert.IsTrue(ticks < 10000, "Deadline scheduling did not finish within its bounded callback budget.");
+                    time.Advance(timer.Interval);
+                    tick(null, EventArgs.Empty);
+                    ticks++;
+                    if (time.GetUtcNow() < cycleStart + TimeSpan.FromSeconds(10))
+                    {
+                        Assert.AreEqual(1, coordinator.ActiveTransferCount);
+                        Assert.AreEqual(reserve ? 1 : 0, coordinator.ReservationCount);
+                    }
+                    else
+                    {
+                        Assert.AreEqual(0, coordinator.ActiveTransferCount);
+                        Assert.AreEqual(0, coordinator.ReservationCount);
+                    }
+                }
+                Assert.AreEqual(cycleStart + TimeSpan.FromSeconds(130), time.GetUtcNow());
+                Assert.AreEqual(0, coordinator.ActiveTransferCount);
+                Assert.AreEqual(0, coordinator.ReservationCount);
+                Assert.IsFalse(coordinator.TryGetTransfer(correlation, out _));
+                Assert.AreEqual(cycle, notifications.Count);
+                Dispatchers.DoEvents();
+                Assert.AreEqual(cycle + 1, notifications.Count);
+                var terminal = notifications[cycle];
+                Assert.AreEqual(correlation, terminal.CorrelationId);
+                Assert.AreEqual(handle, terminal.WindowHandle);
+                Assert.AreEqual(admitted.ReservationId, terminal.ReservationId);
+                Assert.AreEqual(PendingWindowTransferState.Failed, terminal.State);
+                Assert.AreEqual("TransferTimedOut", terminal.TerminalReason);
+                Assert.AreEqual(cycleStart + TimeSpan.FromSeconds(10), terminal.UpdatedAt);
+            }
+            Assert.IsFalse(notificationUnderLock);
+            coordinator.Dispose();
+            tick(null, EventArgs.Empty);
+            Assert.IsFalse(timer.IsEnabled);
+            return ticks;
+        }
+
+        private static long MeasureEmptyCleanup(AlgorithmicLayoutCoordinator coordinator)
+        {
+            for (int iteration = 0; iteration < 2000; iteration++) { coordinator.CleanupExpired(); }
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            int cleaned = 0;
+            for (int iteration = 0; iteration < 10000; iteration++) { cleaned += coordinator.CleanupExpired(); }
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+            Assert.AreEqual(0, cleaned);
+            return allocated;
+        }
+
+        [DataTestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public void CleanupTimerRearmsAcrossTransferAndRetentionCycles(bool reserve)
+        {
+            var time = new ManualTimeProvider(DateTimeOffset.UnixEpoch);
+            using var coordinator = CreateCoordinator(time, TimeSpan.FromSeconds(10));
+            var timer = GetCleanupTimer(coordinator);
+            var display = CreateDisplay();
+            var source = CreateDesktop("Source");
+            var target = new LayoutStateKey(CreateDesktop("Target"), display);
+            using var registration = coordinator.RegisterDisplay(display, new object());
+            coordinator.PublishCapacity(target, EmptyCapacity(2), 1);
+            for (int cycle = 0; cycle < 100; cycle++)
+            {
+                Assert.IsFalse(timer.IsEnabled);
+                var correlation = Guid.NewGuid();
+                var handle = new IntPtr(cycle + 1);
+                bool admitted = reserve
+                    ? coordinator.TryPlanAndReserve(correlation, handle, source, display, target, out _)
+                    : coordinator.TryPlan(correlation, handle, source, display, target, out _);
+                Assert.IsTrue(admitted);
+                Assert.IsTrue(timer.IsEnabled);
+                Assert.AreEqual(TimeSpan.FromSeconds(10), timer.Interval);
+                time.Advance(TimeSpan.FromSeconds(10));
+                Assert.AreEqual(1, coordinator.CleanupExpired());
+                Assert.IsTrue(coordinator.TryGetTransfer(correlation, out var expired));
+                Assert.AreEqual(PendingWindowTransferState.Failed, expired.State);
+                Assert.AreEqual(0, coordinator.ReservationCount);
+                Assert.IsTrue(timer.IsEnabled);
+                Assert.AreEqual(TimeSpan.FromMinutes(2), timer.Interval);
+                time.Advance(TimeSpan.FromSeconds(119));
+                coordinator.CleanupExpired();
+                Assert.IsTrue(timer.IsEnabled);
+                time.Advance(TimeSpan.FromSeconds(1));
+                coordinator.CleanupExpired();
+                Assert.IsFalse(coordinator.TryGetTransfer(correlation, out _));
+                Assert.IsFalse(timer.IsEnabled);
+                Dispatchers.DoEvents();
+            }
+            coordinator.Dispose();
+            coordinator.Dispose();
+            var lateTick = (Action<object?, EventArgs>)typeof(AlgorithmicLayoutCoordinator)
+                .GetMethod("OnCleanupTimerTick", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .CreateDelegate(typeof(Action<object?, EventArgs>), coordinator);
+            lateTick(null, EventArgs.Empty);
+            Assert.IsFalse(timer.IsEnabled);
+        }
+
+        [TestMethod]
+        public void TerminalNotificationCanAdmitNewTransferAfterCleanupStopsTimer()
+        {
+            var time = new ManualTimeProvider(DateTimeOffset.UnixEpoch);
+            using var coordinator = CreateCoordinator(time, TimeSpan.FromSeconds(10));
+            var display = CreateDisplay();
+            var source = CreateDesktop("Source");
+            var target = new LayoutStateKey(CreateDesktop("Target"), display);
+            using var registration = coordinator.RegisterDisplay(display, new object());
+            coordinator.PublishCapacity(target, EmptyCapacity(2), 1);
+            int notifications = 0;
+            coordinator.TransferTerminated += _ =>
+            {
+                notifications++;
+                Assert.IsFalse(coordinator.IsMutationLockHeldByCurrentThread);
+                Assert.IsTrue(Reserve(coordinator, source, display, target, 2, out _));
+            };
+            Assert.IsTrue(Reserve(coordinator, source, display, target, 1, out _));
+            time.Advance(TimeSpan.FromSeconds(10));
+            Assert.AreEqual(1, coordinator.CleanupExpired());
+            time.Advance(TimeSpan.FromMinutes(2));
+            coordinator.CleanupExpired();
+            Assert.IsFalse(GetCleanupTimer(coordinator).IsEnabled);
+            Dispatchers.DoEvents();
+            Assert.AreEqual(1, notifications);
+            Assert.IsTrue(GetCleanupTimer(coordinator).IsEnabled);
+            Assert.AreEqual(1, coordinator.ActiveTransferCount);
+            coordinator.Dispose();
+        }
+
+        private static DispatcherTimer GetCleanupTimer(AlgorithmicLayoutCoordinator coordinator) =>
+            (DispatcherTimer)typeof(AlgorithmicLayoutCoordinator)
+                .GetField("m_cleanupTimer", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .GetValue(coordinator)!;
+
+        private static Action<object?, EventArgs> GetCleanupTick(AlgorithmicLayoutCoordinator coordinator) =>
+            (Action<object?, EventArgs>)typeof(AlgorithmicLayoutCoordinator)
+                .GetMethod("OnCleanupTimerTick", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .CreateDelegate(typeof(Action<object?, EventArgs>), coordinator);
+
         [TestMethod]
         public void CoordinatorOwnsOneRuntimeRegistryAcrossRegisteredDisplays()
         {

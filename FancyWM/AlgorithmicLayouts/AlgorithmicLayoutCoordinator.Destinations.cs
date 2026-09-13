@@ -287,6 +287,7 @@ namespace FancyWM.AlgorithmicLayouts
                     display,
                     layoutKey,
                     sourceOriginalPosition,
+                    placementPreflight != null ? capacity : null,
                     out var transfer))
                 {
                     examined.Add(Candidate(

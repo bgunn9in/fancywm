@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WindowsPerformanceRecorder Version="1.0" Author="FancyWM">
+  <Profiles>
+    <EventCollector Id="AnimationMarkers" Name="FancyWM Animation Markers">
+      <BufferSize Value="64" />
+      <Buffers Value="64" />
+    </EventCollector>
+    <EventProvider Id="AnimationProvider" Name="c72441c8-a777-4d33-8d80-794f778a01ca" Level="5" />
+    <Profile Id="AnimationNative.Verbose.File" Name="AnimationNative" Description="Owned native transition boundaries" DetailLevel="Verbose" LoggingMode="File">
+      <Collectors>
+        <EventCollectorId Value="AnimationMarkers">
+          <EventProviders>
+            <EventProviderId Value="AnimationProvider" />
+          </EventProviders>
+        </EventCollectorId>
+      </Collectors>
+    </Profile>
+  </Profiles>
+</WindowsPerformanceRecorder>

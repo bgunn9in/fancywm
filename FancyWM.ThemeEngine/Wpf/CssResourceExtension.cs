@@ -2,6 +2,7 @@
 using System.Windows;
 using System.Windows.Data;
 using System.Windows.Markup;
+using System.Windows.Threading;
 
 
 namespace FancyWM.ThemeEngine.Wpf
@@ -17,9 +18,12 @@ namespace FancyWM.ThemeEngine.Wpf
             get => m_as;
             set
             {
-                m_as = value;
-                m_previousValue = null;
-                m_previousResult = null;
+                lock (m_valueLock)
+                {
+                    m_as = value;
+                    m_previousValue = null;
+                    m_previousResult = null;
+                }
             }
         }
 
@@ -93,13 +97,21 @@ namespace FancyWM.ThemeEngine.Wpf
 
         public object? GetValue()
         {
+            lock (m_valueLock) return GetValueCore();
+        }
+
+        private readonly object m_valueLock = new();
+
+        private object? GetValueCore()
+        {
             var baseValue = CssManager.Resolve(Path);
             if (baseValue is null)
             {
                 return DependencyProperty.UnsetValue;
             }
 
-            if (Equals(m_previousValue, baseValue))
+            if (Equals(m_previousValue, baseValue)
+                && (m_previousResult is not DispatcherObject dispatcherObject || dispatcherObject.CheckAccess()))
             {
                 return m_previousResult;
             }

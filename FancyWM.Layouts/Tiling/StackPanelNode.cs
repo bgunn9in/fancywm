@@ -79,16 +79,34 @@ namespace FancyWM.Layouts.Tiling
         internal override void MeasureCore()
         {
             int width = 0, height = 0;
-            foreach (var child in Children)
+            var children = Children;
+            if (ReferenceEquals(children, m_children))
             {
-                child.Measure();
-                var minChild = child.MinSize;
-                if (child is WindowNode)
+                foreach (var child in m_children)
                 {
-                    minChild = new Point(minChild.X + Spacing, minChild.Y + Spacing);
+                    child.Measure();
+                    var minChild = child.MinSize;
+                    if (child is WindowNode)
+                    {
+                        minChild = new Point(minChild.X + Spacing, minChild.Y + Spacing);
+                    }
+                    width = Math.Max(width, minChild.X);
+                    height = Math.Max(height, minChild.Y);
                 }
-                width = Math.Max(width, minChild.X);
-                height = Math.Max(height, minChild.Y);
+            }
+            else
+            {
+                foreach (var child in children)
+                {
+                    child.Measure();
+                    var minChild = child.MinSize;
+                    if (child is WindowNode)
+                    {
+                        minChild = new Point(minChild.X + Spacing, minChild.Y + Spacing);
+                    }
+                    width = Math.Max(width, minChild.X);
+                    height = Math.Max(height, minChild.Y);
+                }
             }
             ContentMinSize = new Point(width, height);
         }

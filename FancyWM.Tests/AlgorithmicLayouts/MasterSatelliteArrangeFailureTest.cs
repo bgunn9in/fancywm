@@ -12,6 +12,28 @@ namespace FancyWM.Tests.AlgorithmicLayouts
     public class MasterSatelliteArrangeFailureTest
     {
         [TestMethod]
+        public void NotificationTracker_DoesNotEnumerateWithoutPendingFailure()
+        {
+            var tracker = new ArrangeFailureNotificationTracker();
+            int handleReads = 0;
+            var handles = Enumerable.Range(1, 50).Select(handle =>
+            {
+                handleReads++;
+                return new IntPtr(handle);
+            });
+            tracker.ReleaseResolved(handles);
+            Assert.AreEqual(0, handleReads);
+            tracker.TryMark(new IntPtr(25));
+            tracker.ReleaseResolved(handles);
+            Assert.AreEqual(50, handleReads);
+            Assert.IsFalse(tracker.TryMark(new IntPtr(25)));
+            tracker.ReleaseResolved([]);
+            tracker.ReleaseResolved(handles);
+            Assert.AreEqual(50, handleReads);
+            Assert.IsTrue(tracker.TryMark(new IntPtr(25)));
+        }
+
+        [TestMethod]
         public void AlgorithmicFailure_SelectsNewestActualNewWindow()
         {
             var decision = MasterSatelliteArrangeFailurePolicy.Decide(
@@ -64,13 +86,17 @@ namespace FancyWM.Tests.AlgorithmicLayouts
             var tracker = new ArrangeFailureNotificationTracker();
             var handle = new IntPtr(42);
 
+            Assert.IsFalse(tracker.HasPending);
+
             Assert.IsTrue(tracker.TryMark(handle));
+            Assert.IsTrue(tracker.HasPending);
             Assert.IsFalse(tracker.TryMark(handle));
 
             tracker.ReleaseResolved([handle]);
             Assert.IsFalse(tracker.TryMark(handle));
 
             tracker.ReleaseResolved([]);
+            Assert.IsFalse(tracker.HasPending);
             Assert.IsTrue(tracker.TryMark(handle));
         }
 

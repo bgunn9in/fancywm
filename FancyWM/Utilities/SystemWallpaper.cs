@@ -49,7 +49,8 @@ namespace FancyWM.Utilities
                 };
             }
 
-            if (Registry.CurrentUser.OpenSubKey(@"Control Panel\Colors")?.GetValue("Background", null) is string colorValue)
+            using var colorKey = Registry.CurrentUser.OpenSubKey(@"Control Panel\Colors");
+            if (colorKey?.GetValue("Background", null) is string colorValue)
             {
                 var channelValues = colorValue.Split(' ');
                 if (channelValues.Length == 3)

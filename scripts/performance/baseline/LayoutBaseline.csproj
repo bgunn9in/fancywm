@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AssemblyName>FancyWM.Layouts</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="$(BaselineSourceRoot)/FancyWM.Layouts/**/*.cs"
+             Exclude="$(BaselineSourceRoot)/FancyWM.Layouts/bin/**;$(BaselineSourceRoot)/FancyWM.Layouts/obj/**" />
+    <Reference Include="WinMan">
+      <HintPath>../../../winman/src/WinMan/bin/Release/netstandard2.1/WinMan.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+  <Target Name="RequireBaselineSource" BeforeTargets="CoreCompile">
+    <Error Condition="!Exists('$(BaselineSourceRoot)/FancyWM.Layouts/Flex.cs')" Text="Pass BaselineSourceRoot pointing to a preserved, verified baseline snapshot." />
+  </Target>
+</Project>

@@ -770,7 +770,8 @@ namespace FancyWM
                 runtimeState,
                 settings,
                 "UnregisterWindow",
-                tree => m_masterSatelliteEngine.RemoveWindow(tree, runtimeState, settings, window));
+                tree => m_masterSatelliteEngine.RemoveWindow(tree, runtimeState, settings, window),
+                reuseEngineInvariant: true);
             if (result.Succeeded && !preserveOriginalPosition)
             {
                 m_originalPositions.Remove(window);
@@ -789,7 +790,8 @@ namespace FancyWM
                 runtimeState,
                 settings,
                 "PromoteToMaster",
-                tree => m_masterSatelliteEngine.PromoteToMaster(tree, runtimeState, settings, window));
+                tree => m_masterSatelliteEngine.PromoteToMaster(tree, runtimeState, settings, window),
+                reuseEngineInvariant: true);
         }
 
         public MasterSatelliteOperationResult ReorderMasterSatelliteWindow(
@@ -804,7 +806,8 @@ namespace FancyWM
                 runtimeState,
                 settings,
                 "ReorderSatellite",
-                tree => m_masterSatelliteEngine.ReorderSatellite(tree, runtimeState, settings, fromIndex, toIndex));
+                tree => m_masterSatelliteEngine.ReorderSatellite(tree, runtimeState, settings, fromIndex, toIndex),
+                reuseEngineInvariant: true);
         }
 
         public MasterSatelliteOperationResult MoveMasterSatelliteWindowPrevious(
@@ -818,7 +821,8 @@ namespace FancyWM
                 runtimeState,
                 settings,
                 "MoveSatellitePrevious",
-                tree => m_masterSatelliteEngine.MoveSatellitePrevious(tree, runtimeState, settings, window));
+                tree => m_masterSatelliteEngine.MoveSatellitePrevious(tree, runtimeState, settings, window),
+                reuseEngineInvariant: true);
         }
 
         public MasterSatelliteOperationResult MoveMasterSatelliteWindowNext(
@@ -832,7 +836,8 @@ namespace FancyWM
                 runtimeState,
                 settings,
                 "MoveSatelliteNext",
-                tree => m_masterSatelliteEngine.MoveSatelliteNext(tree, runtimeState, settings, window));
+                tree => m_masterSatelliteEngine.MoveSatelliteNext(tree, runtimeState, settings, window),
+                reuseEngineInvariant: true);
         }
 
         public MasterSatelliteOperationResult SetMasterSatelliteSide(
@@ -846,7 +851,8 @@ namespace FancyWM
                 runtimeState,
                 settings,
                 "SetMasterSide",
-                tree => m_masterSatelliteEngine.SetMasterSide(tree, runtimeState, settings, side));
+                tree => m_masterSatelliteEngine.SetMasterSide(tree, runtimeState, settings, side),
+                reuseEngineInvariant: true);
         }
 
         public MasterSatelliteOperationResult SwapMasterSatelliteSide(
@@ -859,7 +865,8 @@ namespace FancyWM
                 runtimeState,
                 settings,
                 "SwapMasterSide",
-                tree => m_masterSatelliteEngine.SwapMasterSide(tree, runtimeState, settings));
+                tree => m_masterSatelliteEngine.SwapMasterSide(tree, runtimeState, settings),
+                reuseEngineInvariant: true);
         }
 
         public MasterSatelliteOperationResult SetMasterSatelliteOrientation(
@@ -873,7 +880,8 @@ namespace FancyWM
                 runtimeState,
                 settings,
                 "SetSatelliteOrientation",
-                tree => m_masterSatelliteEngine.SetSatelliteOrientation(tree, runtimeState, settings, orientation));
+                tree => m_masterSatelliteEngine.SetSatelliteOrientation(tree, runtimeState, settings, orientation),
+                reuseEngineInvariant: true);
         }
 
         public MasterSatelliteOperationResult SetMasterSatelliteRatio(
@@ -887,7 +895,8 @@ namespace FancyWM
                 runtimeState,
                 settings,
                 "SetMasterRatio",
-                tree => m_masterSatelliteEngine.SetRequestedMasterRatio(tree, runtimeState, settings, ratio));
+                tree => m_masterSatelliteEngine.SetRequestedMasterRatio(tree, runtimeState, settings, ratio),
+                reuseEngineInvariant: true);
         }
 
         public MasterSatelliteOperationResult ResetMasterSatelliteRatio(
@@ -900,7 +909,8 @@ namespace FancyWM
                 runtimeState,
                 settings,
                 "ResetMasterRatio",
-                tree => m_masterSatelliteEngine.ResetMasterRatio(tree, runtimeState, settings));
+                tree => m_masterSatelliteEngine.ResetMasterRatio(tree, runtimeState, settings),
+                reuseEngineInvariant: true);
         }
 
         public MasterSatelliteOperationResult CaptureMasterSatelliteRatio(
@@ -913,7 +923,8 @@ namespace FancyWM
                 runtimeState,
                 settings,
                 "CaptureMasterRatio",
-                tree => m_masterSatelliteEngine.CaptureCurrentMasterRatio(tree, runtimeState, settings));
+                tree => m_masterSatelliteEngine.CaptureCurrentMasterRatio(tree, runtimeState, settings),
+                reuseEngineInvariant: true);
         }
 
         public MasterSatelliteOperationResult RelayoutMasterSatelliteLayout(
@@ -926,7 +937,8 @@ namespace FancyWM
                 runtimeState,
                 settings,
                 "Relayout",
-                tree => m_masterSatelliteEngine.Relayout(tree, runtimeState, settings));
+                tree => m_masterSatelliteEngine.Relayout(tree, runtimeState, settings),
+                reuseEngineInvariant: true);
         }
 
         public MasterSatelliteOperationResult NormalizeMasterSatelliteLayout(
@@ -1067,7 +1079,8 @@ namespace FancyWM
             MasterSatelliteLayoutSettings settings,
             string operationName,
             Func<DesktopTree, MasterSatelliteOperationResult> operation,
-            bool requireCanonicalInput = true)
+            bool requireCanonicalInput = true,
+            bool reuseEngineInvariant = false)
         {
             ArgumentNullException.ThrowIfNull(operation);
             if (!TryGetDesktopState(desktop, runtimeState, settings, out var desktopState, out var failure))
@@ -1112,7 +1125,7 @@ namespace FancyWM
             try
             {
                 var result = operation(tree);
-                result = VerifyValidAfterChangedOperation(tree, runtimeState, settings, result);
+                result = VerifyValidAfterChangedOperation(tree, runtimeState, settings, result, reuseEngineInvariant);
                 ReportRevision(desktop, operationName, beforeRevision, runtimeState.Revision);
                 return result;
             }
@@ -1198,14 +1211,19 @@ namespace FancyWM
             DesktopTree tree,
             MasterSatelliteRuntimeState runtimeState,
             MasterSatelliteLayoutSettings settings,
-            MasterSatelliteOperationResult result)
+            MasterSatelliteOperationResult result,
+            bool reuseEngineInvariant = false)
         {
             if (!result.Succeeded || !result.Changed)
             {
                 return result;
             }
 
-            var invariant = m_masterSatelliteEngine.ValidateInvariant(tree, runtimeState, settings);
+            // ExecuteMutation returns its final invariant without intervening callbacks.
+            // Recovery and callers that have already remapped focus need a fresh check.
+            var invariant = reuseEngineInvariant
+                ? result.Invariant
+                : m_masterSatelliteEngine.ValidateInvariant(tree, runtimeState, settings);
             bool revisionAdvancedOnce = runtimeState.Revision == result.Before.Revision + 1;
             if (invariant.IsValid && revisionAdvancedOnce)
             {

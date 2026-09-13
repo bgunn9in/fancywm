@@ -37,6 +37,9 @@ namespace FancyWM.AlgorithmicLayouts
         private readonly Dictionary<Guid, DateTimeOffset> m_retiredCorrelations = [];
         private readonly Queue<PendingWindowTransfer> m_pendingTerminalNotifications = [];
         private readonly DispatcherTimer m_cleanupTimer;
+        private DateTimeOffset? m_nextCleanupDeadline;
+        private bool m_cleaningUp;
+        private long m_capacityVersion;
         private DispatcherOperation? m_terminalNotificationDispatch;
         private Action<PendingWindowTransfer>? m_transferTerminated;
         private bool m_disposed;
@@ -152,15 +155,8 @@ namespace FancyWM.AlgorithmicLayouts
                     "The transfer timeout must be positive.");
             }
             m_dispatcher.VerifyAccess();
-            m_cleanupTimer = new DispatcherTimer(DispatcherPriority.Background, m_dispatcher)
-            {
-                Interval = TimeSpan.FromSeconds(Math.Clamp(
-                    m_transferTimeout.TotalSeconds / 2,
-                    1,
-                    30)),
-            };
+            m_cleanupTimer = new DispatcherTimer(DispatcherPriority.Background, m_dispatcher);
             m_cleanupTimer.Tick += OnCleanupTimerTick;
-            m_cleanupTimer.Start();
         }
 
         public AlgorithmicLayoutDisplayRegistration RegisterDisplay(
@@ -265,7 +261,10 @@ namespace FancyWM.AlgorithmicLayouts
                 }
                 m_capacities[layoutKey] = new PublishedCapacity(
                     capacity,
-                    publicationSequence);
+                    publicationSequence)
+                {
+                    Version = ++m_capacityVersion,
+                };
                 ReconcileCapacityCore(
                     layoutKey,
                     capacity,
@@ -329,6 +328,27 @@ namespace FancyWM.AlgorithmicLayouts
             Rectangle? sourceOriginalPosition,
             out PendingWindowTransfer transfer)
         {
+            return TryPlanAndReserve(
+                correlationId,
+                windowHandle,
+                sourceDesktop,
+                sourceDisplay,
+                targetLayout,
+                sourceOriginalPosition,
+                null,
+                out transfer);
+        }
+
+        private bool TryPlanAndReserve(
+            Guid correlationId,
+            IntPtr windowHandle,
+            IVirtualDesktop sourceDesktop,
+            IDisplay sourceDisplay,
+            LayoutStateKey targetLayout,
+            Rectangle? sourceOriginalPosition,
+            CoordinatorCapacitySnapshot? expectedCapacity,
+            out PendingWindowTransfer transfer)
+        {
             ArgumentNullException.ThrowIfNull(sourceDesktop);
             ArgumentNullException.ThrowIfNull(sourceDisplay);
             ArgumentNullException.ThrowIfNull(targetLayout.VirtualDesktop);
@@ -349,7 +369,7 @@ namespace FancyWM.AlgorithmicLayouts
                 }
                 if (m_transfers.TryGetValue(correlationId, out var existing))
                 {
-                    if (MatchesRequest(
+                    if (expectedCapacity == null && MatchesRequest(
                         existing,
                         windowHandle,
                         sourceDesktop,
@@ -372,6 +392,9 @@ namespace FancyWM.AlgorithmicLayouts
                     || !m_displayParticipants.ContainsKey(sourceDisplay)
                     || !m_displayParticipants.ContainsKey(targetLayout.Display)
                     || !TryGetCapacityCore(targetLayout, out var capacity)
+                    || (expectedCapacity != null
+                        && (capacity.Version != expectedCapacity.Version
+                            || !LayoutKeysMatch(capacity.LayoutKey, expectedCapacity.LayoutKey)))
                     || !capacity.CanAcceptWindow
                     || capacity.NextRole == null)
                 {
@@ -419,9 +442,11 @@ namespace FancyWM.AlgorithmicLayouts
                     ReservationId = reservationId,
                 };
                 m_reservations.Add(reservationId, reservation);
+                InvalidateCapacityCore(targetLayout);
                 m_transfers.Add(correlationId, transfer);
                 m_activeTransfersByWindow.Add(windowHandle, correlationId);
                 m_recentTransfersByWindow[windowHandle] = correlationId;
+                UpdateCleanupScheduleCore(now);
                 return true;
             }
         }
@@ -495,6 +520,7 @@ namespace FancyWM.AlgorithmicLayouts
                 m_transfers.Add(correlationId, transfer);
                 m_activeTransfersByWindow.Add(windowHandle, correlationId);
                 m_recentTransfersByWindow[windowHandle] = correlationId;
+                UpdateCleanupScheduleCore(now);
                 return true;
             }
         }
@@ -554,6 +580,7 @@ namespace FancyWM.AlgorithmicLayouts
                     CreatedAt = now,
                     Deadline = existing.Deadline,
                 });
+                InvalidateCapacityCore(targetLayout);
                 transfer = existing with
                 {
                     State = PendingWindowTransferState.Reserved,
@@ -796,6 +823,10 @@ namespace FancyWM.AlgorithmicLayouts
                     UpdatedAt = m_timeProvider.GetUtcNow(),
                 };
                 m_transfers[correlationId] = transfer;
+                if (transfer.IsTerminal)
+                {
+                    UpdateCleanupScheduleCore(transfer.UpdatedAt);
+                }
                 return true;
             }
         }
@@ -1028,6 +1059,16 @@ namespace FancyWM.AlgorithmicLayouts
             }
         }
 
+        public int CountForDisplay(IDisplay display)
+        {
+            ArgumentNullException.ThrowIfNull(display);
+            VerifyAccessAndNotDisposed();
+            lock (m_mutationLock)
+            {
+                return m_runtimeStates.CountForDisplay(display);
+            }
+        }
+
         public void Clear()
         {
             VerifyAccessAndNotDisposed();
@@ -1044,6 +1085,7 @@ namespace FancyWM.AlgorithmicLayouts
                 m_runtimeStates.Clear();
                 m_capacities.Clear();
                 m_committedSlotShadows.Clear();
+                UpdateCleanupScheduleCore(m_timeProvider.GetUtcNow());
             }
         }
 
@@ -1058,6 +1100,7 @@ namespace FancyWM.AlgorithmicLayouts
                     return;
                 }
                 m_disposed = true;
+                m_nextCleanupDeadline = null;
                 m_cleanupTimer.Stop();
                 m_cleanupTimer.Tick -= OnCleanupTimerTick;
                 m_displayParticipants.Clear();
@@ -1086,6 +1129,10 @@ namespace FancyWM.AlgorithmicLayouts
                 return;
             }
             CleanupExpired();
+            lock (m_mutationLock)
+            {
+                ArmCleanupTimerCore(m_timeProvider.GetUtcNow());
+            }
         }
 
         private bool Transition(
@@ -1189,6 +1236,10 @@ namespace FancyWM.AlgorithmicLayouts
                         releasedReservation,
                         now);
                 }
+                if (releasedReservation != null)
+                {
+                    InvalidateCapacityCore(releasedReservation.LayoutKey);
+                }
             }
             if (m_activeTransfersByWindow.TryGetValue(
                     transfer.WindowHandle,
@@ -1206,6 +1257,7 @@ namespace FancyWM.AlgorithmicLayouts
                 TerminalReason = reason,
             };
             m_transfers[correlationId] = terminalTransfer;
+            UpdateCleanupScheduleCore(now);
             QueueTerminalNotificationCore(terminalTransfer);
             return true;
         }
@@ -1346,8 +1398,19 @@ namespace FancyWM.AlgorithmicLayouts
                 reserved,
                 physical.TotalCapacity,
                 physical.Revision,
-                reason);
+                reason)
+            {
+                Version = publication.Version,
+            };
             return true;
+        }
+
+        private void InvalidateCapacityCore(LayoutStateKey layoutKey)
+        {
+            if (m_capacities.TryGetValue(layoutKey, out var publication))
+            {
+                m_capacities[layoutKey] = publication with { Version = ++m_capacityVersion };
+            }
         }
 
         private bool IsSlotReservedCore(
@@ -1362,6 +1425,85 @@ namespace FancyWM.AlgorithmicLayouts
         }
 
         private int CleanupExpiredCore(DateTimeOffset now)
+        {
+            if (!HasExpirableEntries())
+            {
+                m_nextCleanupDeadline = null;
+                m_cleanupTimer.Stop();
+                return 0;
+            }
+            if (m_nextCleanupDeadline is DateTimeOffset deadline && now < deadline)
+            {
+                return 0;
+            }
+            m_cleaningUp = true;
+            try
+            {
+                return CleanupExpiredEntriesCore(now);
+            }
+            finally
+            {
+                m_cleaningUp = false;
+                UpdateCleanupScheduleCore(now);
+            }
+        }
+
+        private bool HasExpirableEntries() => m_transfers.Count > 0
+            || m_retiredCorrelations.Count > 0 || m_committedSlotShadows.Count > 0;
+
+        private void UpdateCleanupScheduleCore(DateTimeOffset now)
+        {
+            if (m_cleaningUp || m_disposed)
+            {
+                return;
+            }
+            DateTimeOffset? nextDeadline = null;
+            foreach (var transfer in m_transfers.Values)
+            {
+                var deadline = transfer.IsTerminal
+                    ? transfer.UpdatedAt + TerminalRetention
+                    : transfer.Deadline;
+                if (nextDeadline == null || deadline < nextDeadline)
+                {
+                    nextDeadline = deadline;
+                }
+            }
+            foreach (var deadline in m_retiredCorrelations.Values)
+            {
+                if (nextDeadline == null || deadline < nextDeadline)
+                {
+                    nextDeadline = deadline;
+                }
+            }
+            foreach (var shadow in m_committedSlotShadows.Values)
+            {
+                if (nextDeadline == null || shadow.Deadline < nextDeadline)
+                {
+                    nextDeadline = shadow.Deadline;
+                }
+            }
+            if (nextDeadline == m_nextCleanupDeadline && m_cleanupTimer.IsEnabled)
+            {
+                return;
+            }
+            m_nextCleanupDeadline = nextDeadline;
+            ArmCleanupTimerCore(now);
+        }
+
+        private void ArmCleanupTimerCore(DateTimeOffset now)
+        {
+            m_cleanupTimer.Stop();
+            if (!m_disposed && m_nextCleanupDeadline is DateTimeOffset deadline)
+            {
+                m_cleanupTimer.Interval = TimeSpan.FromMilliseconds(Math.Clamp(
+                    Math.Ceiling((deadline - now).TotalMilliseconds),
+                    1,
+                    int.MaxValue));
+                m_cleanupTimer.Start();
+            }
+        }
+
+        private int CleanupExpiredEntriesCore(DateTimeOffset now)
         {
             int cleaned = 0;
             foreach (var transfer in m_transfers.Values
@@ -1524,6 +1666,7 @@ namespace FancyWM.AlgorithmicLayouts
                         now);
                 }
             }
+            UpdateCleanupScheduleCore(now);
         }
 
         private bool IsPhysicalSlotOccupiedCore(AlgorithmicSlotReservation reservation)
@@ -1543,6 +1686,7 @@ namespace FancyWM.AlgorithmicLayouts
             {
                 m_committedSlotShadows.Remove(reservationId);
             }
+            UpdateCleanupScheduleCore(m_timeProvider.GetUtcNow());
         }
 
         private static int GetSlotOrdinal(ReservedRole role, int? satelliteIndex)
@@ -1637,7 +1781,10 @@ namespace FancyWM.AlgorithmicLayouts
 
     internal readonly record struct PublishedCapacity(
         MasterSatelliteCapacitySnapshot Snapshot,
-        long PublicationSequence);
+        long PublicationSequence)
+    {
+        internal long Version { get; init; }
+    }
 
     internal sealed class AlgorithmicLayoutDisplayRegistration : IDisposable
     {

@@ -5,6 +5,7 @@ using FancyWM.Layouts.Tiling;
 using FancyWM.AlgorithmicLayouts;
 using FancyWM.Utilities;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 
 namespace FancyWM
 {
@@ -86,6 +87,7 @@ namespace FancyWM
 
         void Stop();
         void Start();
+        Task PrepareForShutdownAsync();
         IWindow? GetFocus();
         Rectangle GetBounds();
         IWindow? FindClosest(Point center);

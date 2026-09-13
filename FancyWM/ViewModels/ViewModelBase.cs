@@ -59,7 +59,7 @@ namespace FancyWM.ViewModels
                     }
                     else
                     {
-                        m_dependedBy[dep] = [dep];
+                        m_dependedBy[dep] = [prop];
                     }
                 }
             }

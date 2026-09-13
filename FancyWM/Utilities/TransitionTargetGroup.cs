@@ -14,18 +14,9 @@ namespace FancyWM.Utilities
 
         private static async ValueTask RunOnThreadPool(Action action)
         {
-            await await Task.Run(() =>
-            {
-                try
-                {
-                    action();
-                    return ValueTask.CompletedTask;
-                }
-                catch (Exception e)
-                {
-                    return ValueTask.FromException(e);
-                }
-            });
+            // Await preserves cancellation when the native adapter throws an
+            // OperationCanceledException, including one without a task token.
+            await Task.Run(action);
         }
 
         public async Task PerformSmoothTransitionAsync(TimeSpan duration)
@@ -61,7 +52,12 @@ namespace FancyWM.Utilities
                         if (working[index] == m_targets[index].Window.Position)
                         {
                             Rectangle newCurrent = LerpRectPosition(m_targets[index].OriginalPosition, m_targets[index].ComputedPosition, ease.Evaluate(progress));
-                            await RunOnThreadPool(() => m_targets[index].Window.SetPosition(newCurrent));
+                            // Integer interpolation can produce the same rectangle on adjacent
+                            // frames. Keep observing the window above, but only write a change.
+                            if (newCurrent != working[index])
+                            {
+                                await RunOnThreadPool(() => m_targets[index].Window.SetPosition(newCurrent));
+                            }
                             if (newCurrent == m_targets[index].ComputedPosition)
                             {
                                 job.Cancel();

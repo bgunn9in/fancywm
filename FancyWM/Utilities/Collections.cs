@@ -23,12 +23,12 @@ namespace FancyWM.Utilities
 
             public int GetHashCode([DisallowNull] IEnumerable<T> obj)
             {
-                int hash = 0;
+                var hash = new HashCode();
                 foreach (var item in obj)
                 {
-                    HashCode.Combine(hash, item);
+                    hash.Add(item, Comparer);
                 }
-                return hash;
+                return hash.ToHashCode();
             }
         }
 
@@ -39,10 +39,31 @@ namespace FancyWM.Utilities
 
         public static (IEnumerable<T> addList, IEnumerable<T> removeList, IEnumerable<T> persistList) Changes<T>(this IEnumerable<T> enumerable, IEnumerable<T> newEnumerable, IEqualityComparer<T> equalityComparer)
         {
-            return (
-                addList: newEnumerable.Except(enumerable, equalityComparer),
-                removeList: enumerable.Except(newEnumerable, equalityComparer),
-                persistList: enumerable.Intersect(newEnumerable, equalityComparer));
+            ArgumentNullException.ThrowIfNull(enumerable);
+            ArgumentNullException.ThrowIfNull(newEnumerable);
+
+            var previous = new HashSet<T>(equalityComparer);
+            List<T> previousOrder = [];
+            foreach (var item in enumerable)
+            {
+                if (previous.Add(item)) { previousOrder.Add(item); }
+            }
+
+            var next = new HashSet<T>(equalityComparer);
+            List<T> added = [];
+            foreach (var item in newEnumerable)
+            {
+                if (next.Add(item) && !previous.Contains(item)) { added.Add(item); }
+            }
+
+            List<T> removed = [];
+            List<T> persisted = [];
+            foreach (var item in previousOrder)
+            {
+                if (next.Contains(item)) { persisted.Add(item); }
+                else { removed.Add(item); }
+            }
+            return (added, removed, persisted);
         }
 
         public static IEnumerable<(K Key, V Value)> AsPairs<K, V>(this IEnumerable<KeyValuePair<K, V>> keyValuePairs)

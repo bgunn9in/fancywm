@@ -6,6 +6,7 @@ using System.Linq;
 using System.Windows.Threading;
 
 using FancyWM.AlgorithmicLayouts;
+using FancyWM.Tests.TestUtilities;
 
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 
@@ -22,6 +23,324 @@ namespace FancyWM.Tests.AlgorithmicLayouts
         private readonly Mock<IVirtualDesktopManager> m_virtualDesktopManager = new(MockBehavior.Loose);
         private readonly Dictionary<LayoutStateKey, long> m_publicationSequences
             = new(LayoutStateKeyIdentityComparer.Instance);
+
+        [TestMethod]
+        public void ExpiryDuringPreflightRejectsStaleSatelliteSlotAndContinuesInOrder()
+        {
+            var time = new ManualTimeProvider(DateTimeOffset.UnixEpoch);
+            var source = CreateDesktop("Source");
+            var expiredTarget = CreateDesktop("Expired target");
+            var destination = CreateDesktop("Destination");
+            using var coordinator = CreateCoordinator([source, expiredTarget, destination], time);
+            var display = CreateDisplay();
+            using var registration = coordinator.RegisterDisplay(display, new object());
+            var expiredKey = Publish(coordinator, display, expiredTarget, EmptyCapacity());
+            Publish(coordinator, display, destination, EmptyCapacity());
+            Assert.IsTrue(coordinator.TryPlanAndReserve(
+                Guid.NewGuid(), new IntPtr(701), source, display, expiredKey, out var preceding));
+            var notifications = new List<PendingWindowTransfer>();
+            bool notificationUnderLock = false;
+            coordinator.TransferTerminated += transfer =>
+            {
+                notificationUnderLock |= coordinator.IsMutationLockHeldByCurrentThread;
+                notifications.Add(transfer);
+            };
+            var preflighted = new List<IVirtualDesktop>();
+            var correlationId = Guid.NewGuid();
+            var windowHandle = new IntPtr(702);
+
+            var result = coordinator.FindDestinationAndReserve(
+                correlationId, windowHandle, source, display, null, (key, capacity) =>
+                {
+                    Assert.IsFalse(coordinator.IsMutationLockHeldByCurrentThread);
+                    preflighted.Add(key.VirtualDesktop);
+                    if (ReferenceEquals(key.VirtualDesktop, expiredTarget))
+                    {
+                        Assert.AreEqual(ReservedRole.Satellite, capacity.NextRole);
+                        Assert.AreEqual(0, capacity.NextSatelliteIndex);
+                        for (int lookup = 0; lookup < 5; lookup++)
+                        {
+                            Assert.IsTrue(coordinator.TryGetCapacity(key, out var repeated));
+                            Assert.AreEqual(capacity, repeated);
+                        }
+                        time.Advance(TimeSpan.FromSeconds(30));
+                    }
+                    return AlgorithmicDestinationPreflightResult.Accept();
+                });
+
+            AssertReservedSlot(result, coordinator, correlationId, windowHandle,
+                destination, display, ReservedRole.Master, null);
+            CollectionAssert.AreEqual(new[] { expiredTarget, destination }, preflighted);
+            CollectionAssert.AreEqual(new[] { expiredTarget, destination },
+                result.ExaminedCandidates.Select(item => item.Desktop).ToArray());
+            Assert.AreEqual(AlgorithmicDestinationCandidateDisposition.ReservationRejected,
+                result.ExaminedCandidates[0].Disposition);
+            Assert.IsTrue(coordinator.TryGetTransfer(preceding.CorrelationId, out var expired));
+            Assert.AreEqual(PendingWindowTransferState.Failed, expired.State);
+            Assert.AreEqual("TransferTimedOut", expired.TerminalReason);
+            Assert.IsFalse(coordinator.TryGetReservation(preceding.ReservationId!.Value, out _));
+            Assert.AreEqual(1, coordinator.ReservationCount);
+            Assert.AreEqual(0, notifications.Count);
+            Dispatchers.DoEvents();
+            Assert.IsFalse(notificationUnderLock);
+            Assert.AreEqual(1, notifications.Count);
+            Assert.AreEqual(preceding.CorrelationId, notifications[0].CorrelationId);
+            Assert.AreEqual(preceding.ReservationId, notifications[0].ReservationId);
+        }
+
+        [TestMethod]
+        public void MatchingNonemptyCapacityAfterPreflightPreservesExactSatelliteReservation()
+        {
+            var time = new ManualTimeProvider(DateTimeOffset.UnixEpoch);
+            var source = CreateDesktop("Source");
+            var destination = CreateDesktop("Destination");
+            using var coordinator = CreateCoordinator([source, destination], time);
+            var display = CreateDisplay();
+            using var registration = coordinator.RegisterDisplay(display, new object());
+            var targetKey = Publish(coordinator, display, destination, EmptyCapacity());
+            Assert.IsTrue(coordinator.TryPlanAndReserve(
+                Guid.NewGuid(), new IntPtr(711), source, display, targetKey, out var preceding));
+            var correlationId = Guid.NewGuid();
+            var windowHandle = new IntPtr(712);
+            var originalPosition = Rectangle.OffsetAndSize(10, 20, 300, 200);
+            int preflightCalls = 0;
+
+            var result = coordinator.FindDestinationAndReserve(
+                correlationId, windowHandle, source, display, originalPosition, (key, capacity) =>
+                {
+                    Assert.IsFalse(coordinator.IsMutationLockHeldByCurrentThread);
+                    preflightCalls++;
+                    Assert.AreEqual(ReservedRole.Satellite, capacity.NextRole);
+                    Assert.AreEqual(0, capacity.NextSatelliteIndex);
+                    time.Advance(TimeSpan.FromSeconds(5));
+                    Assert.IsTrue(coordinator.TryGetCapacity(key, out var repeated));
+                    Assert.AreEqual(capacity, repeated);
+                    return AlgorithmicDestinationPreflightResult.Accept();
+                });
+
+            AssertReservedSlot(result, coordinator, correlationId, windowHandle,
+                destination, display, ReservedRole.Satellite, 0);
+            Assert.AreEqual(originalPosition, result.Transfer!.SourceOriginalPosition);
+            Assert.AreEqual(time.GetUtcNow() + TimeSpan.FromSeconds(30), result.Transfer.Deadline);
+            Assert.AreEqual(1, preflightCalls);
+            Assert.AreEqual(1, result.ExaminedCandidates.Count);
+            Assert.AreEqual(2, coordinator.ReservationCount);
+            Assert.IsTrue(coordinator.TryGetReservation(preceding.ReservationId!.Value, out var retained));
+            Assert.AreEqual(preceding.CorrelationId, retained.CorrelationId);
+            Assert.AreEqual(ReservedRole.Master, retained.Role);
+            Assert.IsNull(retained.SatelliteIndex);
+        }
+
+        [TestMethod]
+        public void CommittedShadowExpiryDuringPreflightInvalidatesCapacityAndContinues()
+        {
+            var time = new ManualTimeProvider(DateTimeOffset.UnixEpoch);
+            var source = CreateDesktop("Source");
+            var expiredTarget = CreateDesktop("Expired shadow target");
+            var destination = CreateDesktop("Destination");
+            using var coordinator = CreateCoordinator([source, expiredTarget, destination], time);
+            var display = CreateDisplay();
+            using var registration = coordinator.RegisterDisplay(display, new object());
+            var expiredKey = Publish(coordinator, display, expiredTarget, EmptyCapacity());
+            Publish(coordinator, display, destination, EmptyCapacity());
+            Assert.IsTrue(coordinator.TryPlanAndReserve(
+                Guid.NewGuid(), new IntPtr(721), source, display, expiredKey, out var committed));
+            Assert.IsTrue(coordinator.MarkMoving(committed.CorrelationId, committed.WindowHandle));
+            Assert.IsTrue(coordinator.ObserveDestination(committed.CorrelationId, committed.WindowHandle));
+            Assert.IsTrue(coordinator.Commit(committed.CorrelationId, committed.WindowHandle));
+            var correlationId = Guid.NewGuid();
+            var windowHandle = new IntPtr(722);
+            var preflighted = new List<IVirtualDesktop>();
+
+            var result = coordinator.FindDestinationAndReserve(
+                correlationId, windowHandle, source, display, null, (key, capacity) =>
+                {
+                    Assert.IsFalse(coordinator.IsMutationLockHeldByCurrentThread);
+                    preflighted.Add(key.VirtualDesktop);
+                    if (ReferenceEquals(key.VirtualDesktop, expiredTarget))
+                    {
+                        Assert.AreEqual(1, capacity.ReservedSlots);
+                        Assert.AreEqual(ReservedRole.Satellite, capacity.NextRole);
+                        Assert.AreEqual(0, capacity.NextSatelliteIndex);
+                        time.Advance(TimeSpan.FromSeconds(30));
+                    }
+                    return AlgorithmicDestinationPreflightResult.Accept();
+                });
+
+            AssertReservedSlot(result, coordinator, correlationId, windowHandle,
+                destination, display, ReservedRole.Master, null);
+            CollectionAssert.AreEqual(new[] { expiredTarget, destination }, preflighted);
+            CollectionAssert.AreEqual(new[] { expiredTarget, destination },
+                result.ExaminedCandidates.Select(item => item.Desktop).ToArray());
+            Assert.AreEqual(AlgorithmicDestinationCandidateDisposition.ReservationRejected,
+                result.ExaminedCandidates[0].Disposition);
+            Assert.IsFalse(coordinator.TryGetCapacity(expiredKey, out _));
+            Assert.IsTrue(coordinator.TryGetTransfer(committed.CorrelationId, out var terminal));
+            Assert.AreEqual(PendingWindowTransferState.Committed, terminal.State);
+            Assert.IsFalse(coordinator.TryGetReservation(committed.ReservationId!.Value, out _));
+            Assert.AreEqual(1, coordinator.ReservationCount);
+        }
+
+        [DataTestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public void CapacityChangeDuringPreflightRejectsStaleAcceptance(bool sameFreeSlot)
+        {
+            var time = new ManualTimeProvider(DateTimeOffset.UnixEpoch);
+            var source = CreateDesktop("Source");
+            var changedTarget = CreateDesktop("Changed target");
+            var destination = CreateDesktop("Destination");
+            using var coordinator = CreateCoordinator([source, changedTarget, destination], time);
+            var display = CreateDisplay();
+            using var registration = coordinator.RegisterDisplay(display, new object());
+            Publish(coordinator, display, changedTarget, EmptyCapacity());
+            Publish(coordinator, display, destination, EmptyCapacity());
+            var correlationId = Guid.NewGuid();
+            var windowHandle = new IntPtr(731);
+            var preflighted = new List<IVirtualDesktop>();
+
+            var result = coordinator.FindDestinationAndReserve(
+                correlationId, windowHandle, source, display, null, (key, capacity) =>
+                {
+                    Assert.IsFalse(coordinator.IsMutationLockHeldByCurrentThread);
+                    preflighted.Add(key.VirtualDesktop);
+                    if (ReferenceEquals(key.VirtualDesktop, changedTarget))
+                    {
+                        time.Advance(TimeSpan.FromSeconds(1));
+                        Publish(coordinator, display, changedTarget,
+                            sameFreeSlot ? EmptyCapacity() with { Revision = capacity.Revision + 1 } : FullCapacity());
+                        Assert.IsTrue(coordinator.TryGetCapacity(key, out var changed));
+                        Assert.AreNotEqual(capacity.Revision, changed.Revision);
+                        if (sameFreeSlot)
+                        {
+                            Assert.AreEqual(capacity.NextRole, changed.NextRole);
+                            Assert.AreEqual(capacity.NextSatelliteIndex, changed.NextSatelliteIndex);
+                        }
+                    }
+                    return AlgorithmicDestinationPreflightResult.Accept();
+                });
+
+            AssertReservedSlot(result, coordinator, correlationId, windowHandle,
+                destination, display, ReservedRole.Master, null);
+            CollectionAssert.AreEqual(new[] { changedTarget, destination }, preflighted);
+            CollectionAssert.AreEqual(new[] { changedTarget, destination },
+                result.ExaminedCandidates.Select(item => item.Desktop).ToArray());
+            Assert.AreEqual(AlgorithmicDestinationCandidateDisposition.ReservationRejected,
+                result.ExaminedCandidates[0].Disposition);
+            Assert.AreEqual(1, coordinator.ReservationCount);
+        }
+
+        [DataTestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        public void ReservationPrefixReplacementInvalidatesOnlyItsOwnLayoutPreflight(bool otherDisplay)
+        {
+            var time = new ManualTimeProvider(DateTimeOffset.UnixEpoch);
+            var source = CreateDesktop("Source");
+            var target = CreateDesktop("Target");
+            var fallback = CreateDesktop("Fallback");
+            using var coordinator = CreateCoordinator([source, target, fallback], time);
+            var display = CreateDisplay();
+            var independentDisplay = CreateDisplay();
+            using var registration = coordinator.RegisterDisplay(display, new object());
+            using var independentRegistration = coordinator.RegisterDisplay(independentDisplay, new object());
+            var targetKey = Publish(coordinator, display, target, EmptyCapacity());
+            Publish(coordinator, display, fallback, EmptyCapacity());
+            Assert.IsTrue(coordinator.TryPlanAndReserve(
+                Guid.NewGuid(), new IntPtr(741), source, display, targetKey, out var preceding));
+            var replacedKey = otherDisplay
+                ? Publish(coordinator, independentDisplay, target, EmptyCapacity())
+                : targetKey;
+            var replaced = preceding;
+            if (otherDisplay)
+            {
+                Assert.IsTrue(coordinator.TryPlanAndReserve(
+                    Guid.NewGuid(), new IntPtr(742), source, independentDisplay, replacedKey, out replaced));
+            }
+            PendingWindowTransfer? replacement = null;
+            var correlationId = Guid.NewGuid();
+            var windowHandle = new IntPtr(743);
+            var preflighted = new List<IVirtualDesktop>();
+
+            var result = coordinator.FindDestinationAndReserve(
+                correlationId, windowHandle, source, display, null, (key, capacity) =>
+                {
+                    Assert.IsFalse(coordinator.IsMutationLockHeldByCurrentThread);
+                    preflighted.Add(key.VirtualDesktop);
+                    if (ReferenceEquals(key.VirtualDesktop, target))
+                    {
+                        Assert.AreEqual(ReservedRole.Satellite, capacity.NextRole);
+                        Assert.AreEqual(0, capacity.NextSatelliteIndex);
+                        time.Advance(TimeSpan.FromSeconds(1));
+                        Assert.IsTrue(coordinator.Cancel(
+                            replaced.CorrelationId, replaced.WindowHandle, "PrefixReplaced"));
+                        Assert.IsTrue(coordinator.TryPlanAndReserve(
+                            Guid.NewGuid(), new IntPtr(744), source, replacedKey.Display, replacedKey, out replacement));
+                        Assert.IsTrue(coordinator.TryGetCapacity(key, out var changed));
+                        Assert.AreEqual(capacity.NextRole, changed.NextRole);
+                        Assert.AreEqual(capacity.NextSatelliteIndex, changed.NextSatelliteIndex);
+                        Assert.AreEqual(capacity.ReservedSlots, changed.ReservedSlots);
+                        Assert.AreEqual(capacity.Revision, changed.Revision);
+                        if (otherDisplay) { Assert.AreEqual(capacity, changed); }
+                    }
+                    return AlgorithmicDestinationPreflightResult.Accept();
+                });
+
+            AssertReservedSlot(result, coordinator, correlationId, windowHandle,
+                otherDisplay ? target : fallback, display,
+                otherDisplay ? ReservedRole.Satellite : ReservedRole.Master,
+                otherDisplay ? 0 : null);
+            CollectionAssert.AreEqual(otherDisplay ? new[] { target } : new[] { target, fallback }, preflighted);
+            CollectionAssert.AreEqual(preflighted,
+                result.ExaminedCandidates.Select(item => item.Desktop).ToArray());
+            Assert.AreEqual(otherDisplay
+                ? AlgorithmicDestinationCandidateDisposition.Reserved
+                : AlgorithmicDestinationCandidateDisposition.ReservationRejected,
+                result.ExaminedCandidates[0].Disposition);
+            Assert.IsTrue(coordinator.TryGetTransfer(replaced.CorrelationId, out var terminal));
+            Assert.AreEqual(PendingWindowTransferState.Cancelled, terminal.State);
+            Assert.AreEqual("PrefixReplaced", terminal.TerminalReason);
+            Assert.IsFalse(coordinator.TryGetReservation(replaced.ReservationId!.Value, out _));
+            Assert.IsNotNull(replacement);
+            var replacementTransfer = replacement!;
+            Assert.IsTrue(coordinator.TryGetReservation(replacementTransfer.ReservationId!.Value, out var current));
+            Assert.AreEqual(replacementTransfer.CorrelationId, current.CorrelationId);
+            Assert.AreEqual(new IntPtr(744), current.WindowHandle);
+            Assert.AreSame(replacedKey.Display, current.LayoutKey.Display);
+            Assert.AreEqual(ReservedRole.Master, current.Role);
+            Assert.IsNull(current.SatelliteIndex);
+            Assert.AreEqual(otherDisplay ? 3 : 2, coordinator.ReservationCount);
+        }
+
+        private static void AssertReservedSlot(
+            AlgorithmicDestinationSearchResult result,
+            AlgorithmicLayoutCoordinator coordinator,
+            Guid correlationId,
+            IntPtr windowHandle,
+            IVirtualDesktop destination,
+            IDisplay display,
+            ReservedRole role,
+            int? satelliteIndex)
+        {
+            Assert.IsTrue(result.Succeeded, result.DiagnosticReason);
+            Assert.AreEqual(AlgorithmicDestinationSearchDisposition.Reserved, result.Disposition);
+            Assert.IsNotNull(result.Transfer);
+            var transfer = result.Transfer!;
+            Assert.AreEqual(correlationId, transfer.CorrelationId);
+            Assert.AreEqual(windowHandle, transfer.WindowHandle);
+            Assert.AreSame(destination, transfer.TargetDesktop);
+            Assert.AreSame(display, transfer.TargetDisplay);
+            Assert.AreEqual(role, transfer.TargetRole);
+            Assert.AreEqual(satelliteIndex, transfer.TargetSatelliteIndex);
+            Assert.AreEqual(PendingWindowTransferState.Reserved, transfer.State);
+            Assert.IsTrue(coordinator.TryGetReservation(transfer.ReservationId!.Value, out var reservation));
+            Assert.AreEqual(correlationId, reservation.CorrelationId);
+            Assert.AreEqual(windowHandle, reservation.WindowHandle);
+            Assert.AreSame(destination, reservation.LayoutKey.VirtualDesktop);
+            Assert.AreSame(display, reservation.LayoutKey.Display);
+            Assert.AreEqual(role, reservation.Role);
+            Assert.AreEqual(satelliteIndex, reservation.SatelliteIndex);
+        }
 
         [TestMethod]
         public void WorkspaceVirtualDesktopManagerGetterFailureReturnsNoDestination()

@@ -42,12 +42,14 @@ namespace FancyWM.ThemeEngine
 
         public void Parse(string htmlTemplate, string cssText)
         {
-            Dictionary<string, IElement> elementDict = [];
+            // Each conversion owns its parsed rules. Variants temporarily rewrite
+            // selectors and restore them before the next document uses the sheet.
+            var stylesheet = new CssParser().ParseStyleSheet(cssText);
             foreach (var (variant, document) in m_documents)
             {
                 List<string> variantSelectors = [];
 
-                string transformedCssText = RewriteRules(variant, cssText, variantSelectors);
+                string transformedCssText = RewriteRules(variant, stylesheet, cssText, variantSelectors);
                 document.Head!.InnerHtml = $"<style>{transformedCssText}</style>";
 
                 string transformedHtmlTemplate = RewriteTemplate(variant, htmlTemplate);
@@ -93,44 +95,43 @@ namespace FancyWM.ThemeEngine
             m_documents.Clear();
             foreach (var variant in s_variants)
             {
-                List<string> variantSelectors = [];
                 string documentHtml = $"<!DOCTYPE html><html><head></head><body></body>";
 
                 var context = BrowsingContext.New(m_configuration);
                 var document = await context.OpenAsync(req => req.Content(documentHtml));
 
-                if (variantSelectors.Count > 0)
-                {
-                    var combinedVariantSelector = string.Join(", ", variantSelectors);
-                    var variantDependentElements = document.QuerySelectorAll(combinedVariantSelector);
-                    foreach (var element in variantDependentElements)
-                    {
-                        element.ClassList.Add(variant.GeneratedClassName!);
-                    }
-                }
                 m_documents.Add((variant, document));
             }
         }
 
-        private static string RewriteRules(StyleVariant variant, string cssText, List<string> variantSelectors)
+        private static string RewriteRules(StyleVariant variant, ICssStyleSheet stylesheet, string cssText, List<string> variantSelectors)
         {
-            var parser = new CssParser();
-            var stylesheet = parser.ParseStyleSheet(cssText);
             if (string.IsNullOrEmpty(variant.CssSelector) || !cssText.Contains(variant.CssSelector))
             {
                 return FlattenRules(stylesheet);
             }
 
-            foreach (var rule in stylesheet.Rules.OfType<ICssStyleRule>())
+            List<(ICssStyleRule Rule, string Selector)> rewritten = [];
+            try
             {
-                if (rule.SelectorText?.Contains(variant.CssSelector) != true)
+                foreach (var rule in stylesheet.Rules.OfType<ICssStyleRule>())
                 {
-                    continue;
+                    if (rule.SelectorText?.Contains(variant.CssSelector) != true)
+                    {
+                        continue;
+                    }
+                    var selector = rule.SelectorText;
+                    rewritten.Add((rule, selector));
+                    variantSelectors.Add(selector.Replace(variant.CssSelector, ""));
+                    rule.SelectorText = selector.Replace(variant.CssSelector, variant.CssReplacementSelector!);
                 }
-                variantSelectors.Add(rule.SelectorText.Replace(variant.CssSelector, ""));
-                rule.SelectorText = rule.SelectorText.Replace(variant.CssSelector, variant.CssReplacementSelector!);
+                return FlattenRules(stylesheet);
             }
-            return FlattenRules(stylesheet);
+            finally
+            {
+                foreach (var (rule, selector) in rewritten)
+                    rule.SelectorText = selector;
+            }
         }
 
         private static string FlattenRules(ICssStyleSheet styleSheet)

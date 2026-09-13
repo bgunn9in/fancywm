@@ -31,11 +31,11 @@ namespace FancyWM.ViewModels
         public Rectangle FocusRectangle { get => m_focusRectangle; set => SetField(ref m_focusRectangle, value); }
 
         [DerivedProperty(nameof(FocusRectangle))]
-        public bool IsFocusRectangleVisible => m_focusRectangle.Width == 0;
+        public bool IsFocusRectangleVisible => m_focusRectangle.Width != 0;
 
         public Rectangle PreviewRectangle { get => m_previewRectangle; set => SetField(ref m_previewRectangle, value); }
 
         [DerivedProperty(nameof(PreviewRectangle))]
-        public bool IsPreviewRectangleVisible => m_previewRectangle.Width == 0;
+        public bool IsPreviewRectangleVisible => m_previewRectangle.Width != 0;
     }
 }

@@ -126,5 +126,8 @@ namespace FancyWM.AlgorithmicLayouts
         int ReservedSlots,
         int TotalCapacity,
         long Revision,
-        string? DiagnosticReason);
+        string? DiagnosticReason)
+    {
+        internal long Version { get; init; }
+    }
 }

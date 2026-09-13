@@ -1,0 +1,17 @@
+Latest verified continuation (2026-09-13): `FWM-PERF016-MEMCOUNTERS-20260913-R1` —
+[native GPU and process memory accounting]({link}DXGI_PROCESS_MEMORY.md).
+Real Debug/Release controls calibrate DXGI process usage by adapter LUID/node/
+segment and GetProcessMemoryInfo private commit. F3 uses the same native DLLs
+without PSS, heap tracing or D3D interception. Each full graph completes 100
+post-warmup lifetimes, clears 9,483 workload weak owners and closes all graph
+HWND generations before graceful provider teardown. F3's sampled DXGI usage
+is stable across live epochs and zero after shutdown in both configurations;
+private commit grows in both, and USER/GDI fails Release. F2's Release LOCAL
+growth and F1's missing Application.Windows checkpoints remain preserved.
+The fixture correction is verified by new F2/F3 runs, not a weakened verifier.
+These counters do not identify physical allocations, logical owners or
+presentation; CPU and GPU values are not an atomic/additive total. Production,
+five inherited corrections, PERF-002 250 ms and ledger are unchanged. No new
+TRX/crash/DPI/ETL run, performance claim or stage acceptance. PERF-016 remains
+IN_PROGRESS; the report maps remaining criteria and supersedes historical
+next actions where applicable.

@@ -1,5 +1,54 @@
 # Master + Satellites implementation status
 
+## Practical stage complete — 2026-09-13
+
+The user confirmed **«Работает»** with no new reported problem. The practical
+stage is complete; next action is using the working version and fixing concrete
+new bugs. No further UI run or permission wait is needed for this closeout.
+Earlier successful Debug/Release tests, GUI/x64/MSIX builds and scoped automated
+UI results retain their recorded scope and result. They were not rerun, and
+the application was not relaunched.
+
+The checked portable is `FancyWM-Portable-win-x64-20260913-214722.zip`,
+self-contained Release x64, 509 files, with successful `--help`/`--version`
+checks and per-file archive hash verification. See [launch instructions and
+known limits](docs/portable.md). Sources, dependency versions and the pinned
+`winman-windows` gitlink remain unchanged by this closeout; dependency changes
+continue to be delivered through `patches/winman-windows`.
+
+General confirmation does not individually close all DPI/display checks,
+Horizontal/right-master MoveRight, Firefox placement, physical focus/drag or
+native desktop transfer/overflow. These remain optional checks. Cross-monitor
+and mixed-DPI coverage need a second display; no extra research is scheduled.
+
+## Historical practical UI follow-up before confirmation — 2026-09-13
+
+The r4 sections below are historical scenario/evidence records, not the current
+build or next action. The current reduced scope is in [PERFORMANCE_TODO.md](PERFORMANCE_TODO.md).
+Existing full Debug/Release, x64/MSIX and scoped automated UI results remain
+valid for the unchanged source; their receipts are linked from that plan.
+
+`FWM-USER-UI-20260913-R2/portable/FancyWM-GUI.exe` is freshly published from
+current code, with 508 archived files and successful `--help`/`--version`
+entry checks. Source provenance matches the prior verified production snapshot.
+The old GUI win-x64 output failed binary correspondence and was not launched;
+its preparation failure is retained in R1. No production fix or retry was added.
+
+At that checkpoint the next action was to obtain permission for MainWindow's temporary global
+WindowArranging write/restoration, then perform [one short real-UI scenario](artifacts/performance/FWM-USER-UI-20260913-R2/UI-SCENARIO.md).
+Ordinary startup/shutdown, physical hotkeys/drag, exact two-window right-master
+Horizontal MoveRight, visible settings/notifications and repeated Firefox
+placement remain unverified in this follow-up. The Firefox issue has not been
+reproduced here. Settings/log backups and read-only window placement are saved;
+the user's files/windows have not been changed by a test run.
+
+Available: one local 3440x1440 monitor at 96 DPI and Firefox/Notepad/Paint/Calculator
+launchers. Cross-monitor/mixed-DPI needs a second display; Windows scale changes
+need separate permission. Native virtual-desktop transfer/overflow remains open
+until the isolated user scenario. Deferred performance research stays deferred.
+
+## Historical r4 implementation record
+
 ## Published branch and base commits
 
 - Published root branch: `feature/master-satellite-layout`, based on `main@947e955d550306c40efbc26532da712a57cbc869` (`Set version to 2.19.1-alpha`). The branch was created only after the preserved feature tree had been reviewed and committed, so no dirty-file checkout was required.
@@ -7,11 +56,11 @@
 - Submodule commits are `ModernWpf@0ab73b38c604cade2b344537202e195762e03412`, `winman@b2faabe377386d73b0df1371e61933e103a3ba65`, and `winman-windows@adb9f55b84b567db9f6e0ee8df4c33d11a12d91f`.
 - The required `winman-windows` commit is published on `bgunn9in/winman-windows:feature/master-satellite-layout`; `.gitmodules` points to that reachable fork.
 
-## Current stage
+## Historical r4 stage
 
 Continuation from base `main@947e955d550306c40efbc26532da712a57cbc869` is published on `feature/master-satellite-layout` and remains in Stage 13, Mouse interaction, because the physical mouse/UI gates cannot be completed automatically. Live `r3` testing on the 3440×1440 display confirmed Horizontal satellites and a correlated fifth-window overflow to Desktop 2. It then exposed a direct-command boundary defect: `MoveRight` rejected the sole left satellite even though its actual neighbour was the right-side master. The command now treats that active-axis boundary crossing as the existing atomic promotion operation. The fully validated `r4` portable build is ready for the exact physical direct-hotkey confirmation.
 
-## Current TODO item
+## Historical r4 TODO item
 
 `TODO.md` recommended order item 13, `[~] Mouse interaction`, remains open for physical confirmation. The immediate unchecked gate is the Stage 5 direct-hotkey check: run `r4` with a right-side master and one left-side satellite, then move the satellite right across the adjacent master.
 
@@ -230,6 +279,6 @@ The complete feature-related inventory is below. User-owned `.codex/config.toml`
 - The feature branch was created after the reviewed implementation was committed. User files `.codex/`, `BEGIN_PROMT.md`, and `CONTINUE_PROMT.md` remain local and were not changed or removed.
 - `winman-windows` desktop-creation support is committed at `adb9f55b84b567db9f6e0ee8df4c33d11a12d91f` in the reachable user fork; real COM desktop creation across supported Windows builds remains a manual gate.
 
-## Next exact action
+## Historical r4 next action (superseded above)
 
 Launch `FancyWM-Master-Satellites-win-x64-20260905-r4`, select Horizontal with the master on the right, leave exactly one satellite on the left, focus that satellite, and invoke `MoveRight`. Verify that it becomes the right-side 60% master, the old master becomes the left-side 40% satellite, focus stays on the moved window, and no rejection toast appears. If Firefox initially overwrites its assigned position again, capture `%APPDATA%\FancyWM\fancywm.log`, the screenshot time, and whether the slot corrects without an extra focus change.

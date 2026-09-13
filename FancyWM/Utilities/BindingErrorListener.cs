@@ -1,14 +1,31 @@
 ﻿using System;
 using System.Diagnostics;
+using System.Threading;
 
 namespace FancyWM.Utilities
 {
     public class BindingErrorListener(Action<string?> logAction) : TraceListener
     {
-        public static void Listen(Action<string?> logAction)
+        private Action<string?>? m_logAction = logAction;
+
+        public static BindingErrorListener Listen(Action<string?> logAction)
         {
+            var listener = new BindingErrorListener(logAction);
             PresentationTraceSources.DataBindingSource.Listeners
-                .Add(new BindingErrorListener(logAction));
+                .Add(listener);
+            return listener;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                // Release the callback owner and close admission before removing
+                // the registration; a previously admitted callback may finish.
+                Interlocked.Exchange(ref m_logAction, null);
+                PresentationTraceSources.DataBindingSource.Listeners.Remove(this);
+            }
+            base.Dispose(disposing);
         }
 
         public override void Write(string? message)
@@ -17,7 +34,7 @@ namespace FancyWM.Utilities
 
         public override void WriteLine(string? message)
         {
-            logAction?.Invoke(message);
+            Volatile.Read(ref m_logAction)?.Invoke(message);
         }
     }
 }

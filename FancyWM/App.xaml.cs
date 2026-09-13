@@ -33,6 +33,7 @@ namespace FancyWM
         private readonly Lazy<AppState> m_appState = new(() => new AppState());
 
         private bool m_isProcessingUnhandledException = false;
+        private TaskCompletionSource? m_termination;
 
         internal AppState AppState => m_appState.Value;
 
@@ -144,8 +145,59 @@ namespace FancyWM
 
         internal void Terminate()
         {
-            Close();
-            Shutdown();
+            _ = BeginTermination(ref m_termination, () => TerminateOwnedWindowsAsync(
+                () => Windows.Cast<Window>(),
+                window =>
+                {
+                    if (window is IDisposable disposable) { disposable.Dispose(); }
+                },
+                window => window is MainWindow mainWindow ? mainWindow.ShutdownCompletion : Task.CompletedTask,
+                window => window.Close(),
+                action =>
+                {
+                    if (Dispatcher.CheckAccess())
+                    {
+                        ShutdownMode = System.Windows.ShutdownMode.OnExplicitShutdown;
+                        action();
+                        return Task.CompletedTask;
+                    }
+                    return Dispatcher.InvokeAsync(() =>
+                    {
+                        ShutdownMode = System.Windows.ShutdownMode.OnExplicitShutdown;
+                        action();
+                    }, System.Windows.Threading.DispatcherPriority.Send).Task;
+                },
+                new App.ShutdownOwner[]
+                {
+                    CreateShutdownOwner(
+                        () => Services.GetRequiredService<LowLevelMouseHook>(),
+                        static hook => hook.Dispose(), static hook => hook.Completion),
+                    CreateShutdownOwner(
+                        () => Services.GetRequiredService<LowLevelKeyboardHook>(),
+                        static hook => hook.Dispose(), static hook => hook.Completion),
+                },
+                error => Logger.Error(error, "Failed to release resources on shutdown"),
+                Shutdown));
+        }
+
+        protected override void OnExit(ExitEventArgs e)
+        {
+            try
+            {
+                if (m_appState.IsValueCreated)
+                {
+                    m_appState.Value.Settings.FlushAsync().GetAwaiter().GetResult();
+                }
+            }
+            catch (Exception error)
+            {
+                Logger.Error(error, "Failed to flush settings on shutdown");
+            }
+            finally
+            {
+                WindowExtensions.StopIconDiscovery();
+                base.OnExit(e);
+            }
         }
 
         private async void OnUnhandledException(object sender, UnhandledExceptionEventArgs e)
@@ -244,52 +296,32 @@ namespace FancyWM
 
         private void Close()
         {
-            void CloseAppWindows()
-            {
-                List<Exception> exceptions = [];
-                foreach (var window in Windows.Cast<Window>())
+            CloseOwnedWindows(
+                () => Windows.Cast<Window>(),
+                window =>
                 {
-                    try
-                    {
-                        // Dispose and close window
-                        if (window is IDisposable disposable)
-                        {
-                            disposable.Dispose();
-                        }
-                        try
-                        {
-                            window.Close();
-                        }
-                        catch (InvalidOperationException)
-                        {
-                            // Already closing...
-                        }
-                    }
-                    catch (Exception e)
-                    {
-                        exceptions.Add(e);
-                    }
-                }
-                if (exceptions.Count > 0)
+                    if (window is IDisposable disposable) { disposable.Dispose(); }
+                },
+                window => window.Close(),
+                closeAppWindows =>
                 {
-                    throw new AggregateException("Application shutdown failed!", exceptions);
-                }
-            }
-
-            if (Dispatcher.Thread == Thread.CurrentThread)
-            {
-                CloseAppWindows();
-            }
-            else
-            {
-                // Use highest priority to close
-                Dispatcher.Invoke(CloseAppWindows, System.Windows.Threading.DispatcherPriority.Send);
-            }
-
-            if (Services.GetRequiredService<LowLevelMouseHook>() is LowLevelMouseHook mshk)
-            {
-                mshk.Dispose();
-            }
+                    if (Dispatcher.Thread == Thread.CurrentThread)
+                    {
+                        closeAppWindows();
+                    }
+                    else
+                    {
+                        // Use highest priority to close.
+                        Dispatcher.Invoke(closeAppWindows, System.Windows.Threading.DispatcherPriority.Send);
+                    }
+                },
+                () =>
+                {
+                    if (Services.GetRequiredService<LowLevelMouseHook>() is LowLevelMouseHook mshk)
+                    {
+                        mshk.Dispose();
+                    }
+                });
         }
 
         private static Task<bool?> ShowDialogOnBackgroundThread(Func<Window> windowFactory)

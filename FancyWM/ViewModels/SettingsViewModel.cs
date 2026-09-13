@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Reactive.Linq;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Security.Principal;
 using System.Threading;
 using System.Threading.Tasks;
@@ -266,6 +267,9 @@ namespace FancyWM.ViewModels
         private readonly IDisposable m_subscription;
         private bool m_isInit = false;
         private bool m_suppressSave;
+        private volatile bool m_isDisposed;
+        private bool m_autostartQueryStarted;
+        private Task? m_observedSave;
         private ObservableCollection<KeybindingViewModel>? m_keybindings;
         private int m_panelHeight;
         private int m_panelFontSize;
@@ -300,6 +304,7 @@ namespace FancyWM.ViewModels
             {
                 dispatcher.Invoke(() =>
                 {
+                    if (m_isDisposed) return;
                     m_isInit = false;
                     m_logger.Debug($"{nameof(FancyWM.ViewModels.SettingsViewModel)} received new Settings");
 
@@ -356,8 +361,15 @@ namespace FancyWM.ViewModels
                         }
                     }
 
+                    // File-backed settings are ready now. The independent OS query
+                    // must neither disable editing nor restart on every save echo.
+                    m_isInit = true;
+                    if (m_autostartQueryStarted) return;
+                    m_autostartQueryStarted = true;
+
                     void completeInitialization(Task<bool> task)
                     {
+                        if (m_isDisposed) return;
                         bool? isAutostartEnabled = null;
                         try
                         {
@@ -368,14 +380,17 @@ namespace FancyWM.ViewModels
                             m_logger.Error(e, "Failed to determine whether FancyWM runs at startup");
                         }
 
-                        dispatcher.Invoke(() =>
+                        void applyAutostartState()
                         {
+                            if (m_isDisposed) return;
                             if (isAutostartEnabled.HasValue)
                             {
                                 SetField(ref m_runsAtStartup, isAutostartEnabled.Value, nameof(RunsAtStartup));
                             }
                             m_isInit = true;
-                        });
+                        }
+                        if (dispatcher.CheckAccess()) applyAutostartState();
+                        else _ = dispatcher.InvokeAsync(applyAutostartState);
                     }
 
                     Task<bool> initializationTask;
@@ -443,7 +458,7 @@ namespace FancyWM.ViewModels
                 else
                 {
                     vm.HasErrors = false;
-                    SaveChanges();
+                    SaveChanges(nameof(Keybindings));
                 }
             }
         }
@@ -452,34 +467,89 @@ namespace FancyWM.ViewModels
         {
             base.NotifyPropertyChanged(propertyName);
 
-            if (!m_isInit || m_suppressSave)
+            if (!m_isInit || m_suppressSave || m_isDisposed)
             {
                 return;
             }
 
-            SaveChanges();
+            SaveChanges(propertyName);
         }
 
         public override void Dispose()
         {
-            m_subscription?.Dispose();
-            if (m_keybindings != null)
+            if (m_isDisposed) return;
+            m_isDisposed = true;
+
+            ExceptionDispatchInfo? failure = null;
+            List<Exception>? laterFailures = null;
+            void release(Action action)
             {
-                foreach (var keybinding in m_keybindings)
+                try
                 {
-                    keybinding.PropertyChanged -= OnKeybindingPropertyChanged;
+                    action();
+                }
+                catch (Exception e)
+                {
+                    if (failure == null)
+                    {
+                        failure = ExceptionDispatchInfo.Capture(e);
+                    }
+                    else
+                    {
+                        (laterFailures ??= []).Add(e);
+                    }
                 }
             }
-            base.Dispose();
+
+            // Preserve the historical tolerance for an observable that violates
+            // the IDisposable return contract and supplies null.
+            release(() => m_subscription?.Dispose());
+            if (m_keybindings != null)
+            {
+                release(() =>
+                {
+                    foreach (var keybinding in m_keybindings)
+                    {
+                        keybinding.PropertyChanged -= OnKeybindingPropertyChanged;
+                    }
+                });
+            }
+            try
+            {
+                Model.FlushAsync().GetAwaiter().GetResult();
+            }
+            catch (Exception e)
+            {
+                release(() => m_logger.Error(e, "Failed to flush settings on close"));
+            }
+            release(() => base.Dispose());
+
+            if (laterFailures != null)
+            {
+                try
+                {
+                    const string cleanupExceptionsKey = "SettingsViewModel.CleanupExceptions";
+                    if (failure!.SourceException.Data[cleanupExceptionsKey] is AggregateException existing)
+                    {
+                        laterFailures.InsertRange(0, existing.InnerExceptions);
+                    }
+                    failure.SourceException.Data[cleanupExceptionsKey] = new AggregateException(laterFailures);
+                }
+                catch
+                {
+                    // Supplemental diagnostics must never replace the first
+                    // escaping cleanup error captured above.
+                }
+            }
+            failure?.Throw();
         }
 
-        private void SaveChanges()
+        private void SaveChanges(string? propertyName = null)
         {
-            var saveTask = Model.SaveAsync(x =>
-            {
-                m_logger.Debug($"{nameof(SettingsViewModel)} is overwriting existing Settings");
-
-                return x with
+            if (!m_isInit || m_suppressSave || m_isDisposed) return;
+            if (propertyName is nameof(RunsAtStartup) or nameof(RunsAsAdministrator) or nameof(MouseAutoFocus)) return;
+            // Capture UI-owned values now; the entity may still be initializing asynchronously.
+            var changed = new Settings
                 {
                     ActivationHotkey = SelectedActivationHotkey!,
                     ActivateOnCapsLock = ActivateOnCapsLock,
@@ -488,7 +558,7 @@ namespace FancyWM.ViewModels
                     AllocateNewPanelSpace = AllocateNewPanelSpace,
                     AutoCollapsePanels = AutoCollapsePanels,
                     AutoSplitCount = AutoSplitCount,
-                    MasterSatelliteLayout = x.MasterSatelliteLayout with
+                    MasterSatelliteLayout = new MasterSatelliteLayoutSettings
                     {
                         Enabled = MasterSatelliteEnabled,
                         MasterRatio = MasterRatio,
@@ -518,8 +588,56 @@ namespace FancyWM.ViewModels
                     ShowFocus = ShowFocus,
                     ShowFocusDuringAction = ShowFocusDuringAction
                 };
+            var saveTask = Model.SaveAsync(x => propertyName switch
+            {
+                nameof(SelectedActivationHotkey) => x with { ActivationHotkey = changed.ActivationHotkey },
+                nameof(ActivateOnCapsLock) => x with { ActivateOnCapsLock = changed.ActivateOnCapsLock },
+                nameof(ShowStartupWindow) => x with { ShowStartupWindow = changed.ShowStartupWindow },
+                nameof(NotifyVirtualDesktopServiceIncompatibility) => x with { NotifyVirtualDesktopServiceIncompatibility = changed.NotifyVirtualDesktopServiceIncompatibility },
+                nameof(AllocateNewPanelSpace) => x with { AllocateNewPanelSpace = changed.AllocateNewPanelSpace },
+                nameof(AutoCollapsePanels) => x with { AutoCollapsePanels = changed.AutoCollapsePanels },
+                nameof(AutoSplitCount) => x with { AutoSplitCount = changed.AutoSplitCount },
+                nameof(MasterSatelliteEnabled) => x with { MasterSatelliteLayout = x.MasterSatelliteLayout with { Enabled = changed.MasterSatelliteLayout.Enabled } },
+                nameof(MasterRatio) => x with { MasterSatelliteLayout = x.MasterSatelliteLayout with { MasterRatio = changed.MasterSatelliteLayout.MasterRatio } },
+                nameof(DefaultMasterSide) => x with { MasterSatelliteLayout = x.MasterSatelliteLayout with { DefaultMasterSide = changed.MasterSatelliteLayout.DefaultMasterSide } },
+                nameof(DefaultSatelliteOrientation) => x with { MasterSatelliteLayout = x.MasterSatelliteLayout with { DefaultSatelliteOrientation = changed.MasterSatelliteLayout.DefaultSatelliteOrientation } },
+                nameof(MaxSatellites) => x with { MasterSatelliteLayout = x.MasterSatelliteLayout with { MaxSatellites = changed.MasterSatelliteLayout.MaxSatellites } },
+                nameof(OverflowPolicy) => x with { MasterSatelliteLayout = x.MasterSatelliteLayout with { OverflowPolicy = changed.MasterSatelliteLayout.OverflowPolicy } },
+                nameof(AlgorithmicLayoutDisplayScope) => x with { MasterSatelliteLayout = x.MasterSatelliteLayout with { DisplayScope = changed.MasterSatelliteLayout.DisplayScope } },
+                nameof(MaxAutoCreatedDesktops) => x with { MasterSatelliteLayout = x.MasterSatelliteLayout with { MaxAutoCreatedDesktops = changed.MasterSatelliteLayout.MaxAutoCreatedDesktops } },
+                nameof(FollowOverflowWindow) => x with { MasterSatelliteLayout = x.MasterSatelliteLayout with { FollowOverflowWindow = changed.MasterSatelliteLayout.FollowOverflowWindow } },
+                nameof(DelayReposition) => x with { DelayReposition = changed.DelayReposition },
+                nameof(AnimateWindowMovement) => x with { AnimateWindowMovement = changed.AnimateWindowMovement },
+                nameof(ModifierMoveWindow) => x with { ModifierMoveWindow = changed.ModifierMoveWindow },
+                nameof(ModifierMoveWindowAutoFocus) => x with { ModifierMoveWindowAutoFocus = changed.ModifierMoveWindowAutoFocus },
+                nameof(CustomAccentColor) => x with { CustomAccentColor = changed.CustomAccentColor },
+                nameof(OverrideAccentColor) => x with { OverrideAccentColor = changed.OverrideAccentColor },
+                nameof(Keybindings) => x with { Keybindings = changed.Keybindings },
+                nameof(WindowPadding) => x with { WindowPadding = changed.WindowPadding },
+                nameof(PanelHeight) => x with { PanelHeight = changed.PanelHeight },
+                nameof(PanelFontSize) => x with { PanelFontSize = changed.PanelFontSize },
+                nameof(ShowContextHints) => x with { ShowContextHints = changed.ShowContextHints },
+                nameof(ProcessIgnoreList) => x with { ProcessIgnoreList = changed.ProcessIgnoreList },
+                nameof(ClassIgnoreList) => x with { ClassIgnoreList = changed.ClassIgnoreList },
+                nameof(MultiMonitorSupport) => x with { MultiMonitorSupport = changed.MultiMonitorSupport },
+                nameof(SoundOnFailure) => x with { SoundOnFailure = changed.SoundOnFailure },
+                nameof(ShowFocus) => x with { ShowFocus = changed.ShowFocus },
+                nameof(ShowFocusDuringAction) => x with { ShowFocusDuringAction = changed.ShowFocusDuringAction },
+                // The UWQHD preset changes exactly these six fields in one transaction.
+                null => x with { MasterSatelliteLayout = x.MasterSatelliteLayout with
+                {
+                    MasterRatio = changed.MasterSatelliteLayout.MasterRatio,
+                    DefaultMasterSide = changed.MasterSatelliteLayout.DefaultMasterSide,
+                    DefaultSatelliteOrientation = changed.MasterSatelliteLayout.DefaultSatelliteOrientation,
+                    MaxSatellites = changed.MasterSatelliteLayout.MaxSatellites,
+                    OverflowPolicy = changed.MasterSatelliteLayout.OverflowPolicy,
+                    FollowOverflowWindow = changed.MasterSatelliteLayout.FollowOverflowWindow,
+                } },
+                _ => x,
             });
 
+            if (ReferenceEquals(saveTask, m_observedSave)) return;
+            m_observedSave = saveTask;
             _ = saveTask.ContinueWith(
                 task => m_logger.Error(task.Exception, "Failed to save settings"),
                 CancellationToken.None,

@@ -34,23 +34,28 @@ namespace FancyWM.ThemeEngine.Wpf
             }
         }
 
-        public IEnumerable<string> Keys => m_flattened.Keys;
+        public IEnumerable<string> Keys { get { lock (m_flattened) return m_flattened.Keys.ToArray(); } }
 
-        public IEnumerable<CssValue> Values => m_flattened.Values;
+        public IEnumerable<CssValue> Values { get { lock (m_flattened) return m_flattened.Values.ToArray(); } }
 
-        public int Count => m_flattened.Count;
+        public int Count { get { lock (m_flattened) return m_flattened.Count; } }
 
         public bool ContainsKey(string key)
         {
-            return m_flattened.ContainsKey(key);
+            lock (m_flattened) return m_flattened.ContainsKey(key);
         }
 
         public IEnumerator<KeyValuePair<string, CssValue>> GetEnumerator()
         {
-            return m_flattened.GetEnumerator();
+            lock (m_flattened) return ((IEnumerable<KeyValuePair<string, CssValue>>)m_flattened.ToArray()).GetEnumerator();
         }
 
         public bool TryGetValue(string key, [MaybeNullWhen(false)] out CssValue value)
+        {
+            lock (m_flattened) return TryGetValueCore(key, out value);
+        }
+
+        private bool TryGetValueCore(string key, [MaybeNullWhen(false)] out CssValue value)
         {
             if (!m_flattened.TryGetValue(key, out value))
             {

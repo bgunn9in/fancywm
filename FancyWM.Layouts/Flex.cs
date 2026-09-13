@@ -210,6 +210,22 @@ namespace FancyWM.Layouts
                 throw new UnsatisfiableFlexConstraintsException($"New width ({newWidth}) < MinWidth ({MinWidth})") { Container = this };
             }
 
+            if (newWidth == ContainerWidth)
+            {
+                bool unchanged = true;
+                foreach (var item in m_items)
+                {
+                    if (item.Width != Math.Clamp(item.Width, item.MinWidth, item.MaxWidth))
+                    {
+                        unchanged = false;
+                    }
+                }
+                if (unchanged)
+                {
+                    Validate();
+                    return;
+                }
+            }
             ResizeContainer(newWidth);
             Validate();
         }

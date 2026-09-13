@@ -95,7 +95,9 @@ namespace FancyWM.AlgorithmicLayouts
         {
             ArgumentNullException.ThrowIfNull(violations);
 
-            Violations = new ReadOnlyCollection<string>([.. violations]);
+            Violations = violations.GetType() == typeof(List<string>)
+                ? new ReadOnlyCollection<string>(((List<string>)violations).ToArray())
+                : new ReadOnlyCollection<string>([.. violations]);
             TreeDescription = treeDescription ?? string.Empty;
         }
 

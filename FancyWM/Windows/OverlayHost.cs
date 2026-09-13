@@ -1,5 +1,8 @@
 ﻿using System;
+using System.Collections.Generic;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -83,99 +86,274 @@ namespace FancyWM.Windows
         private readonly IntPtr m_nonHitTestableHwnd;
         private readonly LowLevelMouseHook? m_mshk;
         private bool m_isShown;
+        private bool m_closed;
+        private bool m_showing;
+        private long m_cursorGeneration;
+        private long m_activeCursorGeneration;
+        private readonly OverlayRefreshLoop m_refreshLoop;
+        private readonly (Action Invalidate, IDisposable Lifetime) m_cursorInput;
 
         public OverlayHost(IDisplay display)
         {
             m_display = display;
-
-            m_window = new OverlayWindow(display)
+            m_refreshLoop = new OverlayRefreshLoop(TryUpdatePositions, OverlayRefreshLoop.SubscribeTimer);
+            int subscriptionAttempts = 0;
+            try
             {
-                Title = "FancyWMInteractiveOverlay",
-            };
-            m_nonHitTestableWindow = new OverlayWindow(display)
-            {
-                IsHitTestVisible = false,
-                Title = "FancyWMNonInteractiveOverlay",
-            };
 
-            m_hwnd = new WindowInteropHelper(m_window).EnsureHandle();
-            m_nonHitTestableHwnd = new WindowInteropHelper(m_nonHitTestableWindow).EnsureHandle();
+                m_window = new OverlayWindow(display)
+                {
+                    Title = "FancyWMInteractiveOverlay",
+                };
+                m_nonHitTestableWindow = new OverlayWindow(display)
+                {
+                    IsHitTestVisible = false,
+                    Title = "FancyWMNonInteractiveOverlay",
+                };
 
-            // Set an owner relationship so that m_hwnd is always rendered on top of m_nonHitTestableHwnd.
-            _ = SetWindowLongPtr(new(m_hwnd), GetWindowLongPtr_nIndex.GWLP_HWNDPARENT, m_nonHitTestableHwnd);
+                m_hwnd = new WindowInteropHelper(m_window).EnsureHandle();
+                m_nonHitTestableHwnd = new WindowInteropHelper(m_nonHitTestableWindow).EnsureHandle();
 
-            _ = SetWindowLongPtr(new(m_hwnd), GetWindowLongPtr_nIndex.GWL_EXSTYLE,
-                (int)(WINDOWS_EX_STYLE.WS_EX_TOOLWINDOW | WINDOWS_EX_STYLE.WS_EX_NOACTIVATE));
-            _ = SetWindowLongPtr(new(m_nonHitTestableHwnd), GetWindowLongPtr_nIndex.GWL_EXSTYLE,
-                (int)(WINDOWS_EX_STYLE.WS_EX_TOOLWINDOW | WINDOWS_EX_STYLE.WS_EX_TRANSPARENT | WINDOWS_EX_STYLE.WS_EX_NOACTIVATE));
+                // Set an owner relationship so that m_hwnd is always rendered on top of m_nonHitTestableHwnd.
+                _ = SetWindowLongPtr(new(m_hwnd), GetWindowLongPtr_nIndex.GWLP_HWNDPARENT, m_nonHitTestableHwnd);
 
-            DisableWindow(m_hwnd);
-            DisableWindow(m_nonHitTestableHwnd);
-            UpdatePositions();
+                _ = SetWindowLongPtr(new(m_hwnd), GetWindowLongPtr_nIndex.GWL_EXSTYLE,
+                    (int)(WINDOWS_EX_STYLE.WS_EX_TOOLWINDOW | WINDOWS_EX_STYLE.WS_EX_NOACTIVATE));
+                _ = SetWindowLongPtr(new(m_nonHitTestableHwnd), GetWindowLongPtr_nIndex.GWL_EXSTYLE,
+                    (int)(WINDOWS_EX_STYLE.WS_EX_TOOLWINDOW | WINDOWS_EX_STYLE.WS_EX_TRANSPARENT | WINDOWS_EX_STYLE.WS_EX_NOACTIVATE));
 
-            display.Workspace.CursorLocationChanged += OnCursorLocationChanged;
-            display.Workspace.FocusedWindowChanged += OnFocusedWindowChanged;
-            display.Workspace.WindowAdded += OnWindowAdded;
-            display.Workspace.WindowRemoved += OnWindowRemoved;
+                DisableWindow(m_hwnd);
+                DisableWindow(m_nonHitTestableHwnd);
+                UpdatePositions();
 
-            if (App.Current.Services.GetService<LowLevelMouseHook>() is LowLevelMouseHook mshk)
-            {
-                m_mshk = mshk;
-                m_mshk.ButtonStateChanged += OnMouseButtonStateChanged;
+                m_cursorInput = CreateCursorInput(
+                    callback => Dispatcher.BeginInvoke(callback, System.Windows.Threading.DispatcherPriority.Background),
+                    () => Volatile.Read(ref m_activeCursorGeneration),
+                    () =>
+                    {
+                        var point = m_display.Workspace.CursorLocation;
+                        return new(point.X, point.Y);
+                    },
+                    point => m_window.PointFromScreen(point),
+                    point => VisualTreeHelper.HitTest(m_window, point) != null,
+                    () => PInvoke.GetWindowLong(new(m_hwnd), GetWindowLongPtr_nIndex.GWL_STYLE),
+                    value => _ = SetWindowLongPtr(new(m_hwnd), GetWindowLongPtr_nIndex.GWL_STYLE, value),
+                    exception => App.Current.Logger.Warning(exception, "Overlay cursor refresh failed"));
+
+                subscriptionAttempts |= 1;
+                display.Workspace.CursorLocationChanged += OnCursorLocationChanged;
+                subscriptionAttempts |= 2;
+                display.Workspace.FocusedWindowChanged += OnFocusedWindowChanged;
+                subscriptionAttempts |= 4;
+                display.Workspace.WindowAdded += OnWindowAdded;
+                subscriptionAttempts |= 8;
+                display.Workspace.WindowRemoved += OnWindowRemoved;
+
+                if (App.Current.Services.GetService<LowLevelMouseHook>() is LowLevelMouseHook mshk)
+                {
+                    m_mshk = mshk;
+                    m_mshk.ButtonStateChanged += OnMouseButtonStateChanged;
+                }
             }
+            catch (Exception error)
+            {
+                RollbackConstruction(error, subscriptionAttempts);
+                throw;
+            }
+        }
+
+        private void RollbackConstruction(Exception primary, int subscriptionAttempts)
+        {
+            // An event add can acquire its handler and then throw. Admit rollback
+            // before calling providers; preserve the constructor's original error.
+            m_closed = true;
+            m_cursorGeneration++;
+            Volatile.Write(ref m_activeCursorGeneration, 0);
+            List<Exception>? failures = null;
+            void release(Action action)
+            {
+                try { action(); }
+                catch (Exception error) { (failures ??= []).Add(error); }
+            }
+            release(() => m_cursorInput.Lifetime?.Dispose());
+            release(m_refreshLoop.Dispose);
+            if ((subscriptionAttempts & 1) != 0) release(() => m_display.Workspace.CursorLocationChanged -= OnCursorLocationChanged);
+            if ((subscriptionAttempts & 2) != 0) release(() => m_display.Workspace.FocusedWindowChanged -= OnFocusedWindowChanged);
+            if ((subscriptionAttempts & 4) != 0) release(() => m_display.Workspace.WindowAdded -= OnWindowAdded);
+            if ((subscriptionAttempts & 8) != 0) release(() => m_display.Workspace.WindowRemoved -= OnWindowRemoved);
+            if (m_mshk != null) release(() => m_mshk.ButtonStateChanged -= OnMouseButtonStateChanged);
+            // Destroying the native owner may synchronously destroy its owned
+            // surface first. Both must join rollback before either HWND closes.
+            m_window?.PrepareConstructionRollback(primary);
+            m_nonHitTestableWindow?.PrepareConstructionRollback(primary);
+            release(() => m_nonHitTestableWindow?.AbortConstruction(primary));
+            release(() => m_window?.AbortConstruction(primary));
+            if (failures != null) AttachLaterCloseFailures(primary, failures);
         }
 
         public void Show()
         {
-            m_nonHitTestableWindow.Show();
-            // Hit-testable window goes on top, because it after an interaction,
-            // it will be raised above the non-hit testable window anyway.
-            m_window.Show();
-            m_isShown = true;
-
-            async void UpdateLoop()
+            Dispatcher.VerifyAccess();
+            if (m_closed || m_isShown || m_showing) { return; }
+            long generation = ++m_cursorGeneration;
+            m_showing = true;
+            try
             {
-                while (m_isShown)
-                {
-                    UpdatePositions();
-                    await Task.Delay(1000);
-                }
+                m_nonHitTestableWindow.Show();
+                if (m_closed || generation != m_cursorGeneration) { return; }
+                // Hit-testable window goes on top, because it after an interaction,
+                // it will be raised above the non-hit testable window anyway.
+                m_window.Show();
+                if (m_closed || generation != m_cursorGeneration) { return; }
+                m_isShown = true;
+                Volatile.Write(ref m_activeCursorGeneration, generation);
+
+                TryUpdatePositions();
+                if (generation != Volatile.Read(ref m_activeCursorGeneration)) { return; }
+                m_refreshLoop.Start();
+                if (generation == Volatile.Read(ref m_activeCursorGeneration)) { m_cursorInput.Invalidate(); }
             }
-            UpdateLoop();
+            finally
+            {
+                if (generation == m_cursorGeneration) { m_showing = false; }
+            }
         }
 
         internal void Hide()
         {
+            Dispatcher.VerifyAccess();
+            if (m_closed) { return; }
+            long generation = ++m_cursorGeneration;
+            Volatile.Write(ref m_activeCursorGeneration, 0);
+            m_showing = false;
             m_isShown = false;
+            m_refreshLoop.Stop();
+            if (m_closed || generation != m_cursorGeneration) { return; }
             m_nonHitTestableWindow.Hide();
+            if (m_closed || generation != m_cursorGeneration) { return; }
             m_window.Hide();
         }
 
         public void Close()
         {
-            m_isShown = false;
-            AnchorSource = null;
-            m_display.Workspace.CursorLocationChanged -= OnCursorLocationChanged;
-            m_display.Workspace.FocusedWindowChanged -= OnFocusedWindowChanged;
-            m_display.Workspace.WindowAdded -= OnWindowAdded;
-            m_display.Workspace.WindowRemoved -= OnWindowRemoved;
-            if (m_mshk != null)
+            if (!Dispatcher.CheckAccess())
             {
-                m_mshk.ButtonStateChanged -= OnMouseButtonStateChanged;
+                Dispatcher.Invoke(Close);
+                return;
             }
-            Dispatcher.Invoke(() =>
+            CompleteClose(
+                ref m_closed,
+                () =>
+                {
+                    m_cursorGeneration++;
+                    Volatile.Write(ref m_activeCursorGeneration, 0);
+                    m_showing = false;
+                    m_isShown = false;
+                },
+                m_cursorInput.Lifetime.Dispose,
+                m_refreshLoop.Dispose,
+                () => AnchorSource = null,
+                release =>
+                {
+                    release(() => m_display.Workspace.CursorLocationChanged -= OnCursorLocationChanged);
+                    release(() => m_display.Workspace.FocusedWindowChanged -= OnFocusedWindowChanged);
+                    release(() => m_display.Workspace.WindowAdded -= OnWindowAdded);
+                    release(() => m_display.Workspace.WindowRemoved -= OnWindowRemoved);
+                    if (m_mshk != null)
+                    {
+                        release(() => m_mshk.ButtonStateChanged -= OnMouseButtonStateChanged);
+                    }
+                },
+                release => Dispatcher.Invoke(() =>
+                {
+                    release(() => m_nonHitTestableWindow.Visibility = Visibility.Collapsed);
+                    release(() => m_nonHitTestableWindow.AllowClose = true);
+                    release(m_nonHitTestableWindow.Close);
+                    release(() => m_window.Visibility = Visibility.Collapsed);
+                    release(() => m_window.AllowClose = true);
+                    release(m_window.Close);
+                }));
+        }
+
+        internal static void CompleteClose(
+            ref bool closed,
+            Action invalidateState,
+            Action disposeCursorInput,
+            Action disposeRefreshLoop,
+            Action clearAnchor,
+            Action<Action<Action>> releaseSubscriptions,
+            Action<Action<Action>> closeWindows)
+        {
+            if (closed) { return; }
+            closed = true;
+            ExceptionDispatchInfo? failure = null;
+            List<Exception>? laterFailures = null;
+            void release(Action action)
             {
-                m_nonHitTestableWindow.Visibility = Visibility.Collapsed;
-                m_nonHitTestableWindow.AllowClose = true;
-                m_nonHitTestableWindow.Close();
-                m_window.Visibility = Visibility.Collapsed;
-                m_window.AllowClose = true;
-                m_window.Close();
-            });
+                try
+                {
+                    action();
+                }
+                catch (Exception error)
+                {
+                    if (failure == null)
+                    {
+                        failure = ExceptionDispatchInfo.Capture(error);
+                    }
+                    else
+                    {
+                        (laterFailures ??= []).Add(error);
+                    }
+                }
+            }
+
+            release(invalidateState);
+            release(disposeCursorInput);
+            release(disposeRefreshLoop);
+            release(clearAnchor);
+            release(() => releaseSubscriptions(release));
+            release(() => closeWindows(release));
+
+            if (laterFailures != null)
+            {
+                AttachLaterCloseFailures(failure!.SourceException, laterFailures);
+            }
+            failure?.Throw();
+        }
+
+        private static void AttachLaterCloseFailures(Exception primary, List<Exception> laterFailures)
+        {
+            try
+            {
+                const string key = "OverlayHost.CloseExceptions";
+                if (primary.Data[key] is AggregateException existing)
+                {
+                    laterFailures.InsertRange(0, existing.InnerExceptions);
+                }
+                primary.Data[key] = new AggregateException(laterFailures);
+            }
+            catch
+            {
+                // Supplemental close diagnostics must never replace the first
+                // error from the ordered close sequence.
+            }
+        }
+
+        private void TryUpdatePositions()
+        {
+            try
+            {
+                UpdatePositions();
+            }
+            catch (Exception exception)
+            {
+                App.Current.Logger.Warning(exception, "Overlay position refresh failed");
+            }
         }
 
         public void UpdatePositions()
         {
+            if (m_closed) { return; }
             var anchor = AnchorSource != null
                 ? AnchorSource()
                 : new IntPtr(-1);
@@ -274,38 +452,9 @@ namespace FancyWM.Windows
             }
         }
 
-        private volatile bool m_isScheduled = false;
         private void OnCursorLocationChanged(object? sender, CursorLocationChangedEventArgs e)
         {
-            if (!m_isScheduled)
-            {
-                m_isScheduled = true;
-                Dispatcher.BeginInvoke(new Action(() =>
-                {
-                    m_isScheduled = false;
-                    var screenPoint = m_display.Workspace.CursorLocation;
-                    bool wasHit;
-                    try
-                    {
-                        var point = m_window.PointFromScreen(new(screenPoint.X, screenPoint.Y));
-                        wasHit = VisualTreeHelper.HitTest(m_window, point) != null;
-                    }
-                    catch (InvalidOperationException)
-                    {
-                        // This Visual is not connected to a PresentationSource.
-                        wasHit = false;
-                    }
-
-                    if (wasHit)
-                    {
-                        EnableWindow(m_hwnd);
-                    }
-                    else
-                    {
-                        DisableWindow(m_hwnd);
-                    }
-                }), System.Windows.Threading.DispatcherPriority.Background);
-            }
+            m_cursorInput.Invalidate();
         }
     }
 }

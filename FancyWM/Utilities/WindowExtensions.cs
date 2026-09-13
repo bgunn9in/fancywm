@@ -9,13 +9,10 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Windows.Interop;
 using WinMan.Windows;
-using System.IO;
-using System.Xml.Linq;
-using System.Threading;
 
 namespace FancyWM.Utilities
 {
-    internal static class WindowExtensions
+    internal static partial class WindowExtensions
     {
         private class ProcessInfo(int id, string name)
         {
@@ -24,7 +21,6 @@ namespace FancyWM.Utilities
         }
 
         private static readonly ConditionalWeakTable<IWindow, ProcessInfo> m_processCache = [];
-        private static readonly ConditionalWeakTable<IWindow, BitmapSource?> m_icons = [];
 
         [DllImport("User32", EntryPoint = "GetClassLongW", SetLastError = true)]
         [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
@@ -46,111 +42,19 @@ namespace FancyWM.Utilities
             }
         }
 
-        public static BitmapSource? GetCachedIcon(this IWindow window)
+        internal static BitmapSource ConvertBorrowedIcon(IntPtr iconHandle)
         {
-            BitmapSource? icon;
-            if (m_icons.TryGetValue(window, out icon!))
-            {
-                return icon;
-            }
-
-            try
-            {
-                icon = GetIcon(window);
-            }
-            catch
-            {
-                icon = null;
-            }
-
-            m_icons.AddOrUpdate(window, icon);
-            return icon;
+            using var icon = Icon.FromHandle(iconHandle);
+            using var bitmap = icon.ToBitmap();
+            return ConvertBitmap(bitmap, handle => Imaging.CreateBitmapSourceFromHBitmap(
+                handle, IntPtr.Zero, System.Windows.Int32Rect.Empty,
+                BitmapSizeOptions.FromEmptyOptions()));
         }
 
-        private static BitmapSource GetIcon(IWindow window)
+        internal static BitmapSource ConvertBitmap(Bitmap bitmap, Func<IntPtr, BitmapSource> convert)
         {
-            HWND hwnd = new(window.Handle);
-
-            if (window is Win32Window win32Window && win32Window.ClassName == "ApplicationFrameWindow")
-            {
-                if (TryLoadModernAppShellIcon(window) is BitmapSource bitmap)
-                {
-                    return bitmap;
-                }
-            }
-
-            IntPtr hIcon = GetClassLongPtr(hwnd, GetClassLong_nIndex.GCL_HICON);
-            if (hIcon == IntPtr.Zero)
-            {
-                hIcon = GetClassLongPtr(hwnd, GetClassLong_nIndex.GCL_HICONSM);
-                if (hIcon == IntPtr.Zero && window.GetProcess().MainModule is ProcessModule pm && pm.FileName is string fileName)
-                {
-                    return LoadShellIcon(fileName);
-                }
-            }
-
-            try
-            {
-                using Bitmap bmp = Icon.FromHandle(hIcon).ToBitmap();
-                return Imaging.CreateBitmapSourceFromHBitmap(
-                   bmp.GetHbitmap(), IntPtr.Zero, System.Windows.Int32Rect.Empty,
-                   BitmapSizeOptions.FromEmptyOptions());
-            }
-            finally
-            {
-                PInvoke.DestroyIcon(new(hIcon));
-            }
-        }
-
-        private static BitmapImage? TryLoadModernAppShellIcon(IWindow window)
-        {
-            HWND hwndChild = PInvoke.FindWindowEx(new(window.Handle), new HWND(), "Windows.UI.Core.CoreWindow", null);
-            for (int i = 0; i < 3; i++)
-            {
-                if (hwndChild.Value != IntPtr.Zero)
-                {
-                    break;
-                }
-                // Sleep for 30ms, 300ms, 3000ms
-                Thread.Sleep(3 * (int)Math.Pow(10, (i + 1)));
-                hwndChild = PInvoke.FindWindowEx(new(window.Handle), new HWND(), "Windows.UI.Core.CoreWindow", null);
-            }
-            if (hwndChild.Value == IntPtr.Zero)
-            {
-                return null;
-            }
-
-            var process = window.Workspace.UnsafeCreateFromHandle(hwndChild.Value).GetProcess();
-            if (process.MainModule == null)
-            {
-                return null;
-            }
-
-            var processPath = process.MainModule.FileName;
-            var directory = Path.GetDirectoryName(processPath)!;
-            var manifestPath = Path.Combine(directory, "AppxManifest.xml");
-            if (!File.Exists(manifestPath))
-            {
-                return null;
-            }
-
-            using var fs = File.OpenRead(manifestPath);
-            var manifest = XDocument.Load(fs);
-
-            const string ns = "http://schemas.microsoft.com/appx/manifest/foundation/windows10";
-            string? logoName = manifest?.Root?.Element(XName.Get("Properties", ns))?.Element(XName.Get("Logo", ns))?.Value;
-            if (logoName == null)
-            {
-                return null;
-            }
-
-            string[] matchingFiles = Directory.GetFiles(directory, Path.GetFileNameWithoutExtension(logoName) + "*" + Path.GetExtension(logoName), SearchOption.AllDirectories);
-            if (matchingFiles.Length == 0)
-            {
-                return null;
-            }
-
-            return new BitmapImage(new Uri(matchingFiles[0]));
+            using var handle = new OwnedHBitmap(bitmap);
+            return convert(handle.DangerousGetHandle());
         }
 
         private static BitmapSource LoadShellIcon(string fileName)
@@ -162,10 +66,7 @@ namespace FancyWM.Utilities
             }
             try
             {
-                using Bitmap bmp = Icon.FromHandle(shinfo.hIcon).ToBitmap();
-                return Imaging.CreateBitmapSourceFromHBitmap(
-                   bmp.GetHbitmap(), IntPtr.Zero, System.Windows.Int32Rect.Empty,
-                   BitmapSizeOptions.FromEmptyOptions());
+                return ConvertBorrowedIcon(shinfo.hIcon);
             }
             finally
             {

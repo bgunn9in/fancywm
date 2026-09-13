@@ -43,28 +43,37 @@ namespace FancyWM.Controls
         private void TextBox_LostFocus(object sender, RoutedEventArgs e)
         {
             var text = ((TextBox)sender).Text;
-            var presenter = ((DependencyObject)sender).FindParent<ContentPresenter>()!;
-            var parent = presenter.FindParent<DependencyObject>();
-            if (parent == null)
+            var presenter = ((DependencyObject)sender).FindParent<ContentPresenter>();
+            if (presenter == null || !ReferenceEquals(presenter.FindParent<DependencyObject>(), ItemsBox))
             {
                 return;
             }
 
-            var index = parent.IndexOf(presenter);
-            ItemsSource = ItemsSource.Take(index).Append(text).Concat(ItemsSource.Skip(index + 1)).ToArray();
+            var index = ItemsBox.Children.IndexOf(presenter);
+            var items = ItemsSource;
+            if (items == null || index < 0 || index >= items.Count
+                || string.Equals(items[index], text, StringComparison.Ordinal))
+            {
+                return;
+            }
+            ItemsSource = items.Take(index).Append(text).Concat(items.Skip(index + 1)).ToArray();
         }
 
         private void Button_Click(object sender, RoutedEventArgs e)
         {
-            var presenter = ((DependencyObject)sender).FindParent<ContentPresenter>()!;
-            var parent = presenter.FindParent<DependencyObject>();
-            if (parent == null)
+            var presenter = ((DependencyObject)sender).FindParent<ContentPresenter>();
+            if (presenter == null || !ReferenceEquals(presenter.FindParent<DependencyObject>(), ItemsBox))
             {
                 return;
             }
 
-            var index = parent.IndexOf(presenter);
-            ItemsSource = ItemsSource.Take(index).Concat(ItemsSource.Skip(index + 1)).ToArray();
+            var index = ItemsBox.Children.IndexOf(presenter);
+            var items = ItemsSource;
+            if (items == null || index < 0 || index >= items.Count)
+            {
+                return;
+            }
+            ItemsSource = items.Take(index).Concat(items.Skip(index + 1)).ToArray();
         }
 
         protected override void OnPropertyChanged(DependencyPropertyChangedEventArgs e)

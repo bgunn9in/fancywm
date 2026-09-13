@@ -1,5 +1,6 @@
 ﻿using System.Windows;
 
+using System.Windows.Threading;
 using AngleSharp.Css.Dom;
 
 using FancyWM.ThemeEngine.Wpf.Converters;
@@ -23,7 +24,13 @@ namespace FancyWM.ThemeEngine.Wpf
 
         public object? As(Type outType)
         {
-            if (m_cache.TryGetValue(outType, out var converted))
+            lock (m_cache) return ConvertCore(outType);
+        }
+
+        private object? ConvertCore(Type outType)
+        {
+            if (m_cache.TryGetValue(outType, out var converted)
+                && (converted is not DispatcherObject dispatcherObject || dispatcherObject.CheckAccess()))
             {
                 return converted;
             }
@@ -32,7 +39,10 @@ namespace FancyWM.ThemeEngine.Wpf
             {
                 freezable.FreezeIfPossible();
             }
-            m_cache.Add(outType, newConverted);
+            // Frozen values can be shared. An asynchronously loading image may
+            // still belong to its creating Dispatcher; replace the bounded slot
+            // with an owner-local conversion instead of returning that object.
+            m_cache[outType] = newConverted;
             return newConverted;
         }
     }

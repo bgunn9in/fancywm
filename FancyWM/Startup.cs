@@ -162,7 +162,7 @@ Type 'FancyWM --help' from anywhere after installation.
 
             ProgramExit += OnProgramExit;
 
-            var provider = serviceCollection.BuildServiceProvider();
+            using var provider = serviceCollection.BuildServiceProvider();
 
             // Create logger
             var logger = provider.GetRequiredService<ILogger>();

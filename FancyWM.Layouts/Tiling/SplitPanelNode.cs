@@ -114,25 +114,61 @@ namespace FancyWM.Layouts.Tiling
             int height = 0;
             if (Orientation == PanelOrientation.Horizontal)
             {
-                foreach (var child in Children)
+                var children = Children;
+                if (ReferenceEquals(children, m_children))
                 {
-                    child.Measure();
-                    var childRect = child.MinSize;
-                    width += childRect.X;
-                    height = Math.Max(height, childRect.Y);
+                    foreach (var child in m_children)
+                    {
+                        child.Measure();
+                        var childRect = child.MinSize;
+                        width += childRect.X;
+                        height = Math.Max(height, childRect.Y);
+                    }
+                }
+                else
+                {
+                    foreach (var child in children)
+                    {
+                        child.Measure();
+                        var childRect = child.MinSize;
+                        width += childRect.X;
+                        height = Math.Max(height, childRect.Y);
+                    }
                 }
             }
             else
             {
-                foreach (var child in Children)
+                var children = Children;
+                if (ReferenceEquals(children, m_children))
                 {
-                    child.Measure();
-                    var childRect = child.MinSize;
-                    height += childRect.Y;
-                    width = Math.Max(width, childRect.X);
+                    foreach (var child in m_children)
+                    {
+                        child.Measure();
+                        var childRect = child.MinSize;
+                        height += childRect.Y;
+                        width = Math.Max(width, childRect.X);
+                    }
+                }
+                else
+                {
+                    foreach (var child in children)
+                    {
+                        child.Measure();
+                        var childRect = child.MinSize;
+                        height += childRect.Y;
+                        width = Math.Max(width, childRect.X);
+                    }
                 }
             }
-            var spacing = (m_children.OfType<WindowNode>().Count() + 1) * Spacing / 2;
+            int windowCount = 0;
+            foreach (var child in m_children)
+            {
+                if (child is WindowNode)
+                {
+                    checked { windowCount++; }
+                }
+            }
+            var spacing = (windowCount + 1) * Spacing / 2;
             ContentMinSize = new Point(width + spacing + Padding.Left + Padding.Right, height + spacing + Padding.Top + Padding.Bottom);
             ContentMaxSize = new Point(short.MaxValue, short.MaxValue);
         }
@@ -149,9 +185,7 @@ namespace FancyWM.Layouts.Tiling
                 : rect.Height;
             m_constraints.SetContainerWidth(containerWidth);
 
-            var newConstraints = m_constraints
-                .Select(x => (x.MinWidth, x.MaxWidth))
-                .ToArray();
+            (double MinWidth, double MaxWidth)[]? newConstraints = null;
             for (int i = 0; i < m_children.Count; i++)
             {
                 var minWidth = Orientation == PanelOrientation.Horizontal
@@ -168,6 +202,7 @@ namespace FancyWM.Layouts.Tiling
 
                 if (m_constraints[i].MaxWidth == 0)
                 {
+                    newConstraints ??= m_constraints.Select(item => (item.MinWidth, item.MaxWidth)).ToArray();
                     // Initialize
                     m_constraints.RemoveItem(i);
                     try
@@ -181,11 +216,20 @@ namespace FancyWM.Layouts.Tiling
                         throw;
                     }
                 }
-                newConstraints[i].MinWidth = minWidth;
-                newConstraints[i].MaxWidth = maxWidth;
+                if (m_constraints[i].MinWidth != minWidth || m_constraints[i].MaxWidth != maxWidth)
+                {
+                    newConstraints ??= m_constraints.Select(item => (item.MinWidth, item.MaxWidth)).ToArray();
+                }
+                if (newConstraints != null)
+                {
+                    newConstraints[i] = (minWidth, maxWidth);
+                }
             }
 
-            m_constraints.UpdateConstraints(newConstraints);
+            if (newConstraints != null)
+            {
+                m_constraints.UpdateConstraints(newConstraints);
+            }
 
             RectangleF lastRect = RectangleF.OffsetAndSize(rect.Left, rect.Top, 0, 0);
             for (int i = 0; i < m_children.Count; i++)

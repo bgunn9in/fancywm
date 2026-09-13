@@ -45,6 +45,10 @@ namespace FancyWM.Controls
 
         private void OnDataContextPropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
         {
+            if (e.PropertyName != nameof(TilingOverlayViewModel.OverlayVisibility))
+            {
+                return;
+            }
             Duration duration = new(TimeSpan.FromMilliseconds(200));
             var ease = new SineEase
             {

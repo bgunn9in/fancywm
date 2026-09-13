@@ -1,7 +1,7 @@
 ﻿using System;
-using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
 
 using FancyWM.DllImports;
 
@@ -26,70 +26,84 @@ namespace FancyWM.Utilities
 
         private readonly HOOKPROC m_hookProcDelegate;
         private readonly Thread m_hookThread;
+        private readonly HookRegistrationPolicy.ThreadLifetime m_lifetime;
         private HHOOK m_hHook;
-        private bool m_disposedValue = false;
-        private uint m_hookThreadId;
         private DateTime m_lastActiveTimestamp = DateTime.UtcNow;
 
+        internal Task Completion => m_lifetime.Completion;
+
+        internal Thread WorkerThread => m_hookThread;
+
         public LowLevelKeyboardHook()
+            : this(
+                static (owner, lifetime) => owner.HookThreadMessageLoop(lifetime),
+                static threadId => PInvoke.PostThreadMessage(
+                    threadId, Constants.WM_QUIT, new(0), new(0)))
+        {
+        }
+
+        internal LowLevelKeyboardHook(
+            Action<LowLevelKeyboardHook, HookRegistrationPolicy.ThreadLifetime> worker,
+            Func<uint, bool> postQuit,
+            Action<Thread>? startThread = null)
         {
             m_hookProcDelegate = HookProc;
-            m_hookThread = new Thread(HookThreadMessageLoop)
+            m_lifetime = new(postQuit);
+            m_hookThread = new Thread(() => RunWorker(worker))
             {
                 Name = "LowLevelKeyboardHookThread",
                 IsBackground = true,
             };
             m_hookThread.SetApartmentState(ApartmentState.STA);
-            m_hookThread.Start();
+            try
+            {
+                (startThread ?? (static thread => thread.Start()))(m_hookThread);
+            }
+            catch (Exception error)
+            {
+                m_lifetime.Complete(error);
+                GC.SuppressFinalize(this);
+                throw;
+            }
         }
 
-        private void HookThreadMessageLoop(object? obj)
+        private void RunWorker(
+            Action<LowLevelKeyboardHook, HookRegistrationPolicy.ThreadLifetime> worker)
+        {
+            Exception? failure = null;
+            try { worker(this, m_lifetime); }
+            catch (Exception error) { failure = error; }
+            finally { m_lifetime.Complete(failure); }
+        }
+
+        private void HookThreadMessageLoop(HookRegistrationPolicy.ThreadLifetime lifetime)
         {
             // Message queues are lazily created so we forcec the creation of one by asking for its status
             PInvoke.GetQueueStatus(GetQueueStatus_flags.QS_ALLEVENTS);
-            m_hookThreadId = PInvoke.GetCurrentThreadId();
+            if (!lifetime.PublishQueue(PInvoke.GetCurrentThreadId())) { return; }
+            if (lifetime.IsStopping) { return; }
             HINSTANCE hInstance = new(PInvoke.GetModuleHandle(new PCWSTR()));
-            m_hHook = PInvoke.SetWindowsHookEx(SetWindowsHookEx_idHook.WH_KEYBOARD_LL, m_hookProcDelegate, hInstance, 0);
-            if (m_hHook == IntPtr.Zero)
-            {
-                throw new Win32Exception("Failed to set global WH_KEYBOARD_LL!");
-            }
+            Func<DateTime> utcNow = static () => DateTime.UtcNow;
+            Func<HHOOK> install = () => PInvoke.SetWindowsHookEx(
+                SetWindowsHookEx_idHook.WH_KEYBOARD_LL, m_hookProcDelegate, hInstance, 0);
+            Func<HHOOK, bool> unhook = static hook => PInvoke.UnhookWindowsHookEx(hook);
 
-            nuint timerId = PInvoke.SetTimer(new HWND(), 0, 1000, null);
-            try
-            {
-                while (PInvoke.GetMessage(out MSG lpMsg, new(0), 0, 0))
-                {
-                    if (lpMsg.message == Constants.WM_TIMER)
-                    {
-                        if (DateTime.UtcNow - m_lastActiveTimestamp > RehookIdleInterval)
-                        {
-                            m_lastActiveTimestamp = DateTime.UtcNow;
-                            // Rehook if elapsed
-                            HHOOK oldHHook = m_hHook;
-                            m_hHook = PInvoke.SetWindowsHookEx(SetWindowsHookEx_idHook.WH_KEYBOARD_LL, m_hookProcDelegate, hInstance, 0);
-                            PInvoke.UnhookWindowsHookEx(oldHHook);
-                        }
-                    }
-                    else
-                    {
-                        PInvoke.DispatchMessage(in lpMsg);
-                    }
-                }
-            }
-            catch (ThreadInterruptedException)
-            {
-            }
-            finally
-            {
-                PInvoke.KillTimer(new HWND(), timerId);
-            }
-
-            if (!PInvoke.UnhookWindowsHookEx(m_hHook))
-            {
-                throw new Win32Exception("Failed to unset the global WH_KEYBOARD_LL!");
-            }
+            RunOwnedMessageLoop(ref m_hHook, install,
+                static () => PInvoke.SetTimer(new HWND(), 0, 1000, null),
+                (ref HHOOK current) => HookRegistrationPolicy.RunMessageLoop(ref current,
+                    lifetime, HookRegistrationPolicy.ReadNativeMessage,
+                    (ref HHOOK hook) => HookRegistrationPolicy.RefreshIfIdle(ref hook,
+                        ref m_lastActiveTimestamp, RehookIdleInterval, utcNow, install, unhook),
+                    static (in MSG message) => { _ = PInvoke.DispatchMessage(in message); }),
+                static timerId => PInvoke.KillTimer(new HWND(), timerId), unhook);
         }
+
+        internal static void RunOwnedMessageLoop(ref HHOOK current, Func<HHOOK> install,
+            Func<nuint> createTimer, HookRegistrationPolicy.MessageLoop runLoop,
+            Func<nuint, bool> killTimer, Func<HHOOK, bool> unhook)
+            => HookRegistrationPolicy.RunLoop(ref current, install, createTimer, runLoop,
+                killTimer, unhook, "Failed to set global WH_KEYBOARD_LL!",
+                "Failed to unset the global WH_KEYBOARD_LL!");
 
         private LRESULT HookProc(int code, WPARAM wParam, LPARAM lParam)
         {
@@ -102,9 +116,7 @@ namespace FancyWM.Utilities
                 KeyCode keyCode = (KeyCode)kbhs.vkCode;
                 bool isPressed = (kbhs.flags & LLKHF_UP) == 0;
                 var e = new KeyStateChangedEventArgs(keyCode, isPressed);
-                KeyStateChanged?.Invoke(this, ref e);
-
-                if (e.Handled)
+                if (DispatchKeyStateChanged(ref e))
                 {
                     return new(PInvoke.CallNextHookEx(new HHOOK(), code, wParam, lParam) | 1);
                 }
@@ -113,28 +125,32 @@ namespace FancyWM.Utilities
             return PInvoke.CallNextHookEx(new HHOOK(), code, wParam, lParam);
         }
 
+        internal bool DispatchKeyStateChanged(ref KeyStateChangedEventArgs e)
+        {
+            if (!m_lifetime.TryEnterCallback()) { return false; }
+            try
+            {
+                KeyStateChanged?.Invoke(this, ref e);
+                return e.Handled && !m_lifetime.IsStopping;
+            }
+            finally
+            {
+                m_lifetime.ExitCallback();
+            }
+        }
+
         private void Dispose(bool disposing)
         {
-            if (!m_disposedValue)
-            {
-                if (disposing)
-                {
-                    // dispose managed state (managed objects) if any
-                }
-
-                while (m_hookThreadId == 0)
-                    Thread.Yield();
-                PInvoke.PostThreadMessage(m_hookThreadId, Constants.WM_QUIT, new(0), new(0));
-                m_hookThread.Join(1000);
-
-                m_disposedValue = true;
-            }
+            if (disposing) { m_lifetime?.RequestStop(); }
+            else { m_lifetime?.RequestStopFromFinalizer(); }
         }
 
         ~LowLevelKeyboardHook()
         {
             Dispose(disposing: false);
         }
+
+        internal void RequestFinalizerStopForTest() => Dispose(disposing: false);
 
         public void Dispose()
         {

@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using System.Linq;
 using System.Windows.Threading;
 
@@ -13,6 +13,7 @@ using Serilog;
 using System.Threading.Tasks;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Threading;
 
 using FancyWM.AlgorithmicLayouts;
 
@@ -69,22 +70,20 @@ namespace FancyWM
 
         private bool m_delayReposition = false;
         private bool m_autoFloatNewWindows = false;
+        private int m_settingsRetryVersion;
+        private volatile bool m_retrySettingsApplication;
+        private long m_settingsRequestVersion;
+        private long m_settingsAppliedVersion;
 
         private void SetAutoCollapse(bool value)
         {
             m_backend.AutoCollapse = value;
         }
 
-        private void SetWindowPadding(int value)
-        {
-            m_windowPadding = value;
-            PropagatePaddingChange();
-        }
-
-        private void SetPanelHeight(int value)
+        private void SetPanelHeight(int value, bool preserveViewForPadding = false)
         {
             m_panelHeight = value;
-            PropagatePanelHeightChange();
+            PropagatePanelHeightChange(preserveViewForPadding);
         }
 
         private void SetShowFocus(bool value)
@@ -188,13 +187,18 @@ namespace FancyWM
 
         private bool m_active = false;
         private volatile bool m_disposed;
+        private TaskCompletionSource? m_shutdownPreparation;
         private bool m_dirty = true;
+        private readonly LayoutInvalidationQueue m_layoutInvalidations;
         private UserInteraction m_currentInteraction = UserInteraction.None;
         private IWindow? m_movingWindow;
         private PanelNode? m_movingPanelNode;
         private ITilingServiceIntent? m_pendingIntent;
         private readonly Counter m_frozen = new();
         private readonly Stopwatch m_sw = new();
+        private Func<TimeSpan> m_layoutElapsed;
+        private Func<TimeSpan, CancellationToken, Task> m_layoutDelay;
+        private readonly CancellationTokenSource m_layoutDelayCancellation = new();
 
         public TilingService(
             IWorkspace workspace,
@@ -228,7 +232,9 @@ namespace FancyWM
             Func<LayoutStateKey, MasterSatelliteCapacitySnapshot, long, bool>?
                 algorithmicCapacityPublisher = null,
             AlgorithmicWindowTransferEventTracker?
-                algorithmicWindowEventTracker = null)
+                algorithmicWindowEventTracker = null,
+            Func<TimeSpan>? layoutElapsed = null,
+            Func<TimeSpan, CancellationToken, Task>? layoutDelay = null)
         {
             ArgumentNullException.ThrowIfNull(logger);
             ArgumentNullException.ThrowIfNull(overlayFactory);
@@ -238,6 +244,21 @@ namespace FancyWM
             m_workspace = workspace;
             m_animationThread = animationThread;
             m_display = display;
+            m_layoutElapsed = layoutElapsed ?? (() => m_sw.Elapsed);
+            m_layoutDelay = layoutDelay ?? ((duration, cancellationToken) => Task.Delay(
+                TimeSpan.FromMilliseconds(Math.Max(1, Math.Ceiling(duration.TotalMilliseconds))),
+                cancellationToken));
+            m_layoutInvalidations = new LayoutInvalidationQueue(
+                callback => m_dispatcher.BeginInvoke(callback, DispatcherPriority.DataBind),
+                () => m_active && !m_disposed && !m_frozen.IsPositive(),
+                ApplyInvalidatedLayoutAsync,
+                exception => m_logger.Error(exception, "Scheduling a tiling layout update failed"));
+            m_subscriptions.Add(m_layoutInvalidations);
+            m_subscriptions.Add(Disposable.Create(() =>
+            {
+                m_layoutDelayCancellation.Cancel();
+                m_layoutDelayCancellation.Dispose();
+            }));
             m_masterSatellitePrimaryDisplay = display;
             m_algorithmicLayoutCoordinator = algorithmicLayoutCoordinator
                 ?? throw new ArgumentNullException(nameof(algorithmicLayoutCoordinator));
@@ -344,7 +365,22 @@ namespace FancyWM
                 PlacementFailed += OnPlacementFailed;
                 PendingIntentChanged += OnPendingIntentChanged;
 
-                m_subscriptions.Add(settings.Subscribe(OnSettingsChanged));
+                m_subscriptions.Add(settings
+                    .Select(x => (
+                        Settings: (
+                            x.AllocateNewPanelSpace,
+                            x.AnimateWindowMovement,
+                            x.AutoSplitCount,
+                            x.DelayReposition,
+                            x.AutoFloatNewWindows,
+                            x.WindowPadding,
+                            x.PanelHeight,
+                            x.ShowFocus,
+                            x.AutoCollapsePanels,
+                            x.MasterSatelliteLayout),
+                        RetryVersion: System.Threading.Volatile.Read(ref m_settingsRetryVersion)))
+                    .DistinctUntilChanged()
+                    .Subscribe(x => OnSettingsChanged(x.Settings)));
 
                 var currentDesktop = m_workspace.VirtualDesktopManager.CurrentDesktop;
                 OnCurrentDesktopChanged(this, new CurrentDesktopChangedEventArgs(currentDesktop, currentDesktop));
@@ -466,29 +502,74 @@ namespace FancyWM
             }
         }
 
-        private void OnSettingsChanged(ITilingServiceSettings x)
+        private void OnSettingsChanged((
+            bool AllocateNewPanelSpace,
+            bool AnimateWindowMovement,
+            int AutoSplitCount,
+            bool DelayReposition,
+            bool AutoFloatNewWindows,
+            int WindowPadding,
+            int PanelHeight,
+            bool ShowFocus,
+            bool AutoCollapsePanels,
+            MasterSatelliteLayoutSettings MasterSatelliteLayout) x)
         {
+            long requestVersion = System.Threading.Interlocked.Increment(ref m_settingsRequestVersion);
             void ApplySafely()
             {
-                if (m_disposed)
+                if (m_disposed || m_shutdownPreparation != null || requestVersion < m_settingsAppliedVersion)
                 {
                     return;
                 }
+                // A newer owner-thread publication can overtake queued worker
+                // callbacks. Preserve queue order without replaying older values.
+                m_settingsAppliedVersion = requestVersion;
                 try
                 {
+                    bool geometryChanged = m_retrySettingsApplication
+                        || m_windowPadding != x.WindowPadding
+                        || m_panelHeight != x.PanelHeight;
+                    bool masterSatelliteChanged = m_retrySettingsApplication
+                        || (m_deferredMasterSatelliteSettings
+                            ?? m_masterSatelliteLifecycle.SettingsSnapshot) != x.MasterSatelliteLayout;
                     m_allocateNewPanelSpace = x.AllocateNewPanelSpace;
                     m_animateWindowMovement = x.AnimateWindowMovement;
                     m_autoSplitCount = x.AutoSplitCount;
                     m_delayReposition = x.DelayReposition;
                     m_autoFloatNewWindows = x.AutoFloatNewWindows;
-                    SetWindowPadding(x.WindowPadding);
-                    SetPanelHeight(x.PanelHeight);
-                    SetShowFocus(x.ShowFocus);
-                    SetAutoCollapse(x.AutoCollapsePanels);
-                    OnMasterSatelliteSettingsChanged(x.MasterSatelliteLayout);
+                    if (geometryChanged)
+                    {
+                        bool paddingOnly = !m_retrySettingsApplication && m_panelHeight == x.PanelHeight;
+                        // Reuse settled overlay models only for a padding change.
+                        // Height changes and retries retain complete invalidation.
+                        m_windowPadding = x.WindowPadding;
+                        SetPanelHeight(x.PanelHeight, preserveViewForPadding: paddingOnly);
+                    }
+                    if (m_showFocus != x.ShowFocus)
+                    {
+                        if (geometryChanged) { m_showFocus = x.ShowFocus; }
+                        else { SetShowFocus(x.ShowFocus); }
+                    }
+                    if (m_backend.AutoCollapse != x.AutoCollapsePanels)
+                    {
+                        SetAutoCollapse(x.AutoCollapsePanels);
+                    }
+                    if (masterSatelliteChanged || geometryChanged)
+                    {
+                        OnMasterSatelliteSettingsChanged(x.MasterSatelliteLayout);
+                    }
+                    if (requestVersion == m_settingsAppliedVersion)
+                    {
+                        m_retrySettingsApplication = false;
+                    }
                 }
                 catch (Exception ex)
                 {
+                    // A failed application may have updated scalar fields before
+                    // propagation failed. Let a repeated publication retry the
+                    // complete value, without admitting every queued duplicate.
+                    m_retrySettingsApplication = true;
+                    System.Threading.Interlocked.Increment(ref m_settingsRetryVersion);
                     m_logger.Error(ex, "Applying tiling-service settings failed for display {Display}", m_display);
                 }
             }
@@ -507,6 +588,8 @@ namespace FancyWM
                 }
                 catch (Exception ex)
                 {
+                    m_retrySettingsApplication = true;
+                    System.Threading.Interlocked.Increment(ref m_settingsRetryVersion);
                     m_logger.Error(
                         ex,
                         "Queuing tiling-service settings failed for display {Display}",
@@ -515,8 +598,48 @@ namespace FancyWM
             }
         }
 
+        public Task PrepareForShutdownAsync()
+        {
+            m_dispatcher.VerifyAccess();
+            if (m_shutdownPreparation != null) { return m_shutdownPreparation.Task; }
+            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            m_shutdownPreparation = completion;
+            m_active = false;
+            m_dirty = false;
+            List<Exception> failures = [];
+            if (!m_disposed)
+            {
+                try { m_gui.Hide(); }
+                catch (Exception error) { failures.Add(error); }
+            }
+            try { m_layoutInvalidations.Dispose(); }
+            catch (Exception error) { failures.Add(error); }
+            if (!m_disposed)
+            {
+                try { m_layoutDelayCancellation.Cancel(); }
+                catch (Exception error) { failures.Add(error); }
+            }
+            _ = CompleteShutdownPreparationAsync(completion, failures);
+            return completion.Task;
+        }
+
+        private async Task CompleteShutdownPreparationAsync(TaskCompletionSource completion, List<Exception> failures)
+        {
+            // The queue owns the complete layout pipeline, including native
+            // Task.Run placement and its subsequent Dispatcher continuation.
+            try { await m_layoutInvalidations.Completion.ConfigureAwait(false); }
+            catch (Exception error) { failures.Add(error); }
+            if (failures.Count == 0) { completion.TrySetResult(); }
+            else
+            {
+                completion.TrySetException(new AggregateException("Tiling shutdown preparation failed!", failures));
+                _ = completion.Task.Exception;
+            }
+        }
+
         public void Start()
         {
+            if (m_disposed || m_shutdownPreparation != null) { return; }
             m_active = true;
             InvalidateLayout();
             m_gui.Show();
@@ -525,6 +648,7 @@ namespace FancyWM
         public void Stop()
         {
             m_active = false;
+            ClearMasterSatelliteDropPreviewCache();
             RestoreOriginalLayout();
             m_gui.Hide();
         }
@@ -677,18 +801,21 @@ namespace FancyWM
 
         public bool DiscoverWindows()
         {
+            if (m_disposed || m_shutdownPreparation != null) { return false; }
             if (!AutoRegisterWindows)
             {
                 return false;
             }
 
-            List<IWindow> windows;
+            IWindow[] windows;
             using (m_windowSetLock.EnterScope())
             {
                 windows = [.. m_windowSet];
             }
 
             bool anyChanges = false;
+            IReadOnlyList<IVirtualDesktop>? discoveryDesktops = null;
+            bool attemptedDesktopSnapshot = false;
             foreach (var window in windows)
             {
                 MasterSatelliteLocalMutationResult? algorithmicPlacement = null;
@@ -706,9 +833,23 @@ namespace FancyWM
                         continue;
                     }
 
+                    if (!attemptedDesktopSnapshot)
+                    {
+                        attemptedDesktopSnapshot = true;
+                        try
+                        {
+                            discoveryDesktops = m_workspace.VirtualDesktopManager.Desktops.ToArray();
+                        }
+                        catch (Exception exception)
+                        {
+                            m_logger.Debug(exception, "Could not snapshot desktops for discovery; retaining per-window retries");
+                        }
+                    }
+
                     bool hasActualDesktop = TryFindMasterSatelliteWindowDesktop(
                         window,
-                        out var actualDesktop);
+                        out var actualDesktop,
+                        discoveryDesktops);
                     bool hasStableHandle = TryRememberMasterSatelliteWindowHandle(
                         window,
                         out var stableWindowHandle);
@@ -779,7 +920,10 @@ namespace FancyWM
                         {
                             if (!m_backend.HasWindow(window))
                             {
-                                m_logger.Debug("Discovered window {Window}", window.DebugString());
+                                if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+                                {
+                                    m_logger.Debug("Discovered window {Window}", window.DebugString());
+                                }
                                 algorithmicPlacement = PlaceMasterSatelliteWindowLocked(
                                     window,
                                     out algorithmicLayoutMatched,
@@ -908,7 +1052,8 @@ namespace FancyWM
 
         public void Refresh()
         {
-            List<IWindow> windows;
+            if (m_disposed || m_shutdownPreparation != null) { return; }
+            IWindow[] windows;
             using (m_windowSetLock.EnterScope())
             {
                 windows = [.. m_windowSet];
@@ -1144,40 +1289,55 @@ namespace FancyWM
 
         public async void ToggleDesktop()
         {
-            if (m_active)
+            if (m_disposed || m_shutdownPreparation != null) { return; }
+            var cancellation = m_layoutDelayCancellation.Token;
+            try
             {
-                Stop();
-                await Task.Delay(50);
-                foreach (var window in m_workspace.GetCurrentDesktopSnapshot())
+                if (m_active)
                 {
-                    try
+                    Stop();
+                    await m_layoutDelay(TimeSpan.FromMilliseconds(50), cancellation);
+                    cancellation.ThrowIfCancellationRequested();
+                    if (m_disposed || m_shutdownPreparation != null) { return; }
+                    foreach (var window in m_workspace.GetCurrentDesktopSnapshot())
                     {
-                        if (window.CanMinimize)
-                            window.SetState(WindowState.Minimized);
+                        if (m_disposed || m_shutdownPreparation != null) { return; }
+                        try
+                        {
+                            if (window.CanMinimize)
+                                window.SetState(WindowState.Minimized);
+                        }
+                        catch (Exception e) when (e is Win32Exception || e is InvalidWindowReferenceException)
+                        {
+                            // Ignore
+                        }
                     }
-                    catch (Exception e) when (e is Win32Exception || e is InvalidWindowReferenceException)
+                }
+                else
+                {
+                    foreach (var window in m_workspace.GetCurrentDesktopSnapshot())
                     {
-                        // Ignore
+                        if (m_disposed || m_shutdownPreparation != null) { return; }
+                        try
+                        {
+                            if (window.CanMinimize)
+                                window.SetState(WindowState.Restored);
+                        }
+                        catch (Exception e) when (e is Win32Exception || e is InvalidWindowReferenceException)
+                        {
+                            // Ignore
+                        }
                     }
+                    await m_layoutDelay(TimeSpan.FromMilliseconds(50), cancellation);
+                    cancellation.ThrowIfCancellationRequested();
+                    if (m_disposed || m_shutdownPreparation != null) { return; }
+                    Start();
+                    Refresh();
                 }
             }
-            else
+            catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
             {
-                foreach (var window in m_workspace.GetCurrentDesktopSnapshot())
-                {
-                    try
-                    {
-                        if (window.CanMinimize)
-                            window.SetState(WindowState.Restored);
-                    }
-                    catch (Exception e) when (e is Win32Exception || e is InvalidWindowReferenceException)
-                    {
-                        // Ignore
-                    }
-                }
-                await Task.Delay(50);
-                Start();
-                Refresh();
+                // The shutdown owner cancelled the pending desktop toggle.
             }
         }
 

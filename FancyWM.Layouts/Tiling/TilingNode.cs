@@ -196,7 +196,7 @@ namespace FancyWM.Layouts.Tiling
                 throw new InvalidOperationException();
             }
             var originalParent = Parent;
-            var originalIndex = originalParent.Children.TakeWhile(x => x != this).Count();
+            var originalIndex = originalParent.IndexOf(this);
             originalParent.ReplaceReference(originalIndex, panel);
             panel.Attach(this);
         }

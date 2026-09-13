@@ -62,6 +62,9 @@ jobs:
           fetch-depth: 0
           submodules: true
 
+      - name: Apply pinned dependency patches
+        run: ./scripts/performance/Apply-DependencyPatches.ps1 -Mode Apply
+
       - name: Use Nerdbank.GitVersioning to set version variables
         uses: dotnet/nbgv@master
         id: nbgv

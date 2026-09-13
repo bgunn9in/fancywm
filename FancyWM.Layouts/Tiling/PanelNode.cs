@@ -32,7 +32,43 @@ namespace FancyWM.Layouts.Tiling
 
         public int IndexOf(TilingNode node)
         {
-            return Children.TakeWhile(x => x != node).Count();
+            var children = Children;
+            ArgumentNullException.ThrowIfNull(children, "source");
+            if (children.GetType() == typeof(List<TilingNode>))
+            {
+                return IndexOfExactList((List<TilingNode>)children, node);
+            }
+            return IndexOfEnumerable(children, node);
+
+            static int IndexOfExactList(List<TilingNode> children, TilingNode node)
+            {
+                int index = 0;
+                foreach (var child in children)
+                {
+                    if (child != node)
+                    {
+                        checked { index++; }
+                        continue;
+                    }
+                    return index;
+                }
+                return index;
+            }
+
+            static int IndexOfEnumerable(IReadOnlyList<TilingNode> children, TilingNode node)
+            {
+                int index = 0;
+                foreach (var child in children)
+                {
+                    if (child != node)
+                    {
+                        checked { index++; }
+                        continue;
+                    }
+                    return index;
+                }
+                return index;
+            }
         }
 
         internal abstract void SetReference(int index, TilingNode node);
@@ -145,7 +181,53 @@ namespace FancyWM.Layouts.Tiling
 
         public void RemovePlaceholders()
         {
-            foreach (var child in Children.OfType<PlaceholderNode>().ToList())
+            var children = Children;
+            if (children?.GetType() == typeof(List<TilingNode>))
+            {
+                RemovePlaceholdersFromExactList((List<TilingNode>)children);
+                return;
+            }
+            RemovePlaceholdersFromEnumerable(children);
+        }
+
+        private void RemovePlaceholdersFromExactList(List<TilingNode> children)
+        {
+            PlaceholderNode? first = null;
+            List<PlaceholderNode>? remaining = null;
+            foreach (var child in children)
+            {
+                if (child is not PlaceholderNode placeholder)
+                {
+                    continue;
+                }
+                if (first == null)
+                {
+                    first = placeholder;
+                }
+                else
+                {
+                    (remaining ??= []).Add(placeholder);
+                }
+            }
+            if (first == null)
+            {
+                return;
+            }
+
+            Detach(first);
+            if (remaining == null)
+            {
+                return;
+            }
+            foreach (var child in remaining)
+            {
+                Detach(child);
+            }
+        }
+
+        private void RemovePlaceholdersFromEnumerable(IReadOnlyList<TilingNode>? children)
+        {
+            foreach (var child in children!.OfType<PlaceholderNode>().ToList())
             {
                 Detach(child);
             }

@@ -39,6 +39,8 @@ namespace FancyWM
             m_masterSatelliteDestinationRestorePoints = [];
         private readonly Dictionary<IntPtr, MasterSatelliteIncomingOwnershipProbe>
             m_masterSatelliteIncomingOwnershipProbes = [];
+        private readonly Dictionary<IntPtr, MasterSatellitePostMoveOwnershipProbe>
+            m_masterSatellitePostMoveOwnershipProbes = [];
         private readonly ConditionalWeakTable<IWindow, RetiredWindowGenerationMarker>
             m_retiredMasterSatelliteWindowGenerations = new();
         private readonly Func<LayoutStateKey, MasterSatelliteCapacitySnapshot, long, bool>
@@ -68,6 +70,7 @@ namespace FancyWM
 
         private bool DeferToTilingDispatcher(Action action, string operation)
         {
+            if (m_disposed || m_shutdownPreparation != null) { return true; }
             if (m_dispatcher.CheckAccess())
             {
                 return false;
@@ -83,11 +86,12 @@ namespace FancyWM
         {
             ArgumentNullException.ThrowIfNull(action);
             ArgumentException.ThrowIfNullOrWhiteSpace(operation);
+            if (m_disposed || m_shutdownPreparation != null) { return; }
             try
             {
                 m_dispatcher.BeginInvoke(() =>
                 {
-                    if (m_disposed)
+                    if (m_disposed || m_shutdownPreparation != null)
                     {
                         return;
                     }
@@ -169,6 +173,10 @@ namespace FancyWM
             m_retiredMasterSatelliteWindowGenerations.GetValue(
                 window,
                 static _ => new RetiredWindowGenerationMarker());
+            if (m_algorithmicWindowEvents.TryGetRememberedWindowHandle(window, out var handle))
+            {
+                CancelMasterSatellitePostMoveOwnershipProbe(handle, Guid.Empty, window);
+            }
         }
 
         private bool IsCurrentMasterSatelliteWindowGeneration(IWindow window)
@@ -235,6 +243,7 @@ namespace FancyWM
                 m_movingWindow = null;
                 m_currentInteraction = UserInteraction.None;
                 m_masterSatelliteDropPreviewWindows = EmptyWindowSet;
+                ClearMasterSatelliteDropPreviewCache();
             }
 
             MasterSatelliteLocalMutationResult? removal = null;
@@ -284,21 +293,25 @@ namespace FancyWM
             {
                 InvalidateLayout();
             }
-            m_logger.Debug(
-                "Reset Master + Satellites state for replacement window generation {Window}; previousWindow={PreviousWindow}, windowHandle={WindowHandle}",
-                window.DebugString(),
-                previousWindowGeneration.DebugString(),
-                windowHandle);
+            if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+            {
+                m_logger.Debug(
+                    "Reset Master + Satellites state for replacement window generation {Window}; previousWindow={PreviousWindow}, windowHandle={WindowHandle}",
+                    window.DebugString(),
+                    previousWindowGeneration.DebugString(),
+                    windowHandle);
+            }
         }
 
         private bool TryFindMasterSatelliteWindowDesktop(
             IWindow window,
-            out IVirtualDesktop desktop)
+            out IVirtualDesktop desktop,
+            IReadOnlyList<IVirtualDesktop>? desktopSnapshot = null)
         {
             IReadOnlyList<IVirtualDesktop> candidates;
             try
             {
-                candidates = m_workspace.VirtualDesktopManager.Desktops.ToArray();
+                candidates = desktopSnapshot ?? m_workspace.VirtualDesktopManager.Desktops.ToArray();
             }
             catch (Exception ex)
             {
@@ -639,6 +652,7 @@ namespace FancyWM
         private void OnMasterSatelliteSettingsChanged(MasterSatelliteLayoutSettings settings)
         {
             ArgumentNullException.ThrowIfNull(settings);
+            ClearMasterSatelliteDropPreviewCache();
             if (m_masterSatelliteCapacityTransitions.Count > 0
                 || m_capacityTransitionSourcePlans != null)
             {
@@ -1558,6 +1572,7 @@ namespace FancyWM
 
         private bool OnMasterSatelliteDesktopRemovedLocked(IVirtualDesktop desktop)
         {
+            m_masterSatelliteDrops.ClearPreviewCache();
             bool removed = m_masterSatelliteLifecycle.DesktopRemoved(desktop);
             m_algorithmicLayoutCoordinator.DesktopRemoved(desktop);
             return removed;
@@ -1568,6 +1583,7 @@ namespace FancyWM
             MasterSatelliteLifecycleResult? result = null;
             using (m_backendLock.EnterScope())
             {
+                m_masterSatelliteDrops.ClearPreviewCache();
                 if (m_masterSatelliteLifecycleReady && !m_masterSatelliteLifecycleDisposed)
                 {
                     bool capacityTransitionOwnsDesktop =
@@ -1637,13 +1653,25 @@ namespace FancyWM
         {
             using (m_backendLock.EnterScope())
             {
+                m_masterSatelliteDrops.ClearPreviewCache();
                 m_masterSatelliteLifecycleReady = false;
                 m_masterSatelliteLifecycleDisposed = true;
                 m_masterSatelliteLifecycle.Clear();
                 m_masterSatelliteCapacityTransitions.Clear();
                 m_masterSatelliteExistingWindowTransfers.Clear();
                 m_masterSatelliteDestinationRestorePoints.Clear();
+                var incomingProbes = m_masterSatelliteIncomingOwnershipProbes.Values.ToArray();
                 m_masterSatelliteIncomingOwnershipProbes.Clear();
+                foreach (var probe in incomingProbes)
+                {
+                    probe.Dispose();
+                }
+                var postMoveProbes = m_masterSatellitePostMoveOwnershipProbes.Values.ToArray();
+                m_masterSatellitePostMoveOwnershipProbes.Clear();
+                foreach (var probe in postMoveProbes)
+                {
+                    probe.Dispose();
+                }
                 m_retiredMasterSatelliteWindowGenerations.Clear();
                 m_capacityTransitionLifecycleResults = null;
                 m_capacityTransitionSettingsTransition = null;
@@ -1853,7 +1881,7 @@ namespace FancyWM
             // active canonical tree. Keep it untiled/floating until a later event
             // can identify its desktop safely outside m_backendLock.
             if (desktop == null
-                && m_masterSatelliteLifecycle.SnapshotStates().Count > 0)
+                && m_masterSatelliteLifecycle.StateCount > 0)
             {
                 activeLayoutMatched = true;
                 return new MasterSatelliteLocalMutationResult(
@@ -2054,11 +2082,14 @@ namespace FancyWM
                     // to establish floating state and publish one new event.
                     m_arrangeFailureNotifications.Forget(placedWindowHandle);
                 }
-                m_logger.Debug(
-                    "Placed window {Window} in Master + Satellites layout {LayoutKey} at revision {Revision}",
-                    window.DebugString(),
-                    result.LayoutKey,
-                    result.Operation?.After.Revision);
+                if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+                {
+                    m_logger.Debug(
+                        "Placed window {Window} in Master + Satellites layout {LayoutKey} at revision {Revision}",
+                        window.DebugString(),
+                        result.LayoutKey,
+                        result.Operation?.After.Revision);
+                }
                 InvalidateLayout();
                 return;
             }
@@ -2082,12 +2113,15 @@ namespace FancyWM
                 return;
             }
 
-            m_logger.Debug(
-                "Master + Satellites local placement rejected for window {Window}: {Reason} ({Message}); using floating fallback for policy {Policy}",
-                window.DebugString(),
-                result.Operation?.FailureReason,
-                result.Operation?.Message,
-                m_masterSatelliteLifecycle.SettingsSnapshot.OverflowPolicy);
+            if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+            {
+                m_logger.Debug(
+                    "Master + Satellites local placement rejected for window {Window}: {Reason} ({Message}); using floating fallback for policy {Policy}",
+                    window.DebugString(),
+                    result.Operation?.FailureReason,
+                    result.Operation?.Message,
+                    m_masterSatelliteLifecycle.SettingsSnapshot.OverflowPolicy);
+            }
             NotifyMasterSatellitePlacementFailedOnce(
                 window,
                 sourceLayoutKey: result.LayoutKey);
@@ -2116,14 +2150,21 @@ namespace FancyWM
                 return true;
             }
 
+            if (existingProbe != null)
+            {
+                RemoveMasterSatelliteIncomingOwnershipProbe(existingProbe);
+            }
             var probe = new MasterSatelliteIncomingOwnershipProbe(
                 window,
                 windowHandle);
             m_masterSatelliteIncomingOwnershipProbes[windowHandle] = probe;
 
-            m_logger.Debug(
-                "Deferring Master + Satellites placement for window {Window} until virtual-desktop ownership becomes observable",
-                window.DebugString());
+            if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+            {
+                m_logger.Debug(
+                    "Deferring Master + Satellites placement for window {Window} until virtual-desktop ownership becomes observable",
+                    window.DebugString());
+            }
             if (TryScheduleMasterSatelliteIncomingOwnershipProbe(
                     probe,
                     MasterSatelliteIncomingOwnershipProbeLimit))
@@ -2139,46 +2180,63 @@ namespace FancyWM
             MasterSatelliteIncomingOwnershipProbe probe,
             int remainingProbes)
         {
+            if (m_disposed || !IsCurrentMasterSatelliteIncomingOwnershipProbe(probe))
+            {
+                return false;
+            }
             try
             {
-                var timer = new DispatcherTimer(
-                    DispatcherPriority.Background,
-                    m_dispatcher)
+                if (probe.Timer == null)
                 {
-                    Interval = MasterSatelliteIncomingOwnershipProbeInterval,
-                };
-                EventHandler? tick = null;
-                tick = (_, _) =>
-                {
-                    timer.Stop();
-                    timer.Tick -= tick;
-                    try
+                    var timer = new DispatcherTimer(DispatcherPriority.Background, m_dispatcher)
                     {
-                        RetryMasterSatelliteIncomingOwnership(
-                            probe,
-                            remainingProbes);
-                    }
-                    catch (Exception ex)
+                        Interval = MasterSatelliteIncomingOwnershipProbeInterval,
+                    };
+                    probe.Timer = timer;
+                    probe.Tick = (_, _) =>
                     {
-                        if (!RemoveMasterSatelliteIncomingOwnershipProbe(probe))
+                        timer.Stop();
+                        try
                         {
-                            return;
+                            RetryMasterSatelliteIncomingOwnership(probe, probe.RemainingProbes);
                         }
-                        m_logger.Error(
-                            ex,
-                            "Deferred Master + Satellites ownership processing failed for window handle {WindowHandle}",
-                            probe.WindowHandle);
-                        NotifyMasterSatellitePlacementFailedOnce(
-                            probe.Window,
-                            stableWindowHandle: probe.WindowHandle);
+                        catch (Exception ex)
+                        {
+                            if (!RemoveMasterSatelliteIncomingOwnershipProbe(probe))
+                            {
+                                return;
+                            }
+                            m_logger.Error(
+                                ex,
+                                "Deferred Master + Satellites ownership processing failed for window handle {WindowHandle}",
+                                probe.WindowHandle);
+                            NotifyMasterSatellitePlacementFailedOnce(
+                                probe.Window,
+                                stableWindowHandle: probe.WindowHandle);
+                        }
+                    };
+                    timer.Tick += probe.Tick;
+                }
+                probe.RemainingProbes = remainingProbes;
+                var scheduledTimer = probe.Timer;
+                bool wasStarting = probe.Starting;
+                probe.Starting = true;
+                try { scheduledTimer.Start(); }
+                finally
+                {
+                    probe.Starting = wasStarting;
+                    // Only the outermost Start can finish cleanup after WPF's
+                    // operation assignment; nested starts must retain that scope.
+                    if (!wasStarting && !IsCurrentMasterSatelliteIncomingOwnershipProbe(probe))
+                    {
+                        scheduledTimer.Stop();
                     }
-                };
-                timer.Tick += tick;
-                timer.Start();
+                }
                 return true;
             }
             catch (Exception ex)
             {
+                probe.Dispose();
                 m_logger.Debug(
                     ex,
                     "Could not schedule a deferred virtual-desktop ownership probe for window handle {WindowHandle}",
@@ -2277,9 +2335,11 @@ namespace FancyWM
         private bool RemoveMasterSatelliteIncomingOwnershipProbe(
             MasterSatelliteIncomingOwnershipProbe probe)
         {
-            return IsCurrentMasterSatelliteIncomingOwnershipProbe(probe)
+            bool removed = IsCurrentMasterSatelliteIncomingOwnershipProbe(probe)
                 && m_masterSatelliteIncomingOwnershipProbes.Remove(
                     probe.WindowHandle);
+            probe.Dispose();
+            return removed;
         }
 
         private void CancelMasterSatelliteIncomingOwnershipProbe(
@@ -2291,7 +2351,7 @@ namespace FancyWM
                     out var probe)
                 && ReferenceEquals(probe.Window, window))
             {
-                m_masterSatelliteIncomingOwnershipProbes.Remove(windowHandle);
+                RemoveMasterSatelliteIncomingOwnershipProbe(probe);
             }
         }
 
@@ -2315,10 +2375,13 @@ namespace FancyWM
             }
             catch (Exception ex)
             {
-                m_logger.Debug(
-                    ex,
-                    "Master + Satellites overflow could not capture source geometry for window {Window}",
-                    window.DebugString());
+                if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+                {
+                    m_logger.Debug(
+                        ex,
+                        "Master + Satellites overflow could not capture source geometry for window {Window}",
+                        window.DebugString());
+                }
                 return false;
             }
 
@@ -2439,15 +2502,25 @@ namespace FancyWM
             PendingWindowTransfer transfer,
             int remainingDeferredProbes)
         {
-            if (!IsCurrentMasterSatelliteWindowGeneration(
+            if (m_disposed
+                || !IsCurrentMasterSatelliteWindowGeneration(
                     window,
                     stableWindowHandle))
             {
                 // A replacement wrapper may already own this numeric HWND. The
                 // reset/removal path terminalizes the old correlation; never ask
                 // COM about ownership through the retired wrapper.
+                CancelMasterSatellitePostMoveOwnershipProbe(stableWindowHandle, transfer.CorrelationId, window);
                 return;
             }
+            if (!m_algorithmicLayoutCoordinator.TryGetTransfer(transfer.CorrelationId, out var current)
+                || current.IsTerminal
+                || current.WindowHandle != stableWindowHandle)
+            {
+                CancelMasterSatellitePostMoveOwnershipProbe(stableWindowHandle, transfer.CorrelationId, window);
+                return;
+            }
+            transfer = current;
             bool isAlive;
             try
             {
@@ -2457,10 +2530,22 @@ namespace FancyWM
             {
                 isAlive = false;
             }
+            // Even a liveness property can reenter through a native event. Do
+            // not close or query an endpoint retired by that callback.
+            if (m_disposed
+                || !IsCurrentMasterSatelliteWindowGeneration(window, stableWindowHandle)
+                || !m_algorithmicLayoutCoordinator.TryGetTransfer(transfer.CorrelationId, out current)
+                || current.IsTerminal)
+            {
+                CancelMasterSatellitePostMoveOwnershipProbe(stableWindowHandle, transfer.CorrelationId, window);
+                return;
+            }
+            transfer = current;
             if (!isAlive)
             {
                 // Treat death as terminal before any HasWindow call can observe a
                 // new native window that reused the old numeric HWND.
+                CancelMasterSatellitePostMoveOwnershipProbe(stableWindowHandle, transfer.CorrelationId, window);
                 m_algorithmicLayoutCoordinator.WindowClosed(stableWindowHandle);
                 return;
             }
@@ -2496,11 +2581,15 @@ namespace FancyWM
             }
 
             if (!reconciliation.ShouldRetry
-                || transfer.IsTerminal
-                || m_disposed)
+                || m_disposed
+                || !IsCurrentMasterSatelliteWindowGeneration(window, stableWindowHandle)
+                || !m_algorithmicLayoutCoordinator.TryGetTransfer(transfer.CorrelationId, out current)
+                || current.IsTerminal)
             {
+                CancelMasterSatellitePostMoveOwnershipProbe(stableWindowHandle, transfer.CorrelationId, window);
                 return;
             }
+            transfer = current;
 
             if (remainingDeferredProbes <= 0
                 || DateTimeOffset.UtcNow >= transfer.Deadline)
@@ -2515,65 +2604,95 @@ namespace FancyWM
 
             try
             {
-                var timer = new DispatcherTimer(
-                    DispatcherPriority.Background,
-                    m_dispatcher)
+                if (m_masterSatellitePostMoveOwnershipProbes.TryGetValue(stableWindowHandle, out var probe)
+                    && (!ReferenceEquals(probe.Window, window)
+                        || probe.Transfer.CorrelationId != transfer.CorrelationId))
                 {
-                    // A dispatcher yield alone is shorter than the Windows VDM
-                    // COM propagation window on some builds. Use real elapsed
-                    // time while retaining a strict fixed probe budget.
-                    Interval = MasterSatelliteIncomingOwnershipProbeInterval,
-                };
-                EventHandler? tick = null;
-                tick = (_, _) =>
+                    RemoveMasterSatellitePostMoveOwnershipProbe(probe);
+                    probe = null;
+                }
+                if (probe == null)
                 {
-                    timer.Stop();
-                    timer.Tick -= tick;
-                    try
+                    probe = new MasterSatellitePostMoveOwnershipProbe(window, transfer, remainingDeferredProbes);
+                    m_masterSatellitePostMoveOwnershipProbes.Add(stableWindowHandle, probe);
+                    var timer = new DispatcherTimer(DispatcherPriority.Background, m_dispatcher)
                     {
-                        if (m_disposed
-                            || !m_algorithmicLayoutCoordinator.TryGetTransfer(
-                                transfer.CorrelationId,
-                                out var latest)
-                            || latest.IsTerminal)
+                        // Keep the original COM propagation delay and fixed probe
+                        // budget while retaining one timer for this correlation.
+                        Interval = MasterSatelliteIncomingOwnershipProbeInterval,
+                    };
+                    probe.Timer = timer;
+                    probe.Tick = (_, _) =>
+                    {
+                        timer.Stop();
+                        if (!IsCurrentMasterSatellitePostMoveOwnershipProbe(probe))
                         {
                             return;
                         }
-                        if (DateTimeOffset.UtcNow >= latest.Deadline)
+                        try
                         {
+                            if (m_disposed
+                                || !m_algorithmicLayoutCoordinator.TryGetTransfer(
+                                    probe.Transfer.CorrelationId,
+                                    out var latest)
+                                || latest.IsTerminal)
+                            {
+                                RemoveMasterSatellitePostMoveOwnershipProbe(probe);
+                                return;
+                            }
+                            if (DateTimeOffset.UtcNow >= latest.Deadline)
+                            {
+                                FailMasterSatellitePostMoveReconciliation(
+                                    window,
+                                    stableWindowHandle,
+                                    latest,
+                                    "PostMoveOwnershipDeadlineExpired");
+                            }
+                            else
+                            {
+                                ReconcileMasterSatelliteTransferAfterMove(
+                                    window,
+                                    stableWindowHandle,
+                                    latest,
+                                    probe.RemainingProbes - 1);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            RemoveMasterSatellitePostMoveOwnershipProbe(probe);
+                            m_logger.Error(
+                                ex,
+                                "Master + Satellites deferred post-move reconciliation failed; correlation={CorrelationId}",
+                                probe.Transfer.CorrelationId);
                             FailMasterSatellitePostMoveReconciliation(
                                 window,
                                 stableWindowHandle,
-                                latest,
-                                "PostMoveOwnershipDeadlineExpired");
+                                probe.Transfer,
+                                "PostMoveReconciliationThrew");
                         }
-                        else
-                        {
-                            ReconcileMasterSatelliteTransferAfterMove(
-                                window,
-                                stableWindowHandle,
-                                latest,
-                                remainingDeferredProbes - 1);
-                        }
-                    }
-                    catch (Exception ex)
+                    };
+                    timer.Tick += probe.Tick;
+                }
+                probe.RemainingProbes = Math.Min(probe.RemainingProbes, remainingDeferredProbes);
+                var scheduledTimer = probe.Timer!;
+                bool wasStarting = probe.Starting;
+                probe.Starting = true;
+                try { scheduledTimer.Start(); }
+                finally
+                {
+                    probe.Starting = wasStarting;
+                    // Stop must follow Start's operation assignment: a synchronous
+                    // Dispatcher hook can otherwise stop before WPF registers its
+                    // timer, leaving an orphaned disabled entry until the deadline.
+                    if (!wasStarting && !IsCurrentMasterSatellitePostMoveOwnershipProbe(probe))
                     {
-                        m_logger.Error(
-                            ex,
-                            "Master + Satellites deferred post-move reconciliation failed; correlation={CorrelationId}",
-                            transfer.CorrelationId);
-                        FailMasterSatellitePostMoveReconciliation(
-                            window,
-                            stableWindowHandle,
-                            transfer,
-                            "PostMoveReconciliationThrew");
+                        scheduledTimer.Stop();
                     }
-                };
-                timer.Tick += tick;
-                timer.Start();
+                }
             }
             catch (InvalidOperationException ex)
             {
+                CancelMasterSatellitePostMoveOwnershipProbe(stableWindowHandle, transfer.CorrelationId, window);
                 m_logger.Error(
                     ex,
                     "Master + Satellites could not queue deferred post-move reconciliation; correlation={CorrelationId}",
@@ -2592,6 +2711,7 @@ namespace FancyWM
             PendingWindowTransfer transfer,
             string reason)
         {
+            CancelMasterSatellitePostMoveOwnershipProbe(stableWindowHandle, transfer.CorrelationId, window);
             if (m_disposed
                 || transfer.IsTerminal
                 || !m_algorithmicLayoutCoordinator.Fail(
@@ -2608,6 +2728,31 @@ namespace FancyWM
                 window.DebugString(),
                 transfer.TargetDesktop,
                 reason);
+        }
+
+        private bool IsCurrentMasterSatellitePostMoveOwnershipProbe(MasterSatellitePostMoveOwnershipProbe probe)
+        {
+            return m_masterSatellitePostMoveOwnershipProbes.TryGetValue(probe.Transfer.WindowHandle, out var current)
+                && ReferenceEquals(current, probe);
+        }
+
+        private void RemoveMasterSatellitePostMoveOwnershipProbe(MasterSatellitePostMoveOwnershipProbe probe)
+        {
+            if (IsCurrentMasterSatellitePostMoveOwnershipProbe(probe))
+            {
+                m_masterSatellitePostMoveOwnershipProbes.Remove(probe.Transfer.WindowHandle);
+            }
+            probe.Dispose();
+        }
+
+        private void CancelMasterSatellitePostMoveOwnershipProbe(IntPtr windowHandle, Guid correlationId, IWindow? window = null)
+        {
+            if (m_masterSatellitePostMoveOwnershipProbes.TryGetValue(windowHandle, out var probe)
+                && (correlationId == Guid.Empty || probe.Transfer.CorrelationId == correlationId)
+                && (window == null || ReferenceEquals(probe.Window, window)))
+            {
+                RemoveMasterSatellitePostMoveOwnershipProbe(probe);
+            }
         }
 
         private AlgorithmicTransferStartResult? TryCreateDesktopAndStartOverflow(
@@ -3272,14 +3417,17 @@ namespace FancyWM
             if (arrival.Disposition
                 == AlgorithmicTransferArrivalDisposition.AwaitingPrecedingSlot)
             {
-                m_logger.Debug(
-                    "Master + Satellites destination arrival is waiting for a preceding reserved slot; correlation={CorrelationId}, window={Window}, target={TargetDesktop}, display={Display}, role={Role}, satelliteIndex={SatelliteIndex}",
-                    arrival.Transfer?.CorrelationId,
-                    window.DebugString(),
-                    actualDesktop,
-                    m_display,
-                    arrival.Transfer?.TargetRole,
-                    arrival.Transfer?.TargetSatelliteIndex);
+                if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+                {
+                    m_logger.Debug(
+                        "Master + Satellites destination arrival is waiting for a preceding reserved slot; correlation={CorrelationId}, window={Window}, target={TargetDesktop}, display={Display}, role={Role}, satelliteIndex={SatelliteIndex}",
+                        arrival.Transfer?.CorrelationId,
+                        window.DebugString(),
+                        actualDesktop,
+                        m_display,
+                        arrival.Transfer?.TargetRole,
+                        arrival.Transfer?.TargetSatelliteIndex);
+                }
                 return new MasterSatelliteDestinationAddDecision(
                     true,
                     true,
@@ -3639,6 +3787,7 @@ namespace FancyWM
         private void OnAlgorithmicTransferTerminated(
             PendingWindowTransfer transfer)
         {
+            CancelMasterSatellitePostMoveOwnershipProbe(transfer.WindowHandle, transfer.CorrelationId);
             if (m_disposed
                 || transfer.State == PendingWindowTransferState.Committed
                 || (!MasterSatelliteDisplayEligibility.DisplaysMatch(
@@ -3873,18 +4022,24 @@ namespace FancyWM
             }
             if (result.Succeeded)
             {
-                m_logger.Debug(
-                    "Removed window {Window} from Master + Satellites layout {LayoutKey} at revision {Revision}",
-                    window.DebugString(),
-                    result.LayoutKey,
-                    result.Operation?.After.Revision);
+                if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+                {
+                    m_logger.Debug(
+                        "Removed window {Window} from Master + Satellites layout {LayoutKey} at revision {Revision}",
+                        window.DebugString(),
+                        result.LayoutKey,
+                        result.Operation?.After.Revision);
+                }
                 return;
             }
-            m_logger.Debug(
-                "Master + Satellites removal rejected for window {Window}: {Reason} ({Message})",
-                window.DebugString(),
-                result.Operation?.FailureReason,
-                result.Operation?.Message);
+            if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+            {
+                m_logger.Debug(
+                    "Master + Satellites removal rejected for window {Window}: {Reason} ({Message})",
+                    window.DebugString(),
+                    result.Operation?.FailureReason,
+                    result.Operation?.Message);
+            }
         }
 
         private void LogMasterSatelliteLifecycleResults(
@@ -4059,11 +4214,19 @@ namespace FancyWM
             }
         }
 
-        private sealed class MasterSatelliteIncomingOwnershipProbe
+        private sealed class MasterSatelliteIncomingOwnershipProbe : IDisposable
         {
             public IWindow Window { get; }
 
             public IntPtr WindowHandle { get; }
+
+            public DispatcherTimer? Timer { get; set; }
+
+            public EventHandler? Tick { get; set; }
+
+            public int RemainingProbes { get; set; }
+
+            public bool Starting { get; set; }
 
             public MasterSatelliteIncomingOwnershipProbe(
                 IWindow window,
@@ -4071,6 +4234,50 @@ namespace FancyWM
             {
                 Window = window;
                 WindowHandle = windowHandle;
+            }
+
+            public void Dispose()
+            {
+                var timer = Timer;
+                var tick = Tick;
+                Timer = null;
+                Tick = null;
+                if (timer != null)
+                {
+                    try { if (!Starting) { timer.Stop(); } }
+                    finally { timer.Tick -= tick; }
+                }
+            }
+        }
+
+        private sealed class MasterSatellitePostMoveOwnershipProbe(
+            IWindow window,
+            PendingWindowTransfer transfer,
+            int remainingProbes) : IDisposable
+        {
+            public IWindow Window { get; } = window;
+
+            public PendingWindowTransfer Transfer { get; } = transfer;
+
+            public int RemainingProbes { get; set; } = remainingProbes;
+
+            public bool Starting { get; set; }
+
+            public DispatcherTimer? Timer { get; set; }
+
+            public EventHandler? Tick { get; set; }
+
+            public void Dispose()
+            {
+                var timer = Timer;
+                var tick = Tick;
+                Timer = null;
+                Tick = null;
+                if (timer != null)
+                {
+                    try { if (!Starting) { timer.Stop(); } }
+                    finally { timer.Tick -= tick; }
+                }
             }
         }
 

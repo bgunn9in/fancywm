@@ -1,5 +1,4 @@
 ﻿using System.Collections.Generic;
-using System.Linq;
 using System.Threading.Tasks;
 
 namespace FancyWM.Utilities
@@ -8,18 +7,13 @@ namespace FancyWM.Utilities
     {
         public static async Task WhenAllIgnoreCancelled(IEnumerable<Task> enumerable)
         {
-            var tasks = enumerable.ToList();
-            while (tasks.Any())
+            var completion = Task.WhenAll(enumerable);
+            try
             {
-                try
-                {
-                    await Task.WhenAll(tasks);
-                    tasks.Clear();
-                }
-                catch (TaskCanceledException)
-                {
-                    tasks.RemoveAll(task => task.IsCanceled);
-                }
+                await completion;
+            }
+            catch (TaskCanceledException) when (completion.IsCanceled)
+            {
             }
         }
     }

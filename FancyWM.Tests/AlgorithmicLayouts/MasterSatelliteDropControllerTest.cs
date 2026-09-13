@@ -14,7 +14,7 @@ using WinMan;
 namespace FancyWM.Tests.AlgorithmicLayouts
 {
     [TestClass]
-    public class MasterSatelliteDropControllerTest
+    public partial class MasterSatelliteDropControllerTest
     {
         private readonly UniqueWindowMockFactory m_windows = new();
         private readonly Rectangle m_workArea = Rectangle.OffsetAndSize(0, 0, 1000, 600);

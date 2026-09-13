@@ -1,5 +1,6 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
+using System.Collections.Frozen;
 using System.ComponentModel;
 using System.Linq;
 using System.Threading.Tasks;
@@ -87,27 +88,35 @@ namespace FancyWM
         {
             while (true)
             {
-                HashSet<IntPtr> newWindowHandles;
+                IReadOnlySet<IntPtr> newWindowHandles;
                 using (m_newWindowSetLock.EnterScope())
                 {
-                    newWindowHandles = m_newWindowSet
-                        .Select(window => window.Handle)
-                        .Where(handle => handle != IntPtr.Zero)
-                        .ToHashSet();
+                    newWindowHandles = m_newWindowSet.Count == 0
+                        ? FrozenSet<IntPtr>.Empty
+                        : m_newWindowSet
+                            .Select(window => window.Handle)
+                            .Where(handle => handle != IntPtr.Zero)
+                            .ToHashSet();
                 }
 
                 ArrangeTreeAttempt attempt;
-                IntPtr[] currentTreeHandles;
+                IntPtr[]? currentTreeHandles = null;
                 using (m_backendLock.EnterScope())
                 {
                     attempt = UpdateTreeLocked(tree, newWindowHandles);
-                    currentTreeHandles = tree.Root?.Windows
-                        .Select(window => window.WindowReference.Handle)
-                        .Where(handle => handle != IntPtr.Zero)
-                        .ToArray() ?? [];
+                    if (m_arrangeFailureNotifications.HasPending)
+                    {
+                        currentTreeHandles = tree.Root?.Windows
+                            .Select(window => window.WindowReference.Handle)
+                            .Where(handle => handle != IntPtr.Zero)
+                            .ToArray() ?? [];
+                    }
                 }
 
-                m_arrangeFailureNotifications.ReleaseResolved(currentTreeHandles);
+                if (currentTreeHandles != null)
+                {
+                    m_arrangeFailureNotifications.ReleaseResolved(currentTreeHandles);
+                }
                 ApplyArrangeFailureFallbacks(attempt.Fallbacks);
 
                 if (attempt.Arranged)
@@ -134,7 +143,7 @@ namespace FancyWM
             DesktopTree tree,
             IReadOnlySet<IntPtr> newWindowHandles)
         {
-            var fallbacks = new List<ArrangeFailureFallback>();
+            List<ArrangeFailureFallback>? fallbacks = null;
             tree.WorkArea = m_display.WorkArea;
 
             while (true)
@@ -143,10 +152,11 @@ namespace FancyWM
                 try
                 {
                     tree.Arrange();
-                    return new ArrangeTreeAttempt(true, false, fallbacks, null);
+                    return new ArrangeTreeAttempt(true, false, fallbacks ?? [], null);
                 }
                 catch (UnsatisfiableFlexConstraintsException)
                 {
+                    fallbacks ??= [];
                     bool algorithmicLayoutActive = IsMasterSatelliteTreeActiveLocked(tree);
                     var windows = tree.Root?.Windows.ToList() ?? [];
                     var decision = MasterSatelliteArrangeFailurePolicy.Decide(
@@ -271,11 +281,9 @@ namespace FancyWM
             if (!Active)
                 return;
 
-            if (m_currentInteraction != UserInteraction.None && m_sw.Elapsed - m_lastUpdateLayout <= TimeSpan.FromSeconds(1.0 / m_display.RefreshRate))
-            {
-                return;
-            }
-            m_lastUpdateLayout = m_sw.Elapsed;
+            // ApplyInvalidatedLayoutAsync owns cadence admission. Rechecking
+            // here could discard admitted work when the refresh rate changes.
+            m_lastUpdateLayout = m_layoutElapsed();
 
             IVirtualDesktop desktop = m_workspace.VirtualDesktopManager.CurrentDesktop;
 
@@ -375,19 +383,22 @@ namespace FancyWM
         private async Task UpdateWindowPositionsAsync(IEnumerable<WindowNode> snapshot, bool useSmoothing)
         {
             var targets = CalculateRepositionTargets(snapshot);
-            foreach (var target in targets)
+            if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Information))
             {
-                if (target.OriginalPosition != target.ComputedPosition)
+                foreach (var target in targets)
                 {
-                    m_logger.Information("Relocating window {Window} from {OriginalPosition} to {ComputedPosition}",
-                        target.Window.DebugString(),
-                        target.OriginalPosition, target.ComputedPosition);
-                }
-                else
-                {
-                    m_logger.Information("Window {Window} location is {ComputedPosition}",
-                        target.Window.DebugString(),
-                        target.ComputedPosition);
+                    if (target.OriginalPosition != target.ComputedPosition)
+                    {
+                        m_logger.Information("Relocating window {Window} from {OriginalPosition} to {ComputedPosition}",
+                            target.Window.DebugString(),
+                            target.OriginalPosition, target.ComputedPosition);
+                    }
+                    else
+                    {
+                        m_logger.Information("Window {Window} location is {ComputedPosition}",
+                            target.Window.DebugString(),
+                            target.ComputedPosition);
+                    }
                 }
             }
 
@@ -403,15 +414,18 @@ namespace FancyWM
                 }
             }
 
+            if (m_shutdownPreparation != null || m_disposed) { return; }
             if (useSmoothing)
             {
                 var focusRectangle = m_gui.FocusRectangle;
                 m_gui.FocusRectangle = null;
+                if (m_shutdownPreparation != null || m_disposed) { return; }
 
                 TransitionTargetGroup transitionGroup;
                 if (newWindows != null)
                 {
                     await TransitionTargetGroup.PerformTransitionAsync(targets.Where(x => newWindows!.Contains(x.Window)).ToList());
+                    if (m_shutdownPreparation != null || m_disposed) { return; }
                     transitionGroup = new TransitionTargetGroup(m_animationThread, targets.Where(x => !newWindows!.Contains(x.Window)));
                 }
                 else
@@ -420,7 +434,7 @@ namespace FancyWM
                 }
                 await transitionGroup.PerformSmoothTransitionAsync(TimeSpan.FromMilliseconds(100));
 
-                m_gui.FocusRectangle = focusRectangle;
+                if (m_shutdownPreparation == null && !m_disposed) { m_gui.FocusRectangle = focusRectangle; }
             }
             else
             {
@@ -448,7 +462,10 @@ namespace FancyWM
                     }
                     else
                     {
-                        m_logger.Debug("Updating position of window {Window}", window.WindowReference.DebugString());
+                        if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+                        {
+                            m_logger.Debug("Updating position of window {Window}", window.WindowReference.DebugString());
+                        }
                         var rect = window.ComputedRectangle;
                         var frame = window.WindowReference.FrameMargins;
                         var adjustedRect = new Rectangle(
@@ -512,9 +529,11 @@ namespace FancyWM
             if (m_currentInteraction != UserInteraction.Moving
                 && m_movingPanelNode == null)
             {
+                ClearMasterSatelliteDropPreviewCache();
                 return null;
             }
 
+            bool acceptedCanonicalPreview = false;
             try
             {
                 var interactionWindow = m_currentInteraction == UserInteraction.Moving
@@ -563,6 +582,7 @@ namespace FancyWM
                                             pt);
                                         if (plan.IsAccepted)
                                         {
+                                            acceptedCanonicalPreview = true;
                                             m_masterSatelliteDropPreviewWindows = plan.PreviewWindows.ToHashSet();
                                         }
                                         return plan.PreviewRectangle;
@@ -617,7 +637,22 @@ namespace FancyWM
                     exception,
                     "Window-move preview was cancelled because the window is no longer valid");
             }
+            finally
+            {
+                if (!acceptedCanonicalPreview)
+                {
+                    ClearMasterSatelliteDropPreviewCache();
+                }
+            }
             return null;
+        }
+
+        private void ClearMasterSatelliteDropPreviewCache()
+        {
+            using (m_backendLock.EnterScope())
+            {
+                m_masterSatelliteDrops.ClearPreviewCache();
+            }
         }
 
         private void MoveToParentPanel(TilingNode node)
@@ -758,10 +793,13 @@ namespace FancyWM
                 }
                 catch (Exception ex)
                 {
-                    m_logger.Debug(
-                        ex,
-                        "Could not restore backend focus after unfloat for window {Window}",
-                        window.DebugString());
+                    if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+                    {
+                        m_logger.Debug(
+                            ex,
+                            "Could not restore backend focus after unfloat for window {Window}",
+                            window.DebugString());
+                    }
                 }
             }
         }
@@ -959,9 +997,12 @@ namespace FancyWM
                 // through the legacy OnWindowRemoved callback.
                 if (IsMasterSatelliteWindow(intent.Source.WindowReference))
                 {
-                    m_logger.Debug(
-                        "Ignoring legacy grouping for Master + Satellites window {Window}",
-                        intent.Source.WindowReference.DebugString());
+                    if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+                    {
+                        m_logger.Debug(
+                            "Ignoring legacy grouping for Master + Satellites window {Window}",
+                            intent.Source.WindowReference.DebugString());
+                    }
                     intent.Cancel();
                     return;
                 }
@@ -1120,11 +1161,15 @@ namespace FancyWM
 
         private void OnBeginHorizontalWithRequestedAsync(object? sender, WindowNode e)
         {
+            if (m_disposed || m_shutdownPreparation != null) { return; }
             if (IsMasterSatelliteWindow(e.WindowReference))
             {
-                m_logger.Debug(
-                    "Ignoring horizontal grouping for Master + Satellites window {Window}",
-                    e.WindowReference.DebugString());
+                if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+                {
+                    m_logger.Debug(
+                        "Ignoring horizontal grouping for Master + Satellites window {Window}",
+                        e.WindowReference.DebugString());
+                }
                 return;
             }
             m_gui.PreviewWindows = new HashSet<IWindow> { e.WindowReference };
@@ -1142,11 +1187,15 @@ namespace FancyWM
 
         private void OnBeginVerticalWithRequested(object? sender, WindowNode e)
         {
+            if (m_disposed || m_shutdownPreparation != null) { return; }
             if (IsMasterSatelliteWindow(e.WindowReference))
             {
-                m_logger.Debug(
-                    "Ignoring vertical grouping for Master + Satellites window {Window}",
-                    e.WindowReference.DebugString());
+                if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+                {
+                    m_logger.Debug(
+                        "Ignoring vertical grouping for Master + Satellites window {Window}",
+                        e.WindowReference.DebugString());
+                }
                 return;
             }
             m_gui.PreviewWindows = new HashSet<IWindow> { e.WindowReference };
@@ -1164,11 +1213,15 @@ namespace FancyWM
 
         private void OnBeginStackWithRequested(object? sender, WindowNode e)
         {
+            if (m_disposed || m_shutdownPreparation != null) { return; }
             if (IsMasterSatelliteWindow(e.WindowReference))
             {
-                m_logger.Debug(
-                    "Ignoring stack grouping for Master + Satellites window {Window}",
-                    e.WindowReference.DebugString());
+                if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+                {
+                    m_logger.Debug(
+                        "Ignoring stack grouping for Master + Satellites window {Window}",
+                        e.WindowReference.DebugString());
+                }
                 return;
             }
             m_gui.PreviewWindows = new HashSet<IWindow> { e.WindowReference };
@@ -1186,11 +1239,13 @@ namespace FancyWM
 
         private void OnWindowVerticalSplitRequested(object? sender, TilingNode e)
         {
+            if (m_disposed || m_shutdownPreparation != null) { return; }
             CompleteMasterSatelliteOverlaySplit(e, SatelliteLayoutOrientation.Vertical);
         }
 
         private void OnWindowStackRequested(object? sender, TilingNode e)
         {
+            if (m_disposed || m_shutdownPreparation != null) { return; }
             MasterSatelliteCommandResult? algorithmicResult = null;
             IVirtualDesktop? algorithmicDesktop = null;
             using (m_backendLock.EnterScope())
@@ -1221,6 +1276,7 @@ namespace FancyWM
 
         private void OnWindowPullUpRequested(object? sender, TilingNode e)
         {
+            if (m_disposed || m_shutdownPreparation != null) { return; }
             CompleteMasterSatelliteOverlayPullUp(e);
         }
 
@@ -1255,6 +1311,7 @@ namespace FancyWM
 
         private void OnWindowHorizontalSplitRequested(object? sender, TilingNode e)
         {
+            if (m_disposed || m_shutdownPreparation != null) { return; }
             CompleteMasterSatelliteOverlaySplit(e, SatelliteLayoutOrientation.Horizontal);
         }
 
@@ -1320,6 +1377,7 @@ namespace FancyWM
 
         private void OnWindowFloatRequested(object? sender, WindowNode e)
         {
+            if (m_disposed || m_shutdownPreparation != null) { return; }
             try
             {
                 ToggleFloat(e.WindowReference);
@@ -1336,6 +1394,7 @@ namespace FancyWM
 
         private void OnWindowIgnoreProcessRequested(object? sender, WindowNode e)
         {
+            if (m_disposed || m_shutdownPreparation != null) { return; }
             App.Current.AppState.Settings.SaveAsync(x =>
             {
                 return x with { ProcessIgnoreList = [.. x.ProcessIgnoreList, e.WindowReference.GetCachedProcessName()] };
@@ -1343,6 +1402,7 @@ namespace FancyWM
         }
         private void OnWindowIgnoreClassRequested(object? sender, WindowNode e)
         {
+            if (m_disposed || m_shutdownPreparation != null) { return; }
             App.Current.AppState.Settings.SaveAsync(x =>
             {
                 return x with { ClassIgnoreList = [.. x.ClassIgnoreList, ((WinMan.Windows.Win32Window)e.WindowReference).ClassName] };
@@ -1351,6 +1411,8 @@ namespace FancyWM
 
         private void OnTilingPanelMoving(object? sender, PanelNode panel)
         {
+            if (m_disposed || m_shutdownPreparation != null) { return; }
+            ClearMasterSatelliteDropPreviewCache();
             m_currentInteraction = UserInteraction.Moving;
             m_movingPanelNode = panel;
             InvalidateLayout();
@@ -1358,6 +1420,7 @@ namespace FancyWM
 
         private void OnTilingPanelMoveRequested(object? sender, PanelNode panel)
         {
+            if (m_disposed || m_shutdownPreparation != null) { return; }
             m_logger.Information("Panel {Panel} move ended", panel);
             m_currentInteraction = UserInteraction.None;
             m_movingPanelNode = null;
@@ -1434,12 +1497,14 @@ namespace FancyWM
             finally
             {
                 m_masterSatelliteDropPreviewWindows = EmptyWindowSet;
+                ClearMasterSatelliteDropPreviewCache();
                 InvalidateLayout();
             }
         }
 
         private void OnTilingNodePullUpRequested(object? sender, TilingNode node)
         {
+            if (m_disposed || m_shutdownPreparation != null) { return; }
             CompleteMasterSatelliteOverlayPullUp(node);
         }
 
@@ -1510,6 +1575,7 @@ namespace FancyWM
             m_dispatcher.BeginInvoke(() =>
             {
                 if (m_disposed
+                    || m_shutdownPreparation != null
                     || !IsCurrentMasterSatelliteWindowGeneration(e.Source))
                 {
                     return;
@@ -1522,7 +1588,10 @@ namespace FancyWM
                     {
                         if (m_backend.HasWindow(e.Source))
                         {
-                            m_logger.Debug("Window {Window} is managed by backend, need to hide all obstructing windows", e.Source.DebugString());
+                            if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+                            {
+                                m_logger.Debug("Window {Window} is managed by backend, need to hide all obstructing windows", e.Source.DebugString());
+                            }
                             // Focused restored windows that are in the tree cause all maximised windows
                             // to be send to the back
                             hideMaximised = true;
@@ -1530,7 +1599,10 @@ namespace FancyWM
                         }
                         else
                         {
-                            m_logger.Debug("Window {Window} is not managed by backend", e.Source.DebugString());
+                            if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+                            {
+                                m_logger.Debug("Window {Window} is not managed by backend", e.Source.DebugString());
+                            }
                             return;
                         }
                     }
@@ -1613,7 +1685,10 @@ namespace FancyWM
             {
                 return;
             }
-            m_logger.Debug("Window {Window} added to workspace", e.Source.DebugString());
+            if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+            {
+                m_logger.Debug("Window {Window} added to workspace", e.Source.DebugString());
+            }
             try
             {
                 if (IsRetiredMasterSatelliteWindowGeneration(e.Source)
@@ -1710,6 +1785,7 @@ namespace FancyWM
                     m_dispatcher.BeginInvoke(() =>
                     {
                         if (m_disposed
+                            || m_shutdownPreparation != null
                             || IsRetiredMasterSatelliteWindowGeneration(e.Source)
                             || (hasStableHandle
                                 && !IsCurrentMasterSatelliteWindowGeneration(
@@ -1978,10 +2054,13 @@ namespace FancyWM
                 || isUnregisteredCurrentWindowGeneration;
             if (hasStableHandle && !canReconcileWindowGeneration)
             {
-                m_logger.Debug(
-                    "Ignoring delayed removal for retired window generation {Window}; windowHandle={WindowHandle}",
-                    e.Source.DebugString(),
-                    stableWindowHandle);
+                if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+                {
+                    m_logger.Debug(
+                        "Ignoring delayed removal for retired window generation {Window}; windowHandle={WindowHandle}",
+                        e.Source.DebugString(),
+                        stableWindowHandle);
+                }
                 UnbindEventHandlers(e.Source);
                 UntrackWindowLifetime(e.Source);
                 using (m_savedLocationsLock.EnterScope())
@@ -2122,7 +2201,10 @@ namespace FancyWM
             {
                 if (m_backend.HasWindow(e.Source))
                 {
-                    m_logger.Debug("Unregistering window {Window} from backend", e.Source.DebugString());
+                    if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+                    {
+                        m_logger.Debug("Unregistering window {Window} from backend", e.Source.DebugString());
+                    }
                     algorithmicRemoval = RemoveMasterSatelliteWindowLocked(
                         e.Source,
                         preserveOriginalPosition: false);
@@ -2266,7 +2348,10 @@ namespace FancyWM
             {
                 if (m_backend.HasWindow(window))
                 {
-                    m_logger.Debug("Window {Window} size is unchanged, attempting to insert window at {Position}", window.DebugString(), pt);
+                    if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+                    {
+                        m_logger.Debug("Window {Window} size is unchanged, attempting to insert window at {Position}", window.DebugString(), pt);
+                    }
                     if (TryResolveAttachedMasterSatelliteDesktopLocked(
                             window,
                             out var desktop))
@@ -2392,6 +2477,7 @@ namespace FancyWM
             finally
             {
                 m_masterSatelliteDropPreviewWindows = EmptyWindowSet;
+                ClearMasterSatelliteDropPreviewCache();
                 InvalidateLayout();
                 using (m_ignoreRepositionSetLock.EnterScope())
                 {
@@ -2503,7 +2589,10 @@ namespace FancyWM
                                 right: oldPosition.Right + frame.Right,
                                 bottom: oldPosition.Bottom + frame.Bottom);
 
-                            m_logger.Debug("Window {Window} size is different, attempting to resize window from {OldPosition} to {NewPosition}", e.Source.DebugString(), adjustedRect, e.NewPosition);
+                            if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+                            {
+                                m_logger.Debug("Window {Window} size is different, attempting to resize window from {OldPosition} to {NewPosition}", e.Source.DebugString(), adjustedRect, e.NewPosition);
+                            }
                             if (TryResolveAttachedMasterSatelliteDesktopLocked(
                                     e.Source,
                                     out var desktop))
@@ -2575,7 +2664,10 @@ namespace FancyWM
 
             try
             {
-                m_logger.Verbose("Changed topmost of window {Window}", e.Source.DebugString());
+                if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Verbose))
+                {
+                    m_logger.Verbose("Changed topmost of window {Window}", e.Source.DebugString());
+                }
                 DetectChanges(e.Source);
             }
             catch (InvalidWindowReferenceException)
@@ -2648,6 +2740,7 @@ namespace FancyWM
 
             void RegisterAndRestoreLocation()
             {
+                bool genericPlacementChanged = false;
                 NodeLocation? savedLocation;
                 using (m_savedLocationsLock.EnterScope())
                 {
@@ -2675,6 +2768,7 @@ namespace FancyWM
                                 maxTreeWidth: m_autoSplitCount);
                         window.Parent!.Padding = GetPanelPaddingRect();
                         window.Parent!.Spacing = GetPanelSpacing();
+                        genericPlacementChanged = true;
                     }
                     catch (WindowAlreadyRegisteredException)
                     {
@@ -2713,6 +2807,7 @@ namespace FancyWM
                     int childCount = location.Parent.Children.Count;
                     int index = Math.Min(location.Index, childCount);
                     location.Parent.Attach(index, window);
+                    genericPlacementChanged = true;
 
                     // Restore size
                     if (window.Parent is GridLikeNode gridNode)
@@ -2805,6 +2900,13 @@ namespace FancyWM
                         TilingError.NoValidPlacementExists,
                         e.Source));
                 }
+                if (genericPlacementChanged)
+                {
+                    // DetectChanges sees the already-restored membership, so it
+                    // cannot invalidate this mutation. Restoration need not focus
+                    // the window or produce another event that requests layout.
+                    InvalidateLayout();
+                }
                 DetectChanges(e.Source);
             }
 
@@ -2846,7 +2948,10 @@ namespace FancyWM
 
                 if (Equals(m_workspace.FocusedWindow, sender))
                 {
-                    m_logger.Debug("Window {Window} is also focused, calling OnWindowGotFocus", e.Source.DebugString());
+                    if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+                    {
+                        m_logger.Debug("Window {Window} is also focused, calling OnWindowGotFocus", e.Source.DebugString());
+                    }
                     // This is to update focus when a maximised window is restored.
                     OnWindowGotFocus(e.Source, new WindowFocusChangedEventArgs(e.Source, true));
                 }
@@ -2878,12 +2983,14 @@ namespace FancyWM
                 m_ignoreRepositionSet.Add(e.Source);
             }
             m_masterSatelliteDropPreviewWindows = EmptyWindowSet;
+            ClearMasterSatelliteDropPreviewCache();
             m_movingWindow = e.Source;
             m_currentInteraction = UserInteraction.Starting;
         }
 
         private void OnTilingNodeFocusRequested(object? sender, TilingNode e)
         {
+            if (m_disposed || m_shutdownPreparation != null) { return; }
             using (m_backendLock.EnterScope())
             {
                 var windowNode = e.Windows.FirstOrDefault();
@@ -2906,8 +3013,10 @@ namespace FancyWM
 
         private void OnTilingNodeCloseRequested(object? sender, TilingNode e)
         {
+            if (m_disposed || m_shutdownPreparation != null) { return; }
             foreach (var window in e.Windows.ToList())
             {
+                if (m_disposed || m_shutdownPreparation != null) { return; }
                 try
                 {
                     if (window.WindowReference.CanClose)
@@ -3058,7 +3167,10 @@ namespace FancyWM
             }
             try
             {
-                m_logger.Verbose("Dirty checking for changes with window {Window}", window.DebugString());
+                if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Verbose))
+                {
+                    m_logger.Verbose("Dirty checking for changes with window {Window}", window.DebugString());
+                }
                 if (window.State == WindowState.Restored && CanManage(window))
                 {
                     if (!AutoRegisterWindows)
@@ -3157,7 +3269,10 @@ namespace FancyWM
                             {
                                 if (!m_backend.HasWindow(window))
                                 {
-                                    m_logger.Debug("Window {Window} can be managed, but is not registered with backend, registering now", window.DebugString());
+                                    if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Debug))
+                                    {
+                                        m_logger.Debug("Window {Window} can be managed, but is not registered with backend, registering now", window.DebugString());
+                                    }
                                     algorithmicPlacement = PlaceMasterSatelliteWindowLocked(
                                         window,
                                         out algorithmicLayoutMatched,
@@ -3262,7 +3377,10 @@ namespace FancyWM
                     {
                         if (m_backend.HasWindow(window))
                         {
-                            m_logger.Verbose("Window {Window} can no longer be managed, but is registered with backend, unregistering now", window.DebugString());
+                            if (m_logger.IsEnabled(Serilog.Events.LogEventLevel.Verbose))
+                            {
+                                m_logger.Verbose("Window {Window} can no longer be managed, but is registered with backend, unregistering now", window.DebugString());
+                            }
                             algorithmicRemoval = RemoveMasterSatelliteWindowLocked(
                                 window,
                                 preserveOriginalPosition: true);
@@ -3316,9 +3434,43 @@ namespace FancyWM
                     return true;
 
                 // Check if on any other displays
-                return !m_workspace.DisplayManager.Displays
-                    .Where(d => !d.Equals(m_display) && d.Bounds.Contains(pos))
-                    .Any();
+                var displays = m_workspace.DisplayManager.Displays;
+                if (displays is null || displays is List<IDisplay>)
+                {
+                    return IsOutsideExactDisplayList(displays!, m_display, pos);
+                }
+                if (displays is IDisplay[] displayArray)
+                {
+                    foreach (var display in displayArray)
+                    {
+                        if (!display.Equals(m_display)
+                            && display.Bounds.Contains(pos))
+                        {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+                foreach (var display in displays)
+                {
+                    if (!display.Equals(m_display)
+                        && display.Bounds.Contains(pos))
+                    {
+                        return false;
+                    }
+                }
+                return true;
+
+                static bool IsOutsideExactDisplayList(
+                    IReadOnlyList<IDisplay> displays,
+                    IDisplay currentDisplay,
+                    Point position)
+                {
+                    return !displays
+                        .Where(display => !display.Equals(currentDisplay)
+                            && display.Bounds.Contains(position))
+                        .Any();
+                }
             }
             bool IsFloating()
             {
@@ -3391,7 +3543,7 @@ namespace FancyWM
 
         private void InvalidateLayout()
         {
-            if (!m_active)
+            if (!m_active || m_disposed)
             {
                 return;
             }
@@ -3401,18 +3553,7 @@ namespace FancyWM
             {
                 return;
             }
-            try
-            {
-                m_dispatcher.BeginInvoke(
-                    (Action)ApplyInvalidatedLayoutAsync,
-                    System.Windows.Threading.DispatcherPriority.DataBind);
-            }
-            catch (InvalidOperationException exception)
-            {
-                m_logger.Debug(
-                    exception,
-                    "Dropping layout invalidation because the tiling Dispatcher is shutting down");
-            }
+            m_layoutInvalidations.Invalidate();
         }
 
         /// <summary>
@@ -3420,16 +3561,34 @@ namespace FancyWM
         /// failure is observed here so a transient workspace/VDM/preview error
         /// cannot escape through an abandoned Task.
         /// </summary>
-        private async void ApplyInvalidatedLayoutAsync()
+        private async Task ApplyInvalidatedLayoutAsync()
         {
-            if (!m_dirty || m_frozen.IsPositive())
+            if (!m_dirty || !m_active || m_disposed || m_frozen.IsPositive())
             {
                 return;
             }
-            m_dirty = false;
+            var cancellationToken = m_layoutDelayCancellation.Token;
             try
             {
+                // Keep the existing queue admission while waiting for cadence.
+                // Clearing dirty before cadence admission would consume the
+                // final invalidation without publishing its layout.
+                while (true)
+                {
+                    if (!m_active || m_disposed || m_frozen.IsPositive()) { return; }
+                    if (m_currentInteraction == UserInteraction.None) { break; }
+                    var remaining = TimeSpan.FromSeconds(1.0 / m_display.RefreshRate)
+                        - (m_layoutElapsed() - m_lastUpdateLayout);
+                    if (remaining < TimeSpan.Zero) { break; }
+                    await m_layoutDelay(remaining + TimeSpan.FromTicks(1), cancellationToken);
+                }
+                // Read geometry and window identities only after the wait; a
+                // newer invalidation may have replaced every target meanwhile.
+                m_dirty = false;
                 await UpdateLayoutAsync();
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
             }
             catch (Exception exception)
             {
@@ -3485,30 +3644,19 @@ namespace FancyWM
             return new System.Windows.Thickness(rc.Left, rc.Top, rc.Right, rc.Bottom);
         }
 
-        private void UpdateGuiNodeOptions()
+        private void UpdateGuiNodeOptions(bool preserveViewForPadding = false)
         {
             m_dispatcher.Invoke(() =>
             {
                 m_gui.PanelSpacing = GetPanelSpacing();
                 m_gui.PanelPadding = ToThickness(GetPanelPaddingRect());
-                m_gui.InvalidateView();
+                if (preserveViewForPadding) { m_gui.InvalidateViewForPadding(); }
+                else { m_gui.InvalidateView(); }
                 InvalidateLayout();
             });
         }
 
-        private void PropagatePaddingChange()
-        {
-            using (m_backendLock.EnterScope())
-            {
-                foreach (var panel in m_backend.Trees.SelectMany(x => x.Root!.Nodes).OfType<PanelNode>())
-                {
-                    panel.Spacing = GetPanelSpacing();
-                }
-            }
-            UpdateGuiNodeOptions();
-        }
-
-        private void PropagatePanelHeightChange()
+        private void PropagatePanelHeightChange(bool preserveViewForPadding = false)
         {
             using (m_backendLock.EnterScope())
             {
@@ -3518,7 +3666,7 @@ namespace FancyWM
                     panel.Spacing = GetPanelSpacing();
                 }
             }
-            UpdateGuiNodeOptions();
+            UpdateGuiNodeOptions(preserveViewForPadding);
         }
 
         private void PropagateShowFocusChange()

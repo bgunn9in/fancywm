@@ -198,8 +198,11 @@ namespace FancyWM.Utilities
 
         private static void OnElementMouseMove(object sender, MouseEventArgs e)
         {
-            // TODO: Null referecne here ?
             var element = (FrameworkElement)sender;
+            if (!s_dragData.TryGetValue(element, out _))
+            {
+                return;
+            }
             UpdateDrag(element, GetMousePosition(element));
         }
 

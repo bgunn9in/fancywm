@@ -1,0 +1,525 @@
+diff --git a/src/WinMan.Windows.DllImports/NativeMethods.txt b/src/WinMan.Windows.DllImports/NativeMethods.txt
+index 22b27c8..245c8de 100644
+--- a/src/WinMan.Windows.DllImports/NativeMethods.txt
++++ b/src/WinMan.Windows.DllImports/NativeMethods.txt
+@@ -34,6 +34,7 @@ IsWindowVisible
+ KillTimer
+ NtQueryInformationProcess
+ OpenProcess
++PostMessage
+ QueryDisplayConfig
+ SendMessageTimeout
+ SetForegroundWindow
+diff --git a/src/WinMan.Windows/Windows/Win32DisplayManager.cs b/src/WinMan.Windows/Windows/Win32DisplayManager.cs
+index 0720e22..b8edb7c 100644
+--- a/src/WinMan.Windows/Windows/Win32DisplayManager.cs
++++ b/src/WinMan.Windows/Windows/Win32DisplayManager.cs
+@@ -1,6 +1,7 @@
+ ﻿using System;
+ using System.Collections.Generic;
+ using System.ComponentModel;
++using System.Globalization;
+ using System.Linq;
+ using System.Runtime.InteropServices;
+ using System.Threading;
+@@ -49,7 +50,13 @@ namespace WinMan.Windows
+             {
+                 lock (m_displays)
+                 {
+-                    return m_displays.OrderBy(x => x.DeviceID).ToList();
++                    if (!Equals(
++                            m_displaySnapshotCompareInfo,
++                            CultureInfo.CurrentCulture.CompareInfo))
++                    {
++                        RefreshDisplaySnapshotUnderLock();
++                    }
++                    return m_displaySnapshot.ToList();
+                 }
+             }
+         }
+@@ -70,6 +77,10 @@ namespace WinMan.Windows
+ 
+         private readonly List<Win32Display> m_displays;
+ 
++        private List<Win32Display> m_displaySnapshot = null!;
++
++        private CompareInfo m_displaySnapshotCompareInfo = null!;
++
+         public Win32DisplayManager(Win32Workspace workspace)
+         {
+             m_workspace = workspace;
+@@ -85,6 +96,7 @@ namespace WinMan.Windows
+             }
+ 
+             m_displays = [.. deviceIds.Select(x => Win32Display.TryCreate(this, x)!).Where(x => x != null)];
++            RefreshDisplaySnapshotUnderLock();
+             PrimaryDisplay = m_displays.First(x => x.Bounds.TopLeft == new Point(0, 0));
+         }
+ 
+@@ -100,13 +112,22 @@ namespace WinMan.Windows
+                 freshDeviceIds = [NoMonitorID];
+             }
+ 
+-            var (addedDisplays, removedDisplays) = Enumerables.UpdateDerivedObjectListUnderLock(m_displays, m_displays, x => x.DeviceID, freshDeviceIds, x => x, x => new Win32Display(this, x));
+-
++            List<Win32Display> addedDisplays;
++            List<Win32Display> removedDisplays;
+             IDisplay oldPrimaryDisplay;
+             IDisplay newPrimaryDisplay;
+ 
+             lock (m_displays)
+             {
++                (addedDisplays, removedDisplays) =
++                    Enumerables.UpdateDerivedObjectListUnderLock(
++                        m_displays,
++                        m_displays,
++                        x => x.DeviceID,
++                        freshDeviceIds,
++                        x => x,
++                        x => new Win32Display(this, x));
++                RefreshDisplaySnapshotUnderLock();
+                 oldPrimaryDisplay = PrimaryDisplay;
+                 newPrimaryDisplay = m_displays.FirstOrDefault(x => x.Bounds.TopLeft == new Point(0, 0))
+                     ?? m_displays.First();
+@@ -151,6 +172,16 @@ namespace WinMan.Windows
+             }
+         }
+ 
++        /// <summary>
++        /// Must be called while construction is private or m_displays is locked.
++        /// The public property still returns a fresh concrete List on every read.
++        /// </summary>
++        private void RefreshDisplaySnapshotUnderLock()
++        {
++            m_displaySnapshot = m_displays.OrderBy(x => x.DeviceID).ToList();
++            m_displaySnapshotCompareInfo = CultureInfo.CurrentCulture.CompareInfo;
++        }
++
+         internal void OnSettingChange()
+         {
+             List<Win32Display> displays;
+diff --git a/src/WinMan.Windows/Windows/Win32VirtualDesktop.cs b/src/WinMan.Windows/Windows/Win32VirtualDesktop.cs
+index 534cf0e..3feebba 100644
+--- a/src/WinMan.Windows/Windows/Win32VirtualDesktop.cs
++++ b/src/WinMan.Windows/Windows/Win32VirtualDesktop.cs
+@@ -22,7 +22,16 @@ namespace WinMan.Windows
+             m_desktop = desktop;
+         }
+ 
+-        public bool IsAlive => m_workspace.VirtualDesktopManager.Desktops.Contains(this);
++        public bool IsAlive
++        {
++            get
++            {
++                var manager = m_workspace.VirtualDesktopManager;
++                return manager is Win32VirtualDesktopManager win32Manager
++                    ? win32Manager.ContainsDesktop(this)
++                    : manager.Desktops.Contains(this);
++            }
++        }
+ 
+         public bool IsCurrent
+         {
+@@ -140,4 +149,4 @@ namespace WinMan.Windows
+             throw new NotImplementedException();
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/WinMan.Windows/Windows/Win32VirtualDesktopManager.cs b/src/WinMan.Windows/Windows/Win32VirtualDesktopManager.cs
+index 97382a2..6fe0a38 100644
+--- a/src/WinMan.Windows/Windows/Win32VirtualDesktopManager.cs
++++ b/src/WinMan.Windows/Windows/Win32VirtualDesktopManager.cs
+@@ -43,6 +43,14 @@ namespace WinMan.Windows
+             }
+         }
+ 
++        internal bool ContainsDesktop(Win32VirtualDesktop desktop)
++        {
++            lock (m_syncRoot)
++            {
++                return m_desktops.Contains(desktop);
++            }
++        }
++
+         public IVirtualDesktop CurrentDesktop
+         {
+             get
+diff --git a/src/WinMan.Windows/Windows/Win32Workspace.cs b/src/WinMan.Windows/Windows/Win32Workspace.cs
+index 2ef281f..d73ead4 100644
+--- a/src/WinMan.Windows/Windows/Win32Workspace.cs
++++ b/src/WinMan.Windows/Windows/Win32Workspace.cs
+@@ -44,6 +44,7 @@ namespace WinMan.Windows
+         /// Timer to actively watch recently created windows.
+         /// </summary>
+         private static readonly nuint IdtRecentTimerWatch = 2;
++        private const uint WmUpdateRecentTimer = 0x8001;
+ 
+         private readonly object m_initSyncRoot = new object();
+ 
+@@ -55,15 +56,21 @@ namespace WinMan.Windows
+         private EventLoop m_backgroundProcessingLoop = new EventLoop();
+         private Deleter? m_winEventHook;
+         private UIntPtr m_hTimer;
+-        private UIntPtr m_hTimerRecent;
+-        private bool m_isShuttingDown = false;
++        private volatile bool m_isShuttingDown = false;
+         private TimeSpan m_watchInterval = TimeSpan.FromMilliseconds(200);
+ 
+         private HashSet<Win32Window> m_visibleWindows = new HashSet<Win32Window>();
+         private List<Win32WindowHandle> m_windowList = new List<Win32WindowHandle>();
+         private Dictionary<IntPtr, Win32WindowHandle> m_windowSet = new Dictionary<IntPtr, Win32WindowHandle>();
+         private Stopwatch m_stopwatch = new Stopwatch();
+-        private List<(long timestamp, Win32WindowHandle handle)> m_recentWindowList = new List<(long timestamp, Win32WindowHandle handle)>();
++        private readonly List<(long timestamp, Win32WindowHandle handle)> m_recentWindowList = new();
++        private readonly object m_recentWindowSyncRoot = new();
++        private readonly Func<long> m_getRecentTimestamp;
++        private readonly Action m_postRecentTimerUpdate;
++        private readonly Action<bool> m_setRecentTimerEnabled;
++        private readonly Action<Win32WindowHandle> m_checkRecentVisibility;
++        private bool m_recentTimerEnabled;
++        private bool m_recentTimerUpdatePosted;
+         private IntPtr m_hwndFocused = IntPtr.Zero;
+         //private IntPtr m_hwndCapture = IntPtr.Zero;
+         private readonly Atomic<Point> m_cursorLocation = new Atomic<Point>();
+@@ -210,8 +217,22 @@ namespace WinMan.Windows
+             }
+         }
+ 
+-        public Win32Workspace()
++        public Win32Workspace() : this(null, null, null, null)
+         {
++        }
++
++        internal Win32Workspace(
++            Func<long>? getRecentTimestamp,
++            Action? postRecentTimerUpdate,
++            Action<bool>? setRecentTimerEnabled,
++            Action<IntPtr>? checkRecentVisibility)
++        {
++            m_getRecentTimestamp = getRecentTimestamp ?? (() => m_stopwatch.ElapsedMilliseconds);
++            m_postRecentTimerUpdate = postRecentTimerUpdate ?? PostRecentTimerUpdate;
++            m_setRecentTimerEnabled = setRecentTimerEnabled ?? SetRecentTimerEnabled;
++            m_checkRecentVisibility = checkRecentVisibility == null
++                ? CheckVisibilityChanges
++                : window => checkRecentVisibility(window.Handle);
+             m_processingLoop.UnhandledException += OnProcessingLoopException;
+         }
+ 
+@@ -219,6 +240,7 @@ namespace WinMan.Windows
+         {
+             lock (m_initSyncRoot)
+             {
++                ObjectDisposedException.ThrowIf(m_isShuttingDown, this);
+                 if (IsOpen)
+                 {
+                     throw new InvalidOperationException("Workspace has already been Open()ed!");
+@@ -379,16 +401,34 @@ namespace WinMan.Windows
+ 
+         public void Dispose()
+         {
+-            KillTimer(new HWND(), m_hTimer);
+-            KillTimer(new HWND(), m_hTimerRecent);
+-            m_isShuttingDown = true;
+-            m_winEventHook?.Dispose();
++            ExceptionDispatchInfo? postFailure = null;
++            lock (m_initSyncRoot)
++            {
++                lock (m_recentWindowSyncRoot)
++                {
++                    if (m_isShuttingDown) { return; }
++                    m_isShuttingDown = true;
++                    m_recentWindowList.Clear();
++                    if (m_msgWnd != IntPtr.Zero || m_recentTimerEnabled || m_recentTimerUpdatePosted)
++                    {
++                        try
++                        {
++                            RequestRecentTimerUpdate();
++                        }
++                        catch (Exception exception)
++                        {
++                            postFailure = ExceptionDispatchInfo.Capture(exception);
++                        }
++                    }
++                }
++            }
+ 
+-            m_eventLoopThread?.Join(1000);
++            if (Thread.CurrentThread != m_eventLoopThread) { m_eventLoopThread?.Join(1000); }
+             m_processingLoop.Shutdown();
+             m_backgroundProcessingLoop.Shutdown();
+-            m_processingThread?.Join(1000);
+-            m_backgroundProcessingThread?.Join(1000);
++            if (Thread.CurrentThread != m_processingThread) { m_processingThread?.Join(1000); }
++            if (Thread.CurrentThread != m_backgroundProcessingThread) { m_backgroundProcessingThread?.Join(1000); }
++            postFailure?.Throw();
+         }
+ 
+         internal IWindow? UnsafeGetWindow(IntPtr hwnd)
+@@ -449,6 +489,41 @@ namespace WinMan.Windows
+         }
+ 
+         private void GetMessageLoop()
++        {
++            try
++            {
++                GetMessageLoopCore();
++            }
++            finally
++            {
++                try
++                {
++                    lock (m_recentWindowSyncRoot)
++                    {
++                        if (m_recentTimerEnabled)
++                        {
++                            m_setRecentTimerEnabled(false);
++                            m_recentTimerEnabled = false;
++                        }
++                    }
++                }
++                finally
++                {
++                    m_winEventHook?.Dispose();
++                    lock (m_recentWindowSyncRoot)
++                    {
++                        if (m_msgWnd != IntPtr.Zero)
++                        {
++                            if (m_hTimer != UIntPtr.Zero) { KillTimer(new(m_msgWnd), IdtTimerWatch); }
++                            DestroyWindow(new(m_msgWnd));
++                            m_msgWnd = IntPtr.Zero;
++                        }
++                    }
++                }
++            }
++        }
++
++        private void GetMessageLoopCore()
+         {
+             unsafe
+             {
+@@ -502,8 +577,7 @@ namespace WinMan.Windows
+             }, OnWinEvent);
+ 
+             m_hTimer = SetTimer(new(m_msgWnd), IdtTimerWatch, (uint)m_watchInterval.TotalMilliseconds, null);
+-            m_hTimerRecent = SetTimer(new(m_msgWnd), IdtRecentTimerWatch, 10, null);
+-            if (m_hTimer == UIntPtr.Zero || m_hTimerRecent == UIntPtr.Zero)
++            if (m_hTimer == UIntPtr.Zero)
+             {
+                 throw new Win32Exception().WithMessage("Could not create a timer for the message-only window!");
+             }
+@@ -518,16 +592,33 @@ namespace WinMan.Windows
+         {
+             try
+             {
++                if (m_isShuttingDown) { return; }
+                 switch (msg)
+                 {
++                    case WmUpdateRecentTimer:
++                        UpdateRecentTimer();
++                        break;
+                     case WM_TIMER:
+                         if (wParam == IdtTimerWatch)
+                         {
+-                            ScheduleAction(ref m_onTimerWatchQueued, OnTimerWatch);
++                            try
++                            {
++                                UpdateRecentTimer();
++                            }
++                            finally
++                            {
++                                ScheduleAction(ref m_onTimerWatchQueued, OnTimerWatch);
++                            }
+                         }
+                         else if (wParam == IdtRecentTimerWatch)
+                         {
+-                            ScheduleAction(ref m_onRecentTimerWatchQueued, OnRecentTimerWatch);
++                            lock (m_recentWindowSyncRoot)
++                            {
++                                if (m_recentTimerEnabled && m_recentWindowList.Count > 0)
++                                {
++                                    ScheduleAction(ref m_onRecentTimerWatchQueued, OnRecentTimerWatch);
++                                }
++                            }
+                         }
+                         break;
+                     case WM_DISPLAYCHANGE:
+@@ -579,27 +670,97 @@ namespace WinMan.Windows
+         private void OnRecentTimerWatch()
+         {
+             m_onRecentTimerWatchQueued = 0;
+-            var cleanedList = new List<(long timestamp, Win32WindowHandle handle)>();
+-            var checkList = new List<Win32WindowHandle>();
+-            var now = m_stopwatch.ElapsedMilliseconds;
+-
+-            lock (m_recentWindowList)
++            (long timestamp, Win32WindowHandle handle)[] checkList;
++            lock (m_recentWindowSyncRoot)
+             {
+-                foreach (var (t, w) in m_recentWindowList)
++                if (m_isShuttingDown || m_recentWindowList.Count == 0) { return; }
++                var now = m_getRecentTimestamp();
++                checkList = m_recentWindowList.ToArray();
++                int retainedCount = 0;
++                foreach (var entry in checkList)
+                 {
+-                    if ((now - t) <= RecentWindowDuration)
++                    if (now - entry.timestamp <= RecentWindowDuration)
+                     {
+-                        cleanedList.Add((t, w));
++                        m_recentWindowList[retainedCount++] = entry;
+                     }
+-                    checkList.Add(w);
+                 }
++                m_recentWindowList.RemoveRange(retainedCount, m_recentWindowList.Count - retainedCount);
++            }
++
++            try
++            {
++                foreach (var entry in checkList)
++                {
++                    if (m_isShuttingDown) { return; }
++                    m_checkRecentVisibility(entry.handle);
++                }
++            }
++            finally
++            {
++                lock (m_recentWindowSyncRoot)
++                {
++                    if (!m_isShuttingDown && m_recentWindowList.Count == 0) { RequestRecentTimerUpdate(); }
++                }
++            }
++        }
++
++        private void WatchRecentWindow(Win32WindowHandle window)
++        {
++            lock (m_recentWindowSyncRoot)
++            {
++                if (m_isShuttingDown) { return; }
++                m_recentWindowList.Add((m_getRecentTimestamp(), window));
++                if (!m_recentTimerEnabled) { RequestRecentTimerUpdate(); }
++            }
++        }
++
++        private void RequestRecentTimerUpdate()
++        {
++            if (m_recentTimerUpdatePosted) { return; }
++            m_recentTimerUpdatePosted = true;
++            try
++            {
++                m_postRecentTimerUpdate();
++            }
++            catch
++            {
++                m_recentTimerUpdatePosted = false;
++                throw;
++            }
++        }
++
++        private void PostRecentTimerUpdate()
++        {
++            if (!PostMessage(new(m_msgWnd), WmUpdateRecentTimer, new(), new()))
++            {
++                throw new Win32Exception().WithMessage("Could not schedule recent-window timer update!");
++            }
++        }
+ 
+-                m_recentWindowList = cleanedList;
++        private void UpdateRecentTimer()
++        {
++            lock (m_recentWindowSyncRoot)
++            {
++                m_recentTimerUpdatePosted = false;
++                bool enabled = !m_isShuttingDown && m_recentWindowList.Count > 0;
++                if (enabled == m_recentTimerEnabled) { return; }
++                m_setRecentTimerEnabled(enabled);
++                m_recentTimerEnabled = enabled;
+             }
++        }
+ 
+-            foreach (var w in checkList)
++        private void SetRecentTimerEnabled(bool enabled)
++        {
++            if (enabled)
+             {
+-                CheckVisibilityChanges(w);
++                if (SetTimer(new(m_msgWnd), IdtRecentTimerWatch, 10, null) == UIntPtr.Zero)
++                {
++                    throw new Win32Exception().WithMessage("Could not create recent-window timer!");
++                }
++            }
++            else if (!KillTimer(new(m_msgWnd), IdtRecentTimerWatch))
++            {
++                throw new Win32Exception().WithMessage("Could not stop recent-window timer!");
+             }
+         }
+ 
+@@ -811,6 +972,7 @@ namespace WinMan.Windows
+ 
+         private void OnWindowCreated(IntPtr hwnd)
+         {
++            if (m_isShuttingDown) { return; }
+             Win32WindowHandle window = new Win32WindowHandle(hwnd);
+ 
+             m_windowSet[hwnd] = window;
+@@ -836,10 +998,7 @@ namespace WinMan.Windows
+             }
+             else if (Win32Window.GetIsLikelyToBeTopLevelVisibleSoon(this, window.Handle))
+             {
+-                lock (m_recentWindowList)
+-                {
+-                    m_recentWindowList.Add((m_stopwatch.ElapsedMilliseconds, window));
+-                }
++                WatchRecentWindow(window);
+             }
+         }
+ 
+diff --git a/src/WinMan.Windows/Utilities/EventLoop.cs b/src/WinMan.Windows/Utilities/EventLoop.cs
+index 3615986..9b85227 100644
+--- a/src/WinMan.Windows/Utilities/EventLoop.cs
++++ b/src/WinMan.Windows/Utilities/EventLoop.cs
+@@ -24,22 +24,30 @@ namespace WinMan.Windows.Utilities
+             var reader = m_channel.Reader;
+             while (reader.WaitToReadAsync().AsTask().GetAwaiter().GetResult())
+             {
+-                while (reader.TryRead(out var item))
++                Drain(reader);
++            }
++        }
++
++        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
++        private void Drain(ChannelReader<(Action action, TimeSpan queued)> reader)
++        {
++            // Completed callbacks must leave the stack before Run blocks for
++            // more work, including Debug JIT tuple/out temporaries.
++            while (reader.TryRead(out var item))
++            {
++                var (action, queued) = item;
++                try
+                 {
+-                    var (action, queued) = item;
+-                    try
+-                    {
+ #if DEBUG
+-                        BlockTimer.Create(queued).LogIfExceeded(15, $"Schedule of {action.Method.Name}");
++                    BlockTimer.Create(queued).LogIfExceeded(15, $"Schedule of {action.Method.Name}");
+ #endif
+-                        var t = BlockTimer.Create();
+-                        action.Invoke();
+-                        t.LogIfExceeded(15, action.Method.Name);
+-                    }
+-                    catch (Exception e)
+-                    {
+-                        UnhandledException?.Invoke(this, new UnhandledExceptionEventArgs(e, false));
+-                    }
++                    var t = BlockTimer.Create();
++                    action.Invoke();
++                    t.LogIfExceeded(15, action.Method.Name);
++                }
++                catch (Exception e)
++                {
++                    UnhandledException?.Invoke(this, new UnhandledExceptionEventArgs(e, false));
+                 }
+             }
+         }
