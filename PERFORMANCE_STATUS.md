@@ -1,5 +1,14 @@
 # Performance implementation status
 
+## User-confirmed test portable — 2026-09-14
+
+User result: **«Все работает как надо»** for the requested manual check of
+portable **2.19.1.7**, source `4477212` (application code through `e69c96c`).
+The manual verification stage is complete. No repeat UI/test/build run is pending
+without a concrete reason; unspecified monitors, DPI and applications remain
+outside that confirmation. Previous measured improvements and test results are
+unchanged. This documentation closeout performed no tests or rebuild.
+
 ## Discovery candidate checked; current portable ready — 2026-09-14
 
 PERF-002 selected candidate is **already optimized**, so production remains at

@@ -1,5 +1,14 @@
 # Performance optimization plan
 
+## Current scope — 2026-09-14 user verification complete
+
+The user confirmed **«Все работает как надо»** after receiving test portable
+2.19.1.7 (`4477212`, application code through `e69c96c`). The requested manual
+pass is closed; no repeat test or rebuild is required without a concrete reason.
+The confirmation covers the user's actual pass, not separately unspecified
+monitor/DPI/application configurations. No additional performance gain is claimed.
+This closeout changes documentation only; prior results retain their scope.
+
 ## Current scope — 2026-09-14 discovery check and portable complete
 
 One PERF-002 candidate was checked at `e69c96c`: repeated provider desktop
