@@ -1,5 +1,30 @@
 # Performance optimization plan
 
+## Current scope — 2026-09-14 PERF-017 periodic check complete
+
+The bounded review at `9011e2f` covered LowLevelKeyboardHook,
+LowLevelMouseHook, HookRegistrationPolicy and their existing tests only.
+**NO CHANGE:** no safely removable repeated work was established. Delegates
+are already reused across ticks. The second clock read on an admitted recovery
+attempt records its retry timestamp before installation; its timing is an
+explicit regression contract, not a proven redundant read. Keep the 1 s timers,
+strict >5 s idle threshold, recovery and stop/message ordering unchanged.
+
+Existing managed scenarios pass in Debug and Release: 1,000 warmed not-due
+ticks allocate **0 B** and call install/unhook adapters **0 times**. Across
+100 failure/not-due/success cycles (300 ticks), counters report 500 clock reads,
+200 install attempts and 200 unhooks (100 replacements + 100 fixture cleanups).
+All 100 failed installs preserve the old handle; no fake handles remain.
+There is no before/after candidate or improvement claim. Native timer wakeups,
+input latency and CPU were not measured; managed counters do not establish them.
+
+Targeted **97 Debug + 97 Release** cases pass, no failures/skips; no new test or
+production edit was needed. This pass is complete without another candidate,
+full regression or interactive UI run. Reuse the [current portable](docs/portable.md),
+2.19.1.9 from `2dc08a8`; its ZIP SHA-256 was rechecked. No rebuild is needed.
+The broader historical PERF-017 native evidence remains deferred. Next action:
+continue normal use and revisit hooks only for a concrete input/recovery defect.
+
 ## Current scope — 2026-09-14 user verification complete
 
 The user confirmed **«Все работает как надо»** after receiving test portable
@@ -351,7 +376,7 @@ Audit baseline: `FWM-PERF-20260905-4fb943b-tree48c574b-u3`, commit `4fb943be3ee3
 | PERF-014 | 1 | IMPLEMENTED | MEASURED operations | Concurrent fields/last save/retry/lifetime | Native startup/shutdown; process CPU |
 | PERF-015 | 2 | IMPLEMENTED | MEASURED converter | Parser/selector/resource digests | Whole-app theme cost |
 | PERF-016 | 2 | IN_PROGRESS | Scoped native owners/startup graph with adapters; CLR/native caller identity | Prior native candidates/C2/crashes retained; new F1 weak/teardown and calibrated code-generation/stack witnesses | Atomic heap boundary fails native small-allocation control; logical owners/pre-attach history, unmodified shell and broader GUI/GPU/presentation contracts remain missing |
-| PERF-017 | 2 | IN_PROGRESS | MEASURED managed hook calls | Reinstall failure/signed result/startup/dispose | Native idle/latency/recovery before timer redesign |
+| PERF-017 | 2 | IN_PROGRESS | MEASURED managed hook calls; bounded periodic candidate NO CHANGE | 97/97 D/R; zero allocations/adapter calls on not-due ticks; retry timestamp, failure, message order and lifetime preserved | Native idle/latency/recovery deferred; no timer redesign justified by this pass |
 | PERF-018 | 2 | IMPLEMENTED | MEASURED requests, managed allocations/memory and forced-GC pause | Equal-cycle C1R1: exact mechanical baseline, 5 A/B pairs/10 sequential x64 processes/600 rows; requests 960->45, full-GC passes 1,920->90, pause 15/15 wins, allocation 14/15; targeted 2/2 and affected 26/26 D/R | Real display/native heap/process CPU/GPU/DWM remains E2E_PENDING; pre-final heap is higher without redundant collections, so no retained-memory claim |
 | PERF-019 | 2 | IMPLEMENTED | MEASURED diagnostic reads | 27 guards/enabled fields/errors/A/B | Logging volume/process I/O |
 | PERF-020 | 2 | IMPLEMENTED | MEASURED allocations/callbacks | Deadline/version/clock/lifetime/A/B | Native wakeups; process CPU |

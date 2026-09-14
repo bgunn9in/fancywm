@@ -1,5 +1,39 @@
 # Performance implementation status
 
+## PERF-017 periodic candidate checked — 2026-09-14
+
+At `9011e2f`, the three hook/policy files and directly related tests show no
+safe, useful local removal of repeated work. Tick delegates are already reused;
+the admitted attempt's second clock read preserves the independently tested
+retry timestamp before installation. **Candidate not implemented; application
+and tests unchanged.** The 1 s watchdogs and strict >5 s recovery remain intact.
+
+Existing scenarios produce the same results in Debug/Release:
+
+| Scope | Measured result in each configuration |
+|---|---|
+| 1,000 warmed not-due RefreshIfIdle calls | 0 managed allocation bytes; 0 install/unhook adapter calls |
+| 100 cycles: failed attempt, not-due tick, successful retry | 300 ticks; 500 clock reads; 200 install attempts |
+| Replacement and fixture cleanup | 100 replacement + 100 final unhooks; 100 old handles preserved on failure; 0 remaining fake handles |
+
+These are managed policy/adapter counts, not native API measurements. No
+before/after implementation exists and no performance gain is claimed. CPU,
+native wakeups, input latency and interactive recovery were not measured.
+Targeted **97 Debug + 97 Release** cases pass, zero failures/skips, including
+retry cadence, clock rollback, failure cleanup, message/callback order and
+keyboard/mouse startup/disposal. Existing compiler warnings remain. Raw TRX/logs
+are ignored under `artifacts/performance/FWM-PERF017-PERIODIC-20260914/`.
+
+No full regression, interactive UI, new packaging or second candidate. Reuse
+portable **2.19.1.9**, source `2dc08a8`, archive
+`artifacts/portable/FancyWM-Portable-win-x64-20260914-160522-654.zip`;
+SHA-256 rechecked as
+`0A2EDEF843820E9330368A2209FDFAF0CAD335629CA25363AD265E496196C8FE`.
+[Archive and instructions](docs/portable.md). Only these two status documents
+changed; dependency patches/gitlink and unrelated files are preserved. The
+bounded pass is complete; further hook work needs a concrete input/recovery
+defect. Historical native evidence limits remain unchanged.
+
 ## User-confirmed test portable — 2026-09-14
 
 User result: **«Все работает как надо»** for the requested manual check of
