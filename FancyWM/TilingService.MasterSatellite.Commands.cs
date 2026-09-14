@@ -93,6 +93,29 @@ namespace FancyWM
             CompleteMasterSatelliteCommand("SwapMasterSide", desktop, result);
         }
 
+        public bool CanToggleFocusedSatelliteSlot()
+        {
+            if (!TryGetCurrentMasterSatelliteDesktop(out var desktop))
+            {
+                return false;
+            }
+            using (m_backendLock.EnterScope())
+            {
+                return m_masterSatelliteCommands.CanToggleFocusedSatelliteSlot(m_backend, desktop);
+            }
+        }
+
+        public void ToggleFocusedSatelliteSlot()
+        {
+            MasterSatelliteCommandResult result;
+            var desktop = GetRequiredMasterSatelliteCommandDesktop();
+            using (m_backendLock.EnterScope())
+            {
+                result = m_masterSatelliteCommands.ToggleFocusedSatelliteSlot(m_backend, desktop);
+            }
+            CompleteMasterSatelliteCommand("ToggleFocusedSatelliteSlot", desktop, result);
+        }
+
         public bool CanToggleSatelliteOrientation() => CanMutateCurrentMasterSatelliteLayout();
 
         public void ToggleSatelliteOrientation()

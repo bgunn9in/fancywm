@@ -44,6 +44,8 @@ namespace FancyWM.AlgorithmicLayouts
 
         public SatelliteLayoutOrientation SatelliteOrientation { get; }
 
+        public bool UseMixedSatellites { get; }
+
         public IWindow? Master { get; }
 
         public IReadOnlyList<IWindow> Satellites { get; }
@@ -68,6 +70,7 @@ namespace FancyWM.AlgorithmicLayouts
             RequestedMasterRatio = state.RequestedMasterRatio;
             EffectiveMasterRatio = state.EffectiveMasterRatio;
             SatelliteOrientation = state.SatelliteOrientation;
+            UseMixedSatellites = state.UseMixedSatellites;
             Master = state.Master;
             Satellites = Array.AsReadOnly(state.Satellites.ToArray());
             Revision = state.Revision;

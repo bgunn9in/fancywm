@@ -13,7 +13,8 @@ namespace FancyWM.Pages.Settings
         bool IsMasterFirst,
         bool SatellitesUseRows,
         int ConfiguredSatelliteCount,
-        int VisibleSatelliteCount)
+        int VisibleSatelliteCount,
+        bool IsMixedLayout = false)
     {
         internal const int MaximumVisibleSatellites = 6;
 
@@ -24,7 +25,8 @@ namespace FancyWM.Pages.Settings
             double masterRatio,
             MasterSide masterSide,
             SatelliteLayoutOrientation satelliteOrientation,
-            int maxSatellites)
+            int maxSatellites,
+            bool useMixedSatellites = false)
         {
             var ratio = double.IsFinite(masterRatio)
                 ? Math.Clamp(
@@ -42,7 +44,8 @@ namespace FancyWM.Pages.Settings
                 masterSide != MasterSide.Right,
                 satelliteOrientation != SatelliteLayoutOrientation.Horizontal,
                 configuredSatelliteCount,
-                Math.Min(configuredSatelliteCount, MaximumVisibleSatellites));
+                Math.Min(configuredSatelliteCount, MaximumVisibleSatellites),
+                useMixedSatellites && configuredSatelliteCount == 3);
         }
     }
 }

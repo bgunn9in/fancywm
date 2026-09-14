@@ -171,7 +171,7 @@ namespace FancyWM.Tests.AlgorithmicLayouts
         }
 
         [TestMethod]
-        public void MasterDroppedOnSatellitePromotesTargetAndMovesMasterToThatSlot()
+        public void MasterDroppedOnSatelliteChangesSideAndKeepsItsRole()
         {
             var context = CreateActive(CreateWindows(4));
             var state = GetState(context);
@@ -179,15 +179,14 @@ namespace FancyWM.Tests.AlgorithmicLayouts
             var target = context.Windows[2];
             var plan = PlanAtWindow(context, oldMaster, target);
 
-            Assert.AreEqual(MasterSatelliteDropKind.PromoteTargetSatellite, plan.Kind);
+            Assert.AreEqual(MasterSatelliteDropKind.ChangeMasterSide, plan.Kind);
             var expectedPreviewRectangle = plan.PreviewRectangle;
             var result = Apply(context, plan);
 
             AssertApplied(result);
-            Assert.AreSame(target, state.Master);
-            CollectionAssert.AreEqual(
-                new[] { context.Windows[1], oldMaster, context.Windows[3] },
-                state.Satellites.ToArray());
+            Assert.AreSame(oldMaster, state.Master);
+            Assert.AreEqual(MasterSide.Right, state.MasterSide);
+            CollectionAssert.AreEqual(context.Windows.Skip(1).ToArray(), state.Satellites.ToArray());
             Assert.AreEqual(expectedPreviewRectangle, RectangleFor(context, oldMaster));
             AssertInvariant(context);
         }

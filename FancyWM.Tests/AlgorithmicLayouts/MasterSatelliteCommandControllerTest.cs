@@ -14,7 +14,7 @@ using WinMan;
 namespace FancyWM.Tests.AlgorithmicLayouts
 {
     [TestClass]
-    public class MasterSatelliteCommandControllerTest
+    public partial class MasterSatelliteCommandControllerTest
     {
         private readonly UniqueWindowMockFactory m_windows = new();
         private readonly Rectangle m_workArea = Rectangle.OffsetAndSize(0, 0, 1000, 600);
@@ -316,83 +316,91 @@ namespace FancyWM.Tests.AlgorithmicLayouts
         }
 
         [DataTestMethod]
-        [DataRow(2, MasterSide.Left, TilingDirection.Left, 0)]
-        [DataRow(2, MasterSide.Right, TilingDirection.Right, 0)]
-        [DataRow(4, MasterSide.Left, TilingDirection.Left, 0)]
-        [DataRow(4, MasterSide.Right, TilingDirection.Right, 2)]
-        public void MoveSatelliteAcrossAdjacentMasterPromotesOnActiveAxis(
-            int windowCount,
-            MasterSide masterSide,
-            TilingDirection direction,
-            int satelliteIndex)
+        [DataRow(SatelliteLayoutOrientation.Horizontal, MasterSide.Left)]
+        [DataRow(SatelliteLayoutOrientation.Horizontal, MasterSide.Right)]
+        [DataRow(SatelliteLayoutOrientation.Vertical, MasterSide.Left)]
+        [DataRow(SatelliteLayoutOrientation.Vertical, MasterSide.Right)]
+        public void MoveSatelliteAcrossImmediateMasterPreservesExactSlot(
+            SatelliteLayoutOrientation orientation, MasterSide side)
         {
-            var context = CreateActive(CreateWindows(windowCount));
-            var state = GetState(context);
-            var originalMaster = state.Master!;
-            if (masterSide == MasterSide.Right)
+            for (int count = 1; count <= 3; count++)
+            for (int index = 0; index < count; index++)
             {
-                AssertApplied(context.Controller.SwapMasterSide(
-                    context.Workspace,
-                    context.Desktop));
+                var context = CreateActive(CreateWindows(count + 1));
+                var state = GetState(context);
+                Assert.IsTrue(context.Controller.SetSatelliteOrientation(
+                    context.Workspace, context.Desktop, orientation).Succeeded);
+                Assert.IsTrue(context.Workspace.SetMasterSatelliteSide(
+                    context.Desktop, state, context.Settings, side).Succeeded);
+                var master = state.Master!;
+                var satellites = state.Satellites.ToArray();
+                var selected = satellites[index];
+                var tree = context.Workspace.GetTree(context.Desktop)!;
+                var nodes = context.Windows.Select(tree.FindNode).ToArray();
+                var slot = tree.FindNode(selected)!.ComputedRectangle;
+                double ratio = state.RequestedMasterRatio;
+                var direction = side == MasterSide.Left ? TilingDirection.Left : TilingDirection.Right;
+                bool adjacentMaster = orientation == SatelliteLayoutOrientation.Vertical
+                    || index == (side == MasterSide.Left ? 0 : count - 1);
+                context.Workspace.SetFocus(selected);
+                Assert.IsTrue(context.Controller.CanMoveFocusedWindow(context.Workspace, context.Desktop, direction));
+                AssertApplied(context.Controller.MoveFocusedWindow(context.Workspace, context.Desktop, direction));
+                if (adjacentMaster)
+                {
+                    Assert.AreSame(selected, state.Master);
+                    satellites[index] = master;
+                    Assert.AreEqual(slot, tree.FindNode(master)!.ComputedRectangle);
+                }
+                else
+                {
+                    Assert.AreSame(master, state.Master, "Cannot jump over an intervening satellite.");
+                    int neighbor = index + (side == MasterSide.Left ? -1 : 1);
+                    (satellites[index], satellites[neighbor]) = (satellites[neighbor], satellites[index]);
+                }
+                CollectionAssert.AreEqual(satellites, state.Satellites.ToArray());
+                CollectionAssert.AreEqual(nodes, context.Windows.Select(tree.FindNode).ToArray());
+                Assert.AreEqual(side, state.MasterSide);
+                Assert.AreEqual(ratio, state.RequestedMasterRatio);
+                AssertFocusedWindow(context, selected);
             }
-            Assert.AreEqual(masterSide, state.MasterSide);
-            var selected = state.Satellites[satelliteIndex];
-            context.Workspace.SetFocus(selected);
+        }
 
-            // The master is spatially adjacent in this direction, but promotion
-            // through Move remains limited to the active satellite axis.
-            Assert.IsFalse(context.Controller.CanMoveFocusedWindow(
-                context.Workspace,
-                context.Desktop,
-                direction));
-            AssertApplied(context.Controller.ToggleSatelliteOrientation(
-                context.Workspace,
-                context.Desktop));
-            Assert.AreEqual(
-                SatelliteLayoutOrientation.Horizontal,
-                state.SatelliteOrientation);
-
-            var outerDirection = direction == TilingDirection.Left
-                ? TilingDirection.Right
-                : TilingDirection.Left;
-            var outerSatellite = direction == TilingDirection.Left
-                ? state.Satellites[^1]
-                : state.Satellites[0];
-            context.Workspace.SetFocus(outerSatellite);
-            Assert.IsFalse(context.Controller.CanMoveFocusedWindow(
-                context.Workspace,
-                context.Desktop,
-                outerDirection));
-            var outerMove = context.Controller.MoveFocusedWindow(
-                context.Workspace,
-                context.Desktop,
-                outerDirection);
-            Assert.IsFalse(outerMove.Succeeded);
-            Assert.AreEqual(
-                MasterSatelliteFailureReason.InvalidSatelliteIndex,
-                outerMove.FailureReason);
-
-            context.Workspace.SetFocus(selected);
-            Assert.IsTrue(context.Controller.CanMoveFocusedWindow(
-                context.Workspace,
-                context.Desktop,
-                direction));
-
-            var result = context.Controller.MoveFocusedWindow(
-                context.Workspace,
-                context.Desktop,
-                direction);
-
-            AssertApplied(result);
-            Assert.AreSame(selected, state.Master);
-            Assert.AreSame(originalMaster, state.Satellites[satelliteIndex]);
-            Assert.AreEqual(masterSide, state.MasterSide);
-            AssertFocusedWindow(context, selected);
-            var invariant = context.Workspace.ValidateMasterSatelliteLayout(
-                context.Desktop,
-                state,
-                context.Settings);
-            Assert.IsTrue(invariant.IsValid, invariant.Description);
+        [DataTestMethod]
+        [DataRow(SatelliteLayoutOrientation.Horizontal, MasterSide.Left)]
+        [DataRow(SatelliteLayoutOrientation.Horizontal, MasterSide.Right)]
+        [DataRow(SatelliteLayoutOrientation.Vertical, MasterSide.Left)]
+        [DataRow(SatelliteLayoutOrientation.Vertical, MasterSide.Right)]
+        public void MasterMovesSideAndOuterEdgesDoNotMutate(
+            SatelliteLayoutOrientation orientation, MasterSide side)
+        {
+            var context = CreateActive(CreateWindows(4));
+            var state = GetState(context);
+            context.Controller.SetSatelliteOrientation(context.Workspace, context.Desktop, orientation);
+            context.Workspace.SetMasterSatelliteSide(context.Desktop, state, context.Settings, side);
+            var master = state.Master!;
+            var satellites = state.Satellites.ToArray();
+            context.Workspace.SetFocus(master);
+            var outer = side == MasterSide.Left ? TilingDirection.Left : TilingDirection.Right;
+            foreach (var direction in new[] { outer, TilingDirection.Up, TilingDirection.Down })
+            {
+                long revision = state.Revision;
+                Assert.IsFalse(context.Controller.CanMoveFocusedWindow(context.Workspace, context.Desktop, direction));
+                Assert.IsFalse(context.Controller.MoveFocusedWindow(context.Workspace, context.Desktop, direction).Changed);
+                Assert.AreEqual(revision, state.Revision);
+            }
+            var opposite = side == MasterSide.Left ? TilingDirection.Right : TilingDirection.Left;
+            Assert.IsTrue(context.Controller.CanMoveFocusedWindow(context.Workspace, context.Desktop, opposite));
+            AssertApplied(context.Controller.MoveFocusedWindow(context.Workspace, context.Desktop, opposite));
+            Assert.AreSame(master, state.Master);
+            Assert.AreEqual(side == MasterSide.Left ? MasterSide.Right : MasterSide.Left, state.MasterSide);
+            CollectionAssert.AreEqual(satellites, state.Satellites.ToArray());
+            AssertFocusedWindow(context, master);
+            int outerIndex = state.MasterSide == MasterSide.Left ? satellites.Length - 1 : 0;
+            context.Workspace.SetFocus(satellites[outerIndex]);
+            long before = state.Revision;
+            Assert.IsFalse(context.Controller.CanMoveFocusedWindow(context.Workspace, context.Desktop, outer));
+            Assert.IsFalse(context.Controller.MoveFocusedWindow(context.Workspace, context.Desktop, outer).Changed);
+            Assert.AreEqual(before, state.Revision);
         }
 
         [TestMethod]

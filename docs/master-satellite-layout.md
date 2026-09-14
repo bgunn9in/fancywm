@@ -2,7 +2,7 @@
 
 ## Status
 
-The feature is implemented behind an opt-in setting and is disabled by default. Pure layout, workspace, coordinator, settings, and service-facing components are covered by automated tests. Direct live `TilingService`/WinMan event paths and Windows checks involving UWQHD/DPI combinations, desktop COM integration, and interactive accessibility remain manual acceptance gates; see `IMPLEMENTATION_STATUS.md` for the exact latest build and test results.
+The feature is implemented behind an opt-in setting and is disabled by default. Pure layout, workspace, coordinator, settings, and service-facing components are covered by automated tests. Direct live `TilingService`/WinMan event paths and Windows checks involving UWQHD/DPI combinations, desktop COM integration, and interactive accessibility remain manual acceptance gates; see `NEW_FEATURE_TODO.md` and [the feature verification report](new-features-verification.md) for current-stage results; `IMPLEMENTATION_STATUS.md` records earlier stages.
 
 ## Purpose
 
@@ -14,7 +14,7 @@ Enable it under **Settings → Layouts → Master + Satellites**. The setting ap
 
 State is scoped to a `(virtual desktop, display)` pair. Runtime roles, window handles, desktop references, reservations, and transfer intents are never serialized in settings.
 
-The empty layout has no tiled windows. A one-window layout has a horizontal `SplitPanelNode` root containing only the master, which receives the full display `WorkArea`. Once a satellite exists, the same horizontal root contains exactly two children: the master and one satellite `SplitPanelNode`. Their order represents whether the master is on the left or right. The satellite panel contains only ordered `WindowNode` children and is vertical or horizontal according to runtime state.
+The empty layout has no tiled windows. A one-window layout has a horizontal `SplitPanelNode` root containing only the master, which receives the full display `WorkArea`. Once a satellite exists, the same horizontal root contains exactly two children: the master and one satellite `SplitPanelNode`. Their order represents whether the master is on the left or right. In ordinary modes the satellite panel contains only ordered `WindowNode` children and is vertical or horizontal according to runtime state. With `UseMixedSatellites=true` and exactly three satellites it is vertical, containing a horizontal V1/V2 split followed by the lower window H. No other nesting is allowed.
 
 ```text
 Master left                         Master right
@@ -41,7 +41,7 @@ Vertical satellites                Horizontal satellites
 └──────────────┴──────┘            └──────────────┴──┴──┴──┘
 ```
 
-The canonical tree contains no nested satellite panels, stacks, placeholders, layout-function nodes, or duplicate windows. Its master and satellite sequence must match runtime state, and the satellite count must not exceed `MaxSatellites`. Every committed mutation must validate this invariant. Recovery must preserve all windows; if safe recovery is impossible, algorithmic mode is disabled only for the affected desktop/display pair.
+The canonical tree permits only the additional upper V1/V2 split in the enabled three-satellite mixed shape; no other nested satellite panels, stacks, placeholders, layout-function nodes or duplicate windows are allowed. Its master and satellite sequence must match runtime state, and the satellite count must not exceed `MaxSatellites`. Every committed mutation must validate this invariant. Recovery must preserve all windows; if safe recovery is impossible, algorithmic mode is disabled only for the affected desktop/display pair.
 
 ## Settings and defaults
 
@@ -49,13 +49,14 @@ The canonical tree contains no nested satellite panels, stacks, placeholders, la
 - Master ratio: 60%, normalized to 50–80%.
 - Master side: left.
 - Satellite orientation: vertical.
+- Mixed layout with three satellites: off (`UseMixedSatellites=false`).
 - Maximum satellites: 3, normalized to 1–9; total default capacity is 4 tiled windows.
 - Overflow: move to a suitable existing desktop.
 - Display scope: primary display.
 - Automatically created desktop limit: 1, normalized to 0–9.
 - Do not follow an overflowed window by default.
 
-Settings are normalized when loaded, so older `settings.json` files that do not contain the feature receive these defaults. Runtime roles and transfer state are not serialized. Every layout field saves automatically; there is no separate Apply button. **Reset settings to UWQHD preset** selects the 60% ratio, left master, vertical satellites, three satellites, existing-desktop overflow, and no follow. It deliberately preserves the current enabled state, display scope, and automatic-desktop limit, along with unrelated settings. Choose Horizontal after the reset if that is the desired live orientation; changing it updates the current active canonical tree without restarting FancyWM.
+Settings are normalized when loaded, so older `settings.json` files that do not contain the feature receive these defaults. Runtime roles and transfer state are not serialized. Every layout field saves automatically; there is no separate Apply button. **Reset settings to UWQHD preset** selects the 60% ratio, left master, vertical satellites, mixed layout off, three satellites, existing-desktop overflow, and no follow. It deliberately preserves the current enabled state, display scope, and automatic-desktop limit, along with unrelated settings. Choose Horizontal after the reset if that is the desired live orientation; changing it updates the current active canonical tree without restarting FancyWM.
 
 The implementation uses each display's `IDisplay.WorkArea`, including its current DPI-adjusted dimensions, spacing, padding, and every tiled window's minimum size. It retains requested and effective master ratios separately when constraints force an adjustment. `AutoSplitCount` is not a capacity setting for this feature.
 
@@ -81,7 +82,33 @@ All keybindings remain configurable. With FancyWM's activation chord, the defaul
 - `M` — promote the focused satellite to master.
 - `B` — move the master from left to right or back.
 
-Toggle satellite orientation, reset master ratio, and rebalance are exposed as bindable actions without default keys to avoid conflicts. Existing directional move actions reorder satellites along their visible axis. At the inner edge of a horizontal satellite row, moving toward the adjacent master promotes the focused satellite and places the old master in that exact satellite slot; this also covers the visually natural two-window left/right move. Moving a master left/right changes its side. Existing width-resize actions adjust the focused master's ratio within 50–80%. Stack creation and arbitrary nested-panel operations are rejected while the canonical layout is active.
+Toggle satellite orientation, **Switch upper / wide satellite slot** (`ToggleFocusedSatelliteSlot`), reset master ratio, and rebalance are bindable actions without default keys. Assign the new slot command in **Settings / Keybindings / Master + Satellites**; direct mode uses the same handler. It does not replace the orientation command.
+
+Directional moves promote a satellite when its immediate neighbour is the master, in Horizontal, Vertical and mixed layouts. The old master takes the exact freed slot, including V1/V2/H; other satellites stay in place. An intervening satellite must be crossed first. Master MoveLeft/MoveRight changes its side while preserving its role, focus and satellite order. Moving the master further towards its current outer edge is a no-op; vertical master moves are rejected. Satellite moves at an outer boundary are rejected without wrapping. These rules mirror for either master side.
+
+Existing width-resize actions adjust the focused master's ratio within 50-80%. Stack creation and arbitrary nested-panel operations remain rejected while the canonical layout is active.
+
+## Mixed layout with three satellites
+
+Enable **Settings / Layouts / Mixed layout with three satellites**. It saves automatically and applies without restart when the current windows fit. Old settings leave it disabled. With exactly three satellites, V1/V2 divide the upper width equally and receive two thirds of the satellite region's height; H spans the lower third. Work area, spacing, panel padding and minimum sizes constrain these relative proportions.
+
+```text
+Master right                     Master left
++------+------+----------+       +----------+------+------+
+|  V1  |  V2  |          |       |          |  V1  |  V2  |
+|      |      |  MASTER  |       |  MASTER  |      |      |
++------+------+          |       |          +------+------+
+|      H      |          |       |          |      H      |
++-------------+----------+       +----------+-------------+
+```
+
+The satellite order means `[V1,V2,H]`. MoveDown from either upper window exchanges it with H; MoveUp from H chooses the nearest upper neighbour, with V1 winning equal-distance and one-pixel rounding ties. MoveRight from V1 and MoveLeft from V2 exchange the upper pair. The new slot command uses exactly the same upper/lower selection. Every exchange swaps only two windows; the third window and master keep their places and the moved window keeps focus. For example, `[A,B,C]` becomes `[C,B,A]` after MoveDown(A). Drag onto a specific satellite to exchange those two places, anywhere within the target rectangle.
+
+With master right, V2 and H can promote directly by MoveRight; V1 first exchanges with V2. With master left, V1 and H can promote by MoveLeft; V2 first exchanges with V1.
+
+While the mixed shape is active, orientation commands update the ordinary fallback orientation; V1/V2/H remains mixed. At any other satellite count, the selected ordinary orientation applies. The mixed preference stays enabled and returns at three satellites; close, minimize/restore, float/unfloat and capacity transitions preserve the relative order of survivors. Capacity and overflow remain independent. The settings preview illustrates the configured maximum count (capped at six displayed tiles), showing V1/V2/H when that count is three. It cannot predict application-specific minimum sizes.
+
+Impossible exchanges or setting changes are rejected atomically, keeping the previous layout. A new window that cannot fit follows the existing overflow policy. No additional slot history, persisted window roles or layout backend is introduced.
 
 ## Window roles and operations
 
@@ -89,7 +116,7 @@ The first tiled window becomes master. The second creates the master/satellite s
 
 For example, promoting `C` in `Master=A, Satellites=[B,C,D]` yields `Master=C, Satellites=[B,A,D]`. The old master does not move to the front or end: it occupies `C`'s selected slot.
 
-Mouse drops use a detached preview plan. Dropping a satellite before or after another satellite reorders it; dropping a satellite on the master promotes it; dropping the master on a satellite promotes that satellite; crossing the central boundary changes the master side. Unsupported drops do not mutate the production tree, and the preview is cleared when the drag ends or is cancelled. The current overlay suppresses an impossible preview and explains the rejection after release; it does not yet draw a dedicated red/invalid target. Interactive mouse behavior still requires a live Windows verification pass.
+Mouse drops use a detached preview plan. In ordinary layouts, dropping a satellite before or after another satellite reorders it; in the mixed shape it exchanges their exact slots. Dropping a satellite on the master promotes it. Dragging the master across the central boundary, including onto a satellite, changes the side and preserves the master role. Explicit promotion commands continue to promote a satellite. Unsupported drops do not mutate the production tree, and the preview is cleared when the drag ends or is cancelled. The current overlay suppresses an impossible preview and explains the rejection after release; it does not yet draw a dedicated red/invalid target. Interactive mouse behavior still requires a live Windows verification pass.
 
 ## Overflow contract
 

@@ -9,6 +9,21 @@ namespace FancyWM.Tests.Models
     public class MasterSatellitePreviewPlanTest
     {
         [TestMethod]
+        public void MixedPreviewRequiresExplicitPreferenceAndExactlyThreeSatellites()
+        {
+            foreach (var side in new[] { MasterSide.Left, MasterSide.Right })
+            foreach (var orientation in new[] { SatelliteLayoutOrientation.Horizontal, SatelliteLayoutOrientation.Vertical })
+            foreach (bool enabled in new[] { false, true })
+            for (int count = 1; count <= 9; count++)
+            {
+                var plan = MasterSatellitePreviewPlan.Create(0.6, side, orientation, count, enabled);
+                Assert.AreEqual(enabled && count == 3, plan.IsMixedLayout);
+                Assert.AreEqual(side == MasterSide.Left, plan.IsMasterFirst);
+                Assert.AreEqual(0.6, plan.MasterFraction);
+            }
+        }
+
+        [TestMethod]
         public void CreatesLeftVerticalPreviewFromSettings()
         {
             var plan = MasterSatellitePreviewPlan.Create(

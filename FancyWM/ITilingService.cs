@@ -80,6 +80,8 @@ namespace FancyWM
         void SwapMasterSide();
         bool CanToggleSatelliteOrientation();
         void ToggleSatelliteOrientation();
+        bool CanToggleFocusedSatelliteSlot();
+        void ToggleFocusedSatelliteSlot();
         bool CanResetMasterRatio();
         void ResetMasterRatio();
         bool CanRebalanceMasterSatelliteLayout();

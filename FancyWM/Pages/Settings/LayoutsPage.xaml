@@ -120,6 +120,16 @@
 
                 <Border Style="{DynamicResource SettingsItemStyle}">
                     <StackPanel>
+                        <CheckBox Content="Mixed layout with three satellites"
+                                  IsChecked="{Binding UseMixedSatellites, Mode=TwoWay}"
+                                  AutomationProperties.Name="Mixed layout with three satellites" />
+                        <TextBlock Margin="0,8,0,0" TextWrapping="Wrap"
+                                   Text="With exactly three satellites: two upper windows and one wide lower window. Other counts use the selected orientation. Applies immediately when the windows fit." />
+                    </StackPanel>
+                </Border>
+
+                <Border Style="{DynamicResource SettingsItemStyle}">
+                    <StackPanel>
                         <DockPanel Margin="0,0,0,8">
                             <TextBlock DockPanel.Dock="Right" Text="{Binding MasterRatio, StringFormat={}{0:P0}}" />
                             <TextBlock Text="Master ratio" />

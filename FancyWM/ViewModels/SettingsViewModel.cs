@@ -46,6 +46,7 @@ namespace FancyWM.ViewModels
         public double MasterRatio { get => m_masterRatio; set => SetField(ref m_masterRatio, value); }
         public MasterSide DefaultMasterSide { get => m_defaultMasterSide; set => SetField(ref m_defaultMasterSide, value); }
         public SatelliteLayoutOrientation DefaultSatelliteOrientation { get => m_defaultSatelliteOrientation; set => SetField(ref m_defaultSatelliteOrientation, value); }
+        public bool UseMixedSatellites { get => m_useMixedSatellites; set => SetField(ref m_useMixedSatellites, value); }
         public int MaxSatellites { get => m_maxSatellites; set => SetField(ref m_maxSatellites, value); }
 
         public MasterSatelliteOverflowPolicy OverflowPolicy
@@ -252,6 +253,7 @@ namespace FancyWM.ViewModels
         private double m_masterRatio;
         private MasterSide m_defaultMasterSide;
         private SatelliteLayoutOrientation m_defaultSatelliteOrientation;
+        private bool m_useMixedSatellites;
         private int m_maxSatellites;
         private MasterSatelliteOverflowPolicy m_overflowPolicy;
         private AlgorithmicLayoutDisplayScope m_algorithmicLayoutDisplayScope;
@@ -319,6 +321,7 @@ namespace FancyWM.ViewModels
                     MasterRatio = settings.MasterSatelliteLayout.MasterRatio;
                     DefaultMasterSide = settings.MasterSatelliteLayout.DefaultMasterSide;
                     DefaultSatelliteOrientation = settings.MasterSatelliteLayout.DefaultSatelliteOrientation;
+                    UseMixedSatellites = settings.MasterSatelliteLayout.UseMixedSatellites;
                     MaxSatellites = settings.MasterSatelliteLayout.MaxSatellites;
                     OverflowPolicy = settings.MasterSatelliteLayout.OverflowPolicy;
                     AlgorithmicLayoutDisplayScope = settings.MasterSatelliteLayout.DisplayScope;
@@ -564,6 +567,7 @@ namespace FancyWM.ViewModels
                         MasterRatio = MasterRatio,
                         DefaultMasterSide = DefaultMasterSide,
                         DefaultSatelliteOrientation = DefaultSatelliteOrientation,
+                        UseMixedSatellites = UseMixedSatellites,
                         MaxSatellites = MaxSatellites,
                         OverflowPolicy = OverflowPolicy,
                         DisplayScope = AlgorithmicLayoutDisplayScope,
@@ -601,6 +605,7 @@ namespace FancyWM.ViewModels
                 nameof(MasterRatio) => x with { MasterSatelliteLayout = x.MasterSatelliteLayout with { MasterRatio = changed.MasterSatelliteLayout.MasterRatio } },
                 nameof(DefaultMasterSide) => x with { MasterSatelliteLayout = x.MasterSatelliteLayout with { DefaultMasterSide = changed.MasterSatelliteLayout.DefaultMasterSide } },
                 nameof(DefaultSatelliteOrientation) => x with { MasterSatelliteLayout = x.MasterSatelliteLayout with { DefaultSatelliteOrientation = changed.MasterSatelliteLayout.DefaultSatelliteOrientation } },
+                nameof(UseMixedSatellites) => x with { MasterSatelliteLayout = x.MasterSatelliteLayout with { UseMixedSatellites = changed.MasterSatelliteLayout.UseMixedSatellites } },
                 nameof(MaxSatellites) => x with { MasterSatelliteLayout = x.MasterSatelliteLayout with { MaxSatellites = changed.MasterSatelliteLayout.MaxSatellites } },
                 nameof(OverflowPolicy) => x with { MasterSatelliteLayout = x.MasterSatelliteLayout with { OverflowPolicy = changed.MasterSatelliteLayout.OverflowPolicy } },
                 nameof(AlgorithmicLayoutDisplayScope) => x with { MasterSatelliteLayout = x.MasterSatelliteLayout with { DisplayScope = changed.MasterSatelliteLayout.DisplayScope } },
@@ -629,6 +634,7 @@ namespace FancyWM.ViewModels
                     MasterRatio = changed.MasterSatelliteLayout.MasterRatio,
                     DefaultMasterSide = changed.MasterSatelliteLayout.DefaultMasterSide,
                     DefaultSatelliteOrientation = changed.MasterSatelliteLayout.DefaultSatelliteOrientation,
+                    UseMixedSatellites = changed.MasterSatelliteLayout.UseMixedSatellites,
                     MaxSatellites = changed.MasterSatelliteLayout.MaxSatellites,
                     OverflowPolicy = changed.MasterSatelliteLayout.OverflowPolicy,
                     FollowOverflowWindow = changed.MasterSatelliteLayout.FollowOverflowWindow,
@@ -653,6 +659,7 @@ namespace FancyWM.ViewModels
                 MasterRatio = 0.60;
                 DefaultMasterSide = MasterSide.Left;
                 DefaultSatelliteOrientation = SatelliteLayoutOrientation.Vertical;
+                UseMixedSatellites = false;
                 MaxSatellites = 3;
                 OverflowPolicy = MasterSatelliteOverflowPolicy.MoveToExistingDesktop;
                 FollowOverflowWindow = false;
@@ -688,6 +695,7 @@ namespace FancyWM.ViewModels
                     BindableAction.PromoteFocusedWindowToMaster,
                     BindableAction.SwapMasterSide,
                     BindableAction.ToggleSatelliteOrientation,
+                    BindableAction.ToggleFocusedSatelliteSlot,
                     BindableAction.ResetMasterRatio,
                     BindableAction.RebalanceMasterSatelliteLayout,
                 }),

@@ -1078,6 +1078,16 @@ namespace FancyWM
             GetActiveTilingService().SwapMasterSide();
         }
 
+        public bool CanToggleFocusedSatelliteSlot()
+        {
+            return GetActiveTilingService().CanToggleFocusedSatelliteSlot();
+        }
+
+        public void ToggleFocusedSatelliteSlot()
+        {
+            GetActiveTilingService().ToggleFocusedSatelliteSlot();
+        }
+
         public bool CanToggleSatelliteOrientation()
         {
             return GetActiveTilingService().CanToggleSatelliteOrientation();

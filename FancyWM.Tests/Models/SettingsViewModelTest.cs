@@ -26,6 +26,71 @@ namespace FancyWM.Tests.Models
     public class SettingsViewModelTest
     {
         [TestMethod]
+        public void LayoutsPageMixedCheckboxUpdatesBoundSettingAndActualPreviewGrid()
+        {
+            RunOnSta(() =>
+            {
+                var entity = new RecordingSettingsEntity(new Settings
+                {
+                    MasterSatelliteLayout = new MasterSatelliteLayoutSettings { Enabled = true }
+                });
+                using var model = CreateViewModel(entity);
+                var page = new FancyWM.Pages.Settings.LayoutsPage(model);
+                page.RaiseEvent(new System.Windows.RoutedEventArgs(System.Windows.FrameworkElement.LoadedEvent));
+                try
+                {
+                    var preview = (System.Windows.Controls.Grid)page.FindName("PreviewGrid");
+                    var checkbox = FindMixedCheckbox(page);
+                    Assert.IsNotNull(checkbox);
+                    checkbox.IsChecked = true;
+                    Assert.IsTrue(model.UseMixedSatellites);
+                    Assert.IsTrue(entity.Current.MasterSatelliteLayout.UseMixedSatellites);
+                    var satellites = (System.Windows.Controls.Grid)preview.Children[1];
+                    Assert.AreEqual(2, satellites.RowDefinitions.Count);
+                    Assert.AreEqual(2, satellites.ColumnDefinitions.Count);
+                    Assert.AreEqual(2.0, satellites.RowDefinitions[0].Height.Value);
+                    Assert.AreEqual(2, System.Windows.Controls.Grid.GetColumnSpan(satellites.Children[2]));
+                    model.DefaultMasterSide = MasterSide.Right;
+                    Assert.AreEqual(1, System.Windows.Controls.Grid.GetColumn(preview.Children[0]));
+                    model.MaxSatellites = 4;
+                    satellites = (System.Windows.Controls.Grid)preview.Children[1];
+                    Assert.AreEqual(4, satellites.RowDefinitions.Count);
+                    Assert.IsTrue(model.UseMixedSatellites);
+                    model.MaxSatellites = 3;
+                    Assert.AreEqual(2, ((System.Windows.Controls.Grid)preview.Children[1]).RowDefinitions.Count);
+                    checkbox.IsChecked = false;
+                    Assert.AreEqual(3, ((System.Windows.Controls.Grid)preview.Children[1]).RowDefinitions.Count);
+                }
+                finally
+                {
+                    page.RaiseEvent(new System.Windows.RoutedEventArgs(System.Windows.FrameworkElement.UnloadedEvent));
+                }
+            });
+        }
+
+        private static System.Windows.Controls.CheckBox? FindMixedCheckbox(System.Windows.DependencyObject parent)
+        {
+            if (parent is System.Windows.Controls.CheckBox checkbox
+                && System.Windows.Automation.AutomationProperties.GetName(checkbox) == "Mixed layout with three satellites")
+                return checkbox;
+            foreach (var child in System.Windows.LogicalTreeHelper.GetChildren(parent))
+                if (child is System.Windows.DependencyObject dependency && FindMixedCheckbox(dependency) is { } found)
+                    return found;
+            return null;
+        }
+
+        [TestMethod]
+        public void MixedSettingLoadsAndSavesWithoutChangingOrientationOrCapacity()
+        {
+            var layout = CreateNonDefaultLayout() with { UseMixedSatellites = true };
+            var entity = new RecordingSettingsEntity(new Settings { MasterSatelliteLayout = layout });
+            using var model = CreateViewModel(entity);
+            Assert.IsTrue(model.UseMixedSatellites);
+            model.UseMixedSatellites = false;
+            Assert.AreEqual(layout with { UseMixedSatellites = false }, entity.Current.MasterSatelliteLayout);
+        }
+
+        [TestMethod]
         public void DelayedConcurrentFieldChangeIsNotOverwrittenByTheViewModel()
         {
             var entity = new RecordingSettingsEntity(new Settings { PanelHeight = 18 });

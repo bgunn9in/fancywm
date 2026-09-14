@@ -28,6 +28,7 @@ namespace FancyWM.Controls
             BindableAction.PromoteFocusedWindowToMaster,
             BindableAction.SwapMasterSide,
             BindableAction.ToggleSatelliteOrientation,
+            BindableAction.ToggleFocusedSatelliteSlot,
             BindableAction.ResetMasterRatio,
             BindableAction.RebalanceMasterSatelliteLayout,
 

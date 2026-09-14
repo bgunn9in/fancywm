@@ -884,6 +884,18 @@ namespace FancyWM
                 reuseEngineInvariant: true);
         }
 
+        public MasterSatelliteOperationResult SetMixedSatellites(
+            IVirtualDesktop desktop,
+            MasterSatelliteRuntimeState runtimeState,
+            MasterSatelliteLayoutSettings settings,
+            bool enabled)
+        {
+            return ExecuteAlgorithmicOperation(desktop, runtimeState, settings,
+                "SetMixedSatellites",
+                tree => m_masterSatelliteEngine.SetMixedSatellites(tree, runtimeState, settings, enabled),
+                reuseEngineInvariant: true);
+        }
+
         public MasterSatelliteOperationResult SetMasterSatelliteRatio(
             IVirtualDesktop desktop,
             MasterSatelliteRuntimeState runtimeState,

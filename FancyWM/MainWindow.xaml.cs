@@ -925,6 +925,10 @@ namespace FancyWM
                     friendlyActionName = "swap master side";
                     m_tiling.SwapMasterSide();
                     return;
+                case BindableAction.ToggleFocusedSatelliteSlot:
+                    friendlyActionName = "switch satellite between upper and wide lower slots";
+                    m_tiling.ToggleFocusedSatelliteSlot();
+                    return;
                 case BindableAction.ToggleSatelliteOrientation:
                     friendlyActionName = "toggle satellite orientation";
                     m_tiling.ToggleSatelliteOrientation();
@@ -1450,6 +1454,10 @@ namespace FancyWM
             if (m_tiling.CanSwapMasterSide())
             {
                 yield return BindableAction.SwapMasterSide;
+            }
+            if (m_tiling.CanToggleFocusedSatelliteSlot())
+            {
+                yield return BindableAction.ToggleFocusedSatelliteSlot;
             }
             if (m_tiling.CanToggleSatelliteOrientation())
             {

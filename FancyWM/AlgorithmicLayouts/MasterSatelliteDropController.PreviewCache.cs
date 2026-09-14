@@ -72,6 +72,7 @@ namespace FancyWM.AlgorithmicLayouts
             private readonly double m_requestedRatio;
             private readonly double m_effectiveRatio;
             private readonly SatelliteLayoutOrientation m_orientation;
+            private readonly bool m_useMixedSatellites;
             private readonly WindowIdentity m_master;
             private readonly WindowIdentity[] m_satellites;
             private readonly WindowIdentity m_source;
@@ -99,6 +100,7 @@ namespace FancyWM.AlgorithmicLayouts
                 m_requestedRatio = state.RequestedMasterRatio;
                 m_effectiveRatio = state.EffectiveMasterRatio;
                 m_orientation = state.SatelliteOrientation;
+                m_useMixedSatellites = state.UseMixedSatellites;
                 m_master = WindowIdentity.Capture(state.Master);
                 m_satellites = new WindowIdentity[state.Satellites.Count];
                 for (int i = 0; i < m_satellites.Length; i++)
@@ -153,6 +155,7 @@ namespace FancyWM.AlgorithmicLayouts
                     || m_requestedRatio != state.RequestedMasterRatio
                     || m_effectiveRatio != state.EffectiveMasterRatio
                     || m_orientation != state.SatelliteOrientation
+                    || m_useMixedSatellites != state.UseMixedSatellites
                     || m_satellites.Length != state.Satellites.Count
                     || m_kind != kind || m_fromIndex != fromIndex || m_toIndex != toIndex
                     || m_targetSide != targetSide)

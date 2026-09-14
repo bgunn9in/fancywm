@@ -24,6 +24,7 @@ namespace FancyWM.Tests.Models
             AssertBinding(defaults, BindableAction.PromoteFocusedWindowToMaster, KeyCode.M);
             AssertBinding(defaults, BindableAction.SwapMasterSide, KeyCode.B);
             Assert.IsNull(defaults[BindableAction.ToggleSatelliteOrientation]);
+            Assert.IsNull(defaults[BindableAction.ToggleFocusedSatelliteSlot]);
             Assert.IsNull(defaults[BindableAction.ResetMasterRatio]);
             Assert.IsNull(defaults[BindableAction.RebalanceMasterSatelliteLayout]);
 
@@ -45,6 +46,7 @@ namespace FancyWM.Tests.Models
                 BindableAction.PromoteFocusedWindowToMaster,
                 BindableAction.SwapMasterSide,
                 BindableAction.ToggleSatelliteOrientation,
+                BindableAction.ToggleFocusedSatelliteSlot,
                 BindableAction.ResetMasterRatio,
                 BindableAction.RebalanceMasterSatelliteLayout,
             };

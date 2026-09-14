@@ -24,7 +24,6 @@ namespace FancyWM.Tests.AlgorithmicLayouts
         [DataTestMethod]
         [DataRow(0)]
         [DataRow(1)]
-        [DataRow(2)]
         [DataRow(3)]
         public void SameDiscreteDropStillSamplesAllWindowsButReusesSimulation(int kind)
         {

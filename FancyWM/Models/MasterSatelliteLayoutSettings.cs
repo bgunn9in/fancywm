@@ -80,6 +80,8 @@ namespace FancyWM.Models
             };
         }
 
+        public bool UseMixedSatellites { get; init; } = false;
+
         public int MaxSatellites
         {
             get => m_maxSatellites;

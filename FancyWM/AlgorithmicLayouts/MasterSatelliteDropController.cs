@@ -337,46 +337,14 @@ namespace FancyWM.AlgorithmicLayouts
             int boundary = previewState.MasterSide == MasterSide.Left
                 ? masterNode.ComputedRectangle.Right
                 : masterNode.ComputedRectangle.Left;
-            int boundaryTolerance = Math.Max(8, previewTree.WorkArea.Width / 50);
             bool crossedBoundary = previewState.MasterSide == MasterSide.Left
                 ? pointer.X >= boundary
                 : pointer.X <= boundary;
-            if (crossedBoundary && Math.Abs(pointer.X - boundary) <= boundaryTolerance)
+            if (crossedBoundary)
             {
-                var targetSide = previewState.MasterSide == MasterSide.Left
-                    ? MasterSide.Right
-                    : MasterSide.Left;
-                return Simulate(
-                    cacheAttempt,
-                    desktop,
-                    previewTree,
-                    previewState,
-                    settings,
-                    source,
-                    null,
-                    MasterSatelliteDropKind.ChangeMasterSide,
-                    null,
-                    null,
-                    targetSide,
-                    sourceRevision);
-            }
-
-            var target = FindWindowAtPoint(previewTree, previewState.Satellites, pointer);
-            if (target != null)
-            {
-                return Simulate(
-                    cacheAttempt,
-                    desktop,
-                    previewTree,
-                    previewState,
-                    settings,
-                    source,
-                    target,
-                    MasterSatelliteDropKind.PromoteTargetSatellite,
-                    null,
-                    null,
-                    null,
-                    sourceRevision);
+                var targetSide = previewState.MasterSide == MasterSide.Left ? MasterSide.Right : MasterSide.Left;
+                return Simulate(cacheAttempt, desktop, previewTree, previewState, settings, source, null,
+                    MasterSatelliteDropKind.ChangeMasterSide, null, null, targetSide, sourceRevision);
             }
 
             return Reject(
@@ -384,7 +352,7 @@ namespace FancyWM.AlgorithmicLayouts
                 source,
                 sourceRevision,
                 MasterSatelliteFailureReason.UnsupportedOperation,
-                "The master can only swap with a satellite or cross the central boundary.");
+                "Drag the master across the central boundary to change its side.");
         }
 
         private MasterSatelliteDropPlan PlanSatelliteDrop(
@@ -436,7 +404,7 @@ namespace FancyWM.AlgorithmicLayouts
             bool before = previewState.SatelliteOrientation == SatelliteLayoutOrientation.Vertical
                 ? pointer.Y < targetRectangle.Center.Y
                 : pointer.X < targetRectangle.Center.X;
-            int destinationIndex = before
+            int destinationIndex = previewState.IsMixedLayout ? targetIndex : before
                 ? targetIndex - (sourceIndex < targetIndex ? 1 : 0)
                 : targetIndex + (sourceIndex > targetIndex ? 1 : 0);
             if (destinationIndex == sourceIndex)

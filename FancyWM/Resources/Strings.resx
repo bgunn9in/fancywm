@@ -1060,4 +1060,13 @@ If you are running a supported non-Insider Windows build and you see this messag
   <data name="AlgorithmicLayout.UnknownDesktop" xml:space="preserve">
     <value>another desktop</value>
   </data>
+  <data name="Keybinding.ToggleFocusedSatelliteSlot.Caption" xml:space="preserve">
+    <value>Switch upper / wide satellite slot</value>
+  </data>
+  <data name="Keybinding.ToggleFocusedSatelliteSlot.Description" xml:space="preserve">
+    <value>In the mixed three-satellite layout, exchange the focused upper window with the wide lower window. The lower window uses the same upper neighbour as Move Up.</value>
+  </data>
+  <data name="AlgorithmicLayout.MixedLayoutRejected" xml:space="preserve">
+    <value>The selected satellite layout cannot fit the current windows. The previous layout has been kept.</value>
+  </data>
 </root>

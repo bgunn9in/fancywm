@@ -219,7 +219,8 @@ namespace FancyWM.AlgorithmicLayouts
                     targetState.MutableSatellites[satelliteIndex] = oldMaster;
 
                     Debug.Assert(selectedNode.Parent == root);
-                    Debug.Assert(masterNode.Parent == satellitePanel);
+                    Debug.Assert(masterNode.Parent == satellitePanel
+                        || (targetState.IsMixedLayout && masterNode.Parent?.Parent == satellitePanel));
                     return true;
                 });
         }
@@ -249,12 +250,35 @@ namespace FancyWM.AlgorithmicLayouts
                 (targetTree, targetState) =>
                 {
                     var (_, _, satellitePanel) = GetCanonicalNodes(targetTree, targetState);
+                    if (targetState.IsMixedLayout)
+                    {
+                        var from = targetTree.FindNode(targetState.Satellites[fromIndex])!;
+                        var to = targetTree.FindNode(targetState.Satellites[toIndex])!;
+                        targetTree.Measure();
+                        targetTree.Arrange();
+                        if (!FitsSlot(from, to) || !FitsSlot(to, from))
+                        {
+                            throw new EngineFailureException(MasterSatelliteFailureReason.MinSizeConflict,
+                                "The two windows cannot fit their exchanged satellite slots.");
+                        }
+                        DesktopTree.SwapReferences(from, to);
+                        (targetState.MutableSatellites[fromIndex], targetState.MutableSatellites[toIndex]) =
+                            (targetState.MutableSatellites[toIndex], targetState.MutableSatellites[fromIndex]);
+                        return true;
+                    }
                     satellitePanel.Move(fromIndex, toIndex);
                     var moved = targetState.MutableSatellites[fromIndex];
                     targetState.MutableSatellites.RemoveAt(fromIndex);
                     targetState.MutableSatellites.Insert(toIndex, moved);
                     return true;
                 });
+        }
+
+        internal static bool FitsSlot(WindowNode window, WindowNode slot)
+        {
+            window.Measure();
+            return window.MinSize.X <= slot.ComputedRectangle.Width
+                && window.MinSize.Y <= slot.ComputedRectangle.Height;
         }
 
         public MasterSatelliteOperationResult MoveSatellitePrevious(
@@ -352,7 +376,7 @@ namespace FancyWM.AlgorithmicLayouts
                 settings,
                 (targetTree, targetState) =>
                 {
-                    if (targetState.Satellites.Count > 0)
+                    if (targetState.Satellites.Count > 0 && !targetState.IsMixedLayout)
                     {
                         var (_, _, satellitePanel) = GetCanonicalNodes(targetTree, targetState);
                         satellitePanel.ChangeOrientation(ToPanelOrientation(orientation));
@@ -361,6 +385,28 @@ namespace FancyWM.AlgorithmicLayouts
                     return true;
                 },
                 rebalanceSatellites: true);
+        }
+
+        public MasterSatelliteOperationResult SetMixedSatellites(
+            DesktopTree tree,
+            MasterSatelliteRuntimeState state,
+            MasterSatelliteLayoutSettings settings,
+            bool enabled)
+        {
+            if (state.UseMixedSatellites == enabled)
+            {
+                return NoOp(tree, state, settings, "The mixed layout preference is unchanged.");
+            }
+            return ExecuteMutation(tree, state, settings, (targetTree, targetState) =>
+            {
+                targetState.UseMixedSatellites = enabled;
+                if (targetState.Satellites.Count == 3)
+                {
+                    var (_, _, panel) = GetCanonicalNodes(targetTree, targetState);
+                    ConfigureSatellitePanel(panel, targetState, panel.Windows.ToArray());
+                }
+                return true;
+            }, rebalanceSatellites: state.Satellites.Count == 3);
         }
 
         public MasterSatelliteOperationResult SetRequestedMasterRatio(
@@ -469,6 +515,7 @@ namespace FancyWM.AlgorithmicLayouts
                         targetState,
                         requireSatellite: targetState.Satellites.Count > 0);
 
+                    bool wasMixed = targetState.IsMixedLayout;
                     if (WindowEquals(targetState.Master, window))
                     {
                         if (targetState.Satellites.Count == 0)
@@ -481,7 +528,7 @@ namespace FancyWM.AlgorithmicLayouts
                             var promotedWindow = targetState.MutableSatellites[0];
                             var promotedNode = targetTree.FindNode(promotedWindow)!;
                             DesktopTree.SwapReferences(masterNode, promotedNode);
-                            satellitePanel.Detach(masterNode);
+                            masterNode.Parent!.Detach(masterNode);
                             targetState.Master = promotedWindow;
                             targetState.MutableSatellites.RemoveAt(0);
                             if (targetState.MutableSatellites.Count == 0)
@@ -494,15 +541,20 @@ namespace FancyWM.AlgorithmicLayouts
                     {
                         int index = IndexOfWindow(targetState.Satellites, window);
                         var node = targetTree.FindNode(window)!;
-                        satellitePanel.Detach(node);
+                        node.Parent!.Detach(node);
                         targetState.MutableSatellites.RemoveAt(index);
                         if (targetState.MutableSatellites.Count == 0)
                         {
                             root.Detach(satellitePanel);
                         }
                     }
+                    if (wasMixed || targetState.IsMixedLayout)
+                    {
+                        ConfigureSatellitePanel(satellitePanel, targetState, satellitePanel.Windows.ToArray());
+                    }
                     return true;
-                });
+                }, rebalanceSatellites: state.UseMixedSatellites
+                    && state.Satellites.Count is 3 or 4);
         }
 
         public MasterSatelliteInvariantResult ValidateInvariant(
@@ -697,39 +749,61 @@ namespace FancyWM.AlgorithmicLayouts
                 violations.Add("The non-master root child must be a SplitPanelNode satellite panel.");
                 return new MasterSatelliteInvariantResult(violations, description);
             }
-            if (satellitePanel.Orientation != ToPanelOrientation(state.SatelliteOrientation))
+            SplitPanelNode? upperPanel = null;
+            IReadOnlyList<TilingNode> slots = satellitePanel.Children;
+            if (state.IsMixedLayout)
             {
-                violations.Add("The satellite panel orientation does not match runtime state.");
+                if (satellitePanel.Orientation != PanelOrientation.Vertical
+                    || satellitePanel.Children.Count != 2
+                    || satellitePanel.Children[0] is not SplitPanelNode upper
+                    || upper.Orientation != PanelOrientation.Horizontal
+                    || upper.Children.Count != 2
+                    || upper.Children.Any(child => child is not WindowNode)
+                    || satellitePanel.Children[1] is not WindowNode)
+                {
+                    violations.Add("Mixed satellites require exactly a horizontal V1/V2 panel above the H window.");
+                }
+                else
+                {
+                    upperPanel = upper;
+                    slots = new[] { upper.Children[0], upper.Children[1], satellitePanel.Children[1] };
+                }
             }
-            if (satellitePanel.Children.Count != state.Satellites.Count)
+            else
+            {
+                if (satellitePanel.Orientation != ToPanelOrientation(state.SatelliteOrientation))
+                {
+                    violations.Add("The satellite panel orientation does not match runtime state.");
+                }
+                if (satellitePanel.Children.Count != state.Satellites.Count)
+                {
+                    violations.Add("The satellite panel child count does not match runtime state.");
+                }
+                if (satellitePanel.Children.Any(child => child is not WindowNode))
+                {
+                    violations.Add("Every satellite panel child must be a direct WindowNode.");
+                }
+            }
+            if (state.IsMixedLayout && slots.Count != state.Satellites.Count)
             {
                 violations.Add("The satellite panel child count does not match runtime state.");
             }
-            if (satellitePanel.Children.Any(child => child is not WindowNode))
-            {
-                violations.Add("Every satellite panel child must be a direct WindowNode.");
-            }
-
-            bool hasNonCanonicalPanel = false;
             foreach (var node in nodes)
             {
                 if (node is PanelNode panel
                     && !ReferenceEquals(panel, root)
-                    && !ReferenceEquals(panel, satellitePanel))
+                    && !ReferenceEquals(panel, satellitePanel)
+                    && !ReferenceEquals(panel, upperPanel))
                 {
-                    hasNonCanonicalPanel = true;
+                    violations.Add(state.IsMixedLayout
+                        ? "Nested panels are not allowed outside the canonical satellite structure."
+                        : "Nested panels are not allowed below the canonical satellite panel.");
                     break;
                 }
             }
-            if (hasNonCanonicalPanel)
+            for (int i = 0; i < Math.Min(slots.Count, state.Satellites.Count); i++)
             {
-                violations.Add("Nested panels are not allowed below the canonical satellite panel.");
-            }
-
-            int comparableCount = Math.Min(satellitePanel.Children.Count, state.Satellites.Count);
-            for (int i = 0; i < comparableCount; i++)
-            {
-                if (satellitePanel.Children[i] is not WindowNode satelliteNode
+                if (slots[i] is not WindowNode satelliteNode
                     || !WindowEquals(satelliteNode.WindowReference, state.Satellites[i]))
                 {
                     violations.Add($"Satellite slot {i} does not match runtime visual order.");
@@ -898,6 +972,7 @@ namespace FancyWM.AlgorithmicLayouts
                     candidateState.EffectiveMasterRatio)
                 || currentState.SatelliteOrientation
                     != candidateState.SatelliteOrientation
+                || currentState.UseMixedSatellites != candidateState.UseMixedSatellites
                 || !WindowEquals(currentState.Master, candidateState.Master)
                 || currentState.Satellites.Count
                     != candidateState.Satellites.Count
@@ -1163,11 +1238,59 @@ namespace FancyWM.AlgorithmicLayouts
                 Spacing = previousSatellitePanel?.Spacing ?? sourceRoot?.Spacing ?? 0,
             };
             root.Attach(state.MasterSide == MasterSide.Left ? 1 : 0, satellitePanel);
-            foreach (var satellite in state.MutableSatellites)
+            if (state.IsMixedLayout)
             {
-                satellitePanel.Attach(CloneOrCreateWindowNode(sourceRoot, satellite));
+                ConfigureSatellitePanel(satellitePanel, state, state.Satellites
+                    .Select(window => CloneOrCreateWindowNode(sourceRoot, window)).ToArray());
+            }
+            else
+            {
+                foreach (var satellite in state.Satellites)
+                {
+                    satellitePanel.Attach(CloneOrCreateWindowNode(sourceRoot, satellite));
+                }
             }
             return true;
+        }
+
+        // The only additional canonical nesting: [horizontal(V1, V2), H].
+        // Reuse the existing window nodes when changing shape so focus, identity,
+        // padding and the actual slot order survive count/settings transitions.
+        private static void ConfigureSatellitePanel(
+            SplitPanelNode panel, MasterSatelliteRuntimeState state, IReadOnlyList<WindowNode> windows)
+        {
+            var orderedNodes = state.Satellites.Select(window => windows.Single(
+                node => WindowEquals(node.WindowReference, window))).ToArray();
+            foreach (var node in orderedNodes)
+            {
+                node.Parent?.Detach(node);
+            }
+            foreach (var child in panel.Children.ToArray())
+            {
+                panel.Detach(child);
+            }
+            panel.ChangeOrientation(state.IsMixedLayout
+                ? PanelOrientation.Vertical : ToPanelOrientation(state.SatelliteOrientation));
+            if (state.IsMixedLayout)
+            {
+                var upper = new SplitPanelNode
+                {
+                    Orientation = PanelOrientation.Horizontal,
+                    Padding = panel.Padding,
+                    Spacing = panel.Spacing,
+                };
+                panel.Attach(upper);
+                upper.Attach(orderedNodes[0]);
+                upper.Attach(orderedNodes[1]);
+                panel.Attach(orderedNodes[2]);
+            }
+            else
+            {
+                foreach (var node in orderedNodes)
+                {
+                    panel.Attach(node);
+                }
+            }
         }
 
         private static WindowNode CloneOrCreateWindowNode(PanelNode? sourceRoot, IWindow window)
@@ -1223,8 +1346,17 @@ namespace FancyWM.AlgorithmicLayouts
             }
 
             int index = satelliteIndex ?? state.Satellites.Count;
-            satellitePanel.Attach(index, new WindowNode(window));
+            bool wasMixed = state.IsMixedLayout;
+            var addedNode = new WindowNode(window);
             state.MutableSatellites.Insert(index, window);
+            if (wasMixed || state.IsMixedLayout)
+            {
+                ConfigureSatellitePanel(satellitePanel, state, satellitePanel.Windows.Append(addedNode).ToArray());
+            }
+            else
+            {
+                satellitePanel.Attach(index, addedNode);
+            }
         }
 
         private static void FinalizeLayout(
@@ -1263,7 +1395,25 @@ namespace FancyWM.AlgorithmicLayouts
             var (root, masterNode, satellitePanel) = GetCanonicalNodes(tree, state);
             if (rebalanceSatellites)
             {
-                satellitePanel.DistributeChildrenEvenly();
+                if (state.IsMixedLayout)
+                {
+                    var upper = (SplitPanelNode)satellitePanel.Children[0];
+                    upper.DistributeChildrenEvenly();
+                    var topConstraints = satellitePanel.GetChildConstraints(upper);
+                    var bottomConstraints = satellitePanel.GetChildConstraints(satellitePanel.Children[1]);
+                    double topHeight = Math.Clamp(satellitePanel.ContainerLength * 2 / 3,
+                        Math.Max(topConstraints.MinWidth, satellitePanel.ContainerLength - bottomConstraints.MaxWidth),
+                        Math.Min(topConstraints.MaxWidth, satellitePanel.ContainerLength - bottomConstraints.MinWidth));
+                    if (!satellitePanel.ResizeTo(upper, topHeight, GrowDirection.Both))
+                    {
+                        throw new EngineFailureException(MasterSatelliteFailureReason.MinSizeConflict,
+                            "The satellite Flex container rejected the mixed layout proportions.");
+                    }
+                }
+                else
+                {
+                    satellitePanel.DistributeChildrenEvenly();
+                }
                 tree.Arrange();
             }
             double usefulWidth = root.ContainerLength;

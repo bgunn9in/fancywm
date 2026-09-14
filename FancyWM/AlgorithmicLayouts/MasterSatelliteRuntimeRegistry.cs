@@ -685,6 +685,20 @@ namespace FancyWM.AlgorithmicLayouts
             m_session.Clear();
         }
 
+        private MasterSatelliteLifecycleResult? ApplyMixedSatelliteSetting(
+            TilingWorkspace backend, IVirtualDesktop desktop, MasterSatelliteRuntimeState state)
+        {
+            var settings = m_session.SettingsSnapshot;
+            if (state.UseMixedSatellites == settings.UseMixedSatellites)
+            {
+                return null;
+            }
+            var operation = backend.SetMixedSatellites(desktop, state, settings, settings.UseMixedSatellites);
+            return new MasterSatelliteLifecycleResult(m_session.GetKey(desktop), true, true, false, false,
+                operation.Succeeded ? "SettingsMixedLayoutChanged" : "SettingsMixedLayoutRejected",
+                operation, operation.Invariant);
+        }
+
         private MasterSatelliteLifecycleResult RefreshOrInitializeDesktop(
             TilingWorkspace backend,
             IVirtualDesktop desktop)
@@ -701,6 +715,10 @@ namespace FancyWM.AlgorithmicLayouts
                 m_session.SettingsSnapshot);
             if (invariant.IsValid)
             {
+                if (ApplyMixedSatelliteSetting(backend, desktop, state) is { } mixedResult)
+                {
+                    return mixedResult;
+                }
                 return new MasterSatelliteLifecycleResult(
                     key,
                     true,
@@ -749,6 +767,10 @@ namespace FancyWM.AlgorithmicLayouts
                     m_session.SettingsSnapshot);
                 if (invariant.IsValid)
                 {
+                    if (ApplyMixedSatelliteSetting(backend, desktop, state) is { } mixedResult)
+                    {
+                        return mixedResult;
+                    }
                     return new MasterSatelliteLifecycleResult(
                         key,
                         true,

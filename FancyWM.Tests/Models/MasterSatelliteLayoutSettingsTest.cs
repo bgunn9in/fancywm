@@ -40,6 +40,7 @@ namespace FancyWM.Tests.Models
             var settings = new MasterSatelliteLayoutSettings();
 
             Assert.IsFalse(settings.Enabled);
+            Assert.IsFalse(settings.UseMixedSatellites);
             Assert.AreEqual(0.60, settings.MasterRatio);
             Assert.AreEqual(MasterSide.Left, settings.DefaultMasterSide);
             Assert.AreEqual(SatelliteLayoutOrientation.Vertical, settings.DefaultSatelliteOrientation);
@@ -125,6 +126,7 @@ namespace FancyWM.Tests.Models
                 DisplayScope = AlgorithmicLayoutDisplayScope.AllDisplays,
                 MaxAutoCreatedDesktops = 7,
                 FollowOverflowWindow = true,
+                UseMixedSatellites = true,
             };
             var state = new AppState(m_settingsPath);
 

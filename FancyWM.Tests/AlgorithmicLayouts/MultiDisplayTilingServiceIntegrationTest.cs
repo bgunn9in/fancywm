@@ -267,6 +267,8 @@ namespace FancyWM.Tests.AlgorithmicLayouts
             nameof(ITilingService.PromoteFocusedWindowToMaster),
             nameof(ITilingService.CanSwapMasterSide),
             nameof(ITilingService.SwapMasterSide),
+            nameof(ITilingService.CanToggleFocusedSatelliteSlot),
+            nameof(ITilingService.ToggleFocusedSatelliteSlot),
             nameof(ITilingService.CanToggleSatelliteOrientation),
             nameof(ITilingService.ToggleSatelliteOrientation),
             nameof(ITilingService.CanResetMasterRatio),
@@ -283,6 +285,8 @@ namespace FancyWM.Tests.AlgorithmicLayouts
             service.PromoteFocusedWindowToMaster();
             Assert.IsTrue(service.CanSwapMasterSide());
             service.SwapMasterSide();
+            Assert.IsTrue(service.CanToggleFocusedSatelliteSlot());
+            service.ToggleFocusedSatelliteSlot();
             Assert.IsTrue(service.CanToggleSatelliteOrientation());
             service.ToggleSatelliteOrientation();
             Assert.IsTrue(service.CanResetMasterRatio());
@@ -502,6 +506,8 @@ namespace FancyWM.Tests.AlgorithmicLayouts
             public void SwapMasterSide()
                 => Record(nameof(SwapMasterSide));
 
+            public bool CanToggleFocusedSatelliteSlot() => RecordCapability(nameof(CanToggleFocusedSatelliteSlot));
+            public void ToggleFocusedSatelliteSlot() => Record(nameof(ToggleFocusedSatelliteSlot));
             public bool CanToggleSatelliteOrientation()
                 => RecordCapability(nameof(CanToggleSatelliteOrientation));
 

@@ -54,7 +54,8 @@ namespace FancyWM.Pages.Settings
             if (e.PropertyName is nameof(SettingsViewModel.MasterRatio)
                 or nameof(SettingsViewModel.DefaultMasterSide)
                 or nameof(SettingsViewModel.DefaultSatelliteOrientation)
-                or nameof(SettingsViewModel.MaxSatellites))
+                or nameof(SettingsViewModel.MaxSatellites)
+                or nameof(SettingsViewModel.UseMixedSatellites))
             {
                 UpdatePreview();
             }
@@ -66,7 +67,8 @@ namespace FancyWM.Pages.Settings
                 m_viewModel.MasterRatio,
                 m_viewModel.DefaultMasterSide,
                 m_viewModel.DefaultSatelliteOrientation,
-                m_viewModel.MaxSatellites);
+                m_viewModel.MaxSatellites,
+                m_viewModel.UseMixedSatellites);
 
             PreviewGrid.Children.Clear();
             PreviewGrid.ColumnDefinitions.Clear();
@@ -94,7 +96,22 @@ namespace FancyWM.Pages.Settings
             Grid.SetColumn(satellites, satelliteColumn);
             PreviewGrid.Children.Add(satellites);
 
-            for (var i = 0; i < plan.VisibleSatelliteCount; i++)
+            if (plan.IsMixedLayout)
+            {
+                satellites.RowDefinitions.Add(new RowDefinition { Height = new GridLength(2, GridUnitType.Star) });
+                satellites.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+                satellites.ColumnDefinitions.Add(new ColumnDefinition());
+                satellites.ColumnDefinitions.Add(new ColumnDefinition());
+                for (int i = 0; i < 3; i++)
+                {
+                    var tile = CreateTile(i == 2 ? "H" : $"V{i + 1}", isMaster: false);
+                    Grid.SetRow(tile, i == 2 ? 1 : 0);
+                    Grid.SetColumn(tile, i == 1 ? 1 : 0);
+                    Grid.SetColumnSpan(tile, i == 2 ? 2 : 1);
+                    satellites.Children.Add(tile);
+                }
+            }
+            for (var i = 0; !plan.IsMixedLayout && i < plan.VisibleSatelliteCount; i++)
             {
                 if (plan.SatellitesUseRows)
                 {

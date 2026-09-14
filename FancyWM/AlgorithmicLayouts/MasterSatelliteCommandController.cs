@@ -326,6 +326,20 @@ namespace FancyWM.AlgorithmicLayouts
             {
                 return false;
             }
+            // Role changes follow the immediate geometric neighbour, regardless
+            // of the axis used to arrange the satellite group.
+            var adjacent = GetAdjacentWindow(state!, focused, direction);
+            if (adjacent != null
+                && WindowsMatch(state.Master, adjacent.WindowReference))
+            {
+                return MasterSatelliteLayoutEngine.FitsSlot(adjacent, focused);
+            }
+            if (state.IsMixedLayout)
+            {
+                return adjacent != null && IndexOfWindow(state.Satellites, adjacent.WindowReference) >= 0
+                    && MasterSatelliteLayoutEngine.FitsSlot(focused, adjacent)
+                    && MasterSatelliteLayoutEngine.FitsSlot(adjacent, focused);
+            }
             bool previous = (state.SatelliteOrientation, direction) switch
             {
                 (Models.SatelliteLayoutOrientation.Vertical, TilingDirection.Up) => true,
@@ -343,15 +357,6 @@ namespace FancyWM.AlgorithmicLayouts
                 return false;
             }
 
-            // Reordering reaches the master at the inner edge of a horizontal
-            // satellite row. Crossing that real visual neighbour promotes the
-            // focused satellite, preserving the old master's exact slot.
-            var adjacent = focused.GetAdjacentWindow(direction);
-            if (adjacent != null
-                && WindowsMatch(state.Master, adjacent.WindowReference))
-            {
-                return true;
-            }
             return previous
                 ? index > 0
                 : index < state.Satellites.Count - 1;
@@ -406,6 +411,22 @@ namespace FancyWM.AlgorithmicLayouts
                     MasterSatelliteFailureReason.WindowNotFound,
                     "The focused window is not part of the canonical layout.");
             }
+            var adjacent = GetAdjacentWindow(state!, focused, direction);
+            if (adjacent != null
+                && WindowsMatch(state.Master, adjacent.WindowReference))
+            {
+                return FromOperation(backend.PromoteMasterSatelliteWindow(
+                    desktop,
+                    state,
+                    m_lifecycle.SettingsSnapshot,
+                    focused.WindowReference));
+            }
+            if (state.IsMixedLayout)
+            {
+                int targetIndex = adjacent == null ? -1 : IndexOfWindow(state.Satellites, adjacent.WindowReference);
+                return FromOperation(backend.ReorderMasterSatelliteWindow(
+                    desktop, state, m_lifecycle.SettingsSnapshot, index, targetIndex));
+            }
             bool previous = (state.SatelliteOrientation, direction) switch
             {
                 (Models.SatelliteLayoutOrientation.Vertical, TilingDirection.Up) => true,
@@ -424,16 +445,6 @@ namespace FancyWM.AlgorithmicLayouts
                     MasterSatelliteFailureReason.UnsupportedOperation,
                     "Satellites can only be moved along the active satellite axis.");
             }
-            var adjacent = focused.GetAdjacentWindow(direction);
-            if (adjacent != null
-                && WindowsMatch(state.Master, adjacent.WindowReference))
-            {
-                return FromOperation(backend.PromoteMasterSatelliteWindow(
-                    desktop,
-                    state,
-                    m_lifecycle.SettingsSnapshot,
-                    focused.WindowReference));
-            }
             return FromOperation(previous
                 ? backend.MoveMasterSatelliteWindowPrevious(
                     desktop,
@@ -445,6 +456,70 @@ namespace FancyWM.AlgorithmicLayouts
                     state,
                     m_lifecycle.SettingsSnapshot,
                     focused.WindowReference));
+        }
+
+        // Start with the existing structural neighbour, then choose its closest
+        // window along the perpendicular axis. Stable visual order breaks ties
+        // towards V1 for H -> Up; CanMove and execution use this same selection.
+        private static WindowNode? GetAdjacentWindow(
+            MasterSatelliteRuntimeState state, WindowNode focused, TilingDirection direction)
+        {
+            if (!state.IsMixedLayout)
+            {
+                return focused.GetAdjacentWindow(direction);
+            }
+            var adjacent = focused.GetAdjacentNode(direction);
+            bool vertical = direction is TilingDirection.Up or TilingDirection.Down;
+            var rectangle = focused.ComputedRectangle;
+            double center = vertical ? (rectangle.Left + rectangle.Right) / 2.0
+                : (rectangle.Top + rectangle.Bottom) / 2.0;
+            WindowNode? nearest = null;
+            double nearestDistance = double.PositiveInfinity;
+            if (adjacent != null)
+            {
+                foreach (var window in adjacent.Windows)
+                {
+                    var bounds = window.ComputedRectangle;
+                    double distance = Math.Abs(center - (vertical
+                        ? (bounds.Left + bounds.Right) / 2.0 : (bounds.Top + bounds.Bottom) / 2.0));
+                    // Integer rectangles can differ by a pixel after equal Flex
+                    // allocation. Treat that rounding as a tie, preserving V1.
+                    if (distance < nearestDistance - 1)
+                    {
+                        nearest = window;
+                        nearestDistance = distance;
+                    }
+                }
+            }
+            return nearest;
+        }
+
+        public bool CanToggleFocusedSatelliteSlot(TilingWorkspace backend, IVirtualDesktop desktop)
+        {
+            if (!m_lifecycle.TryGetState(desktop, out var state) || !state.IsMixedLayout
+                || backend.GetFocus(desktop) is not WindowNode focused)
+            {
+                return false;
+            }
+            int index = IndexOfWindow(state.Satellites, focused.WindowReference);
+            return index >= 0 && CanMoveFocusedWindow(backend, desktop,
+                index == 2 ? TilingDirection.Up : TilingDirection.Down);
+        }
+
+        public MasterSatelliteCommandResult ToggleFocusedSatelliteSlot(TilingWorkspace backend, IVirtualDesktop desktop)
+        {
+            if (!TryGetActiveState(desktop, out var state, out var failure))
+            {
+                return failure!;
+            }
+            int index = backend.GetFocus(desktop) is WindowNode focused
+                ? IndexOfWindow(state!.Satellites, focused.WindowReference) : -1;
+            if (!state!.IsMixedLayout || index < 0)
+            {
+                return Rejected(MasterSatelliteFailureReason.UnsupportedOperation,
+                    "Select a satellite in the mixed three-satellite layout to switch its slot.");
+            }
+            return MoveFocusedWindow(backend, desktop, index == 2 ? TilingDirection.Up : TilingDirection.Down);
         }
 
         public bool CanSwapFocusedWindow(
@@ -460,7 +535,7 @@ namespace FancyWM.AlgorithmicLayouts
             {
                 return false;
             }
-            var adjacent = focused.GetAdjacentWindow(direction);
+            var adjacent = GetAdjacentWindow(state!, focused, direction);
             if (adjacent == null)
             {
                 return false;
@@ -494,7 +569,7 @@ namespace FancyWM.AlgorithmicLayouts
                     MasterSatelliteFailureReason.WindowNotFound,
                     "There is no focused tiled window to swap.");
             }
-            var adjacent = focused.GetAdjacentWindow(direction);
+            var adjacent = GetAdjacentWindow(state!, focused, direction);
             if (adjacent == null)
             {
                 return Rejected(

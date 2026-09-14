@@ -4071,13 +4071,14 @@ namespace FancyWM
                     result.Key.Display,
                     failed.FailureReason,
                     failed.Message);
-                if (result.Action == "SettingsOrientationRejected")
+                if (result.Action is "SettingsOrientationRejected" or "SettingsMixedLayoutRejected")
                 {
                     RaiseMasterSatelliteEvent(new AlgorithmicLayoutEvent(
                         AlgorithmicLayoutEventKind.OperationRejected,
                         result.Key.Display,
                         failed.FailureReason.ToString(),
-                        "AlgorithmicLayout.OrientationRejected",
+                        result.Action == "SettingsMixedLayoutRejected"
+                            ? "AlgorithmicLayout.MixedLayoutRejected" : "AlgorithmicLayout.OrientationRejected",
                         sourceDesktop: result.Key.VirtualDesktop));
                 }
                 return;

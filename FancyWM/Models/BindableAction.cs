@@ -171,5 +171,9 @@ namespace FancyWM.Models
         MoveToDisplay8,
         [DefaultKeybinding(KeyCode.LeftShift, KeyCode.F9)]
         MoveToDisplay9,
+
+        // Append to retain the numeric identities of existing actions.
+        [DefaultKeybinding()]
+        ToggleFocusedSatelliteSlot,
     }
 }
