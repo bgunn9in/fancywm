@@ -1,5 +1,22 @@
 # Performance optimization plan
 
+## Current scope — 2026-09-14 discovery check and portable complete
+
+One PERF-002 candidate was checked at `e69c96c`: repeated provider desktop
+snapshots inside DiscoverWindows. It is already optimized: two eligible windows
+use one snapshot, no eligible window uses none; an initial failure correctly
+retains two per-window retries (three calls total). Existing counters and all
+ten targeted Release cases pass. No production change or A/B gain is claimed;
+250 ms reconciliation, native/equality/callback semantics and defensive copies
+remain intact. [Decision and evidence](docs/performance/DISCOVERY_SNAPSHOT_CHECK.md).
+
+The [current portable](docs/portable.md) is freshly built from `e69c96c`, version
+2.19.1.6, Release win-x64 with bundled .NET. ZIP: 511 files, full entry hashes/CRC,
+dependency assets and extracted CLI checks pass. Previous packages are preserved.
+No interactive UI or repeat of the prior 758 Debug / 800 Release regression;
+their results and the user's feature confirmation retain their original scope.
+This one-candidate/package pass is complete; no further audit was started.
+
 ## Current scope — 2026-09-14 preview conversion follow-up complete
 
 The user authorized the proposed follow-up after `43dcfcc`. One small PERF-010/021

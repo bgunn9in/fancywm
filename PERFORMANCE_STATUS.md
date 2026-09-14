@@ -1,5 +1,22 @@
 # Performance implementation status
 
+## Discovery candidate checked; current portable ready — 2026-09-14
+
+PERF-002 selected candidate is **already optimized**, so production remains at
+`e69c96c`. Provider snapshot counter: two eligible windows → one call, none
+eligible → zero, initial snapshot failure → three calls including required
+per-window retries. Ten targeted Release cases pass, including snapshot mutation
+and missed-event reconciliation. No new optimization or before/after gain.
+[Bounded result](docs/performance/DISCOVERY_SNAPSHOT_CHECK.md).
+
+Fresh Release win-x64 self-contained portable **2.19.1.6**, source `e69c96c`:
+511 files, 72,338,952-byte ZIP; all entry hashes/CRC, 669 dependency asset
+references, x64 apphosts/runtime and both extracted EXEs' help/version pass.
+[Archive and instructions](docs/portable.md). Existing dependency patches match
+their manifest; gitlink/local changes are preserved. Old builds are retained.
+The earlier 758 Debug / 800 Release results were not repeated. No interactive
+UI, push, installation or external publication. This bounded pass is complete.
+
 ## Preview conversion follow-up complete — 2026-09-14
 
 After `43dcfcc`, the authorized follow-up removed one enumerator allocation
