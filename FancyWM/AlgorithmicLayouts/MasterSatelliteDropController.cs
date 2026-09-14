@@ -47,6 +47,19 @@ namespace FancyWM.AlgorithmicLayouts
 
         public IReadOnlyList<IWindow> PreviewWindows { get; init; } = Array.Empty<IWindow>();
 
+        public HashSet<IWindow> CreatePreviewWindowSet()
+        {
+            // Accepted plans own a read-only indexed list. Avoid its enumerator,
+            // but rebuild the set so current window hash/equality is sampled on
+            // every call, even when the immutable plan itself is reused.
+            var windows = new HashSet<IWindow>(PreviewWindows.Count);
+            for (int i = 0; i < PreviewWindows.Count; i++)
+            {
+                windows.Add(PreviewWindows[i]);
+            }
+            return windows;
+        }
+
         public MasterSatelliteFailureReason FailureReason { get; init; }
 
         public string? Message { get; init; }

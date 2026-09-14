@@ -583,7 +583,7 @@ namespace FancyWM
                                         if (plan.IsAccepted)
                                         {
                                             acceptedCanonicalPreview = true;
-                                            m_masterSatelliteDropPreviewWindows = plan.PreviewWindows.ToHashSet();
+                                            m_masterSatelliteDropPreviewWindows = plan.CreatePreviewWindowSet();
                                         }
                                         return plan.PreviewRectangle;
                                     }

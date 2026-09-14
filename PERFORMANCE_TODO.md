@@ -1,5 +1,25 @@
 # Performance optimization plan
 
+## Current scope — 2026-09-14 preview conversion follow-up complete
+
+The user authorized the proposed follow-up after `43dcfcc`. One small PERF-010/021
+change removes the enumerator from conversion of an accepted plan's indexed
+PreviewWindows list to a fresh set. Inter-call set reuse was not introduced:
+current IWindow hashing/equality still determines each newly published set.
+
+Same-process baseline/candidate counters across 18 cases (three layouts, both
+master sides, reorder/promotion/side movement) show **208 → 176 B per conversion**
+in Release; 54,000 conversions allocate **11,232,000 → 9,504,000 B**. Debug also
+improves in every case, with **9,504,048 B** in the candidate aggregate.
+This modest local allocation saving does not establish faster application/UI
+behavior. [Method and limits](docs/performance/PREVIEW_WINDOW_SET.md).
+
+Final affected regression: **758 Debug + 800 Release**, all passed, including
+both features and overlay/preview recovery. No layout rule, MinSize/preflight/
+rollback, focus or 250 ms reconciliation change; no interactive UI launch.
+This follow-up is complete; earlier feature closure and tab-order optimization
+remain valid. Broader PERF-010/021 research remains deferred as recorded below.
+
 ## Current scope — 2026-09-14 bounded overlay optimization complete
 
 The user manually confirmed both new features work normally. Their stage is

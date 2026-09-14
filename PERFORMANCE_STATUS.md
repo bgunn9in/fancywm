@@ -1,5 +1,24 @@
 # Performance implementation status
 
+## Preview conversion follow-up complete — 2026-09-14
+
+After `43dcfcc`, the authorized follow-up removed one enumerator allocation
+while creating PreviewWindows sets from accepted plans. Fresh sets preserve
+current hash/equality semantics and independent ownership; no cache was added.
+
+Release before/after: **208 → 176 B per conversion**, or
+**11,232,000 → 9,504,000 B** over 54,000 conversions. Debug also improves in all
+18 cases: **11,232,000 → 9,504,048 B** in aggregate.
+This is a small allocation reduction only, not a measured application speedup.
+[Counter, tests and limitations](docs/performance/PREVIEW_WINDOW_SET.md).
+
+Final affected regression: **758 Debug + 800 Release = 1558** passed leaf cases,
+zero failures/skips; both feature suites and overlay/preview checks included.
+Both configurations compiled. Raw receipts remain ignored under
+`artifacts/performance/FWM-PREVIEW-WINDOW-SET-20260914/`. No new interactive UI,
+push, installation or publication. Existing feature confirmation and all
+historical research limits remain unchanged; this bounded follow-up is complete.
+
 ## One local optimization complete — 2026-09-14
 
 Both new features are complete and manually confirmed by the user; feature
