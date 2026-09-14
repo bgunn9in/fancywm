@@ -1,6 +1,27 @@
 # Performance optimization plan
 
+## Current scope — 2026-09-14 idle CPU observation complete, no code change
+
+External observation of the already running ordinary portable 2.19.1.9 completed
+three clean intervals after 15 s stabilization: **218.75 / 156.25 / 218.75 ms**
+TotalProcessorTime over **30.064 / 30.190 / 30.091 s**. One ordinary visible window
+(WindowsTerminal, ignored for tiling); settings: master right, Horizontal, mixed
+enabled. This does not establish costs with a populated layout. All 357 polls
+observed stable input/window/foreground state; settings SHA-256 matches.
+
+Total process CPU is 593.75 ms over 90.345 s, with no attribution to a specific
+production method or evidence for a local optimization. **Pass complete without
+application changes**, broader investigation, regression or rebuild. Earlier
+three attempts remain excluded for activity; details and limits are recorded in
+PERFORMANCE_STATUS.md. Documentation diff checks pass. Do not repeat the already
+optimized desktop snapshot work or start another candidate in this pass.
+Historical unfinished criteria retain their status.
+
 ## Current scope — 2026-09-14 four-window interaction measurement complete
+
+The current practical PERFORMANCE iteration is **complete**. Further changes
+require a concrete reproducible problem or a measured bottleneck. Historical
+results and remaining IN_PROGRESS criteria retain their existing status.
 
 The bounded PERF-010/021 native scenario now passes in the existing Release
 full-app host: four owned windows, Horizontal/Vertical/Mixed, two warmup cycles

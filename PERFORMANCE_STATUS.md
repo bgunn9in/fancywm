@@ -1,6 +1,55 @@
 # Performance implementation status
 
+## Idle CPU observation complete, no application change — 2026-09-14
+
+The already running ordinary portable **2.19.1.9** (PID 34116) completed three
+idle intervals after 15 s stabilization, using a separate PowerShell observer
+(PID 39472). One ordinary visible, non-minimized, non-cloaked window remained:
+WindowsTerminal, excluded from tiling by the user's settings. Settings select
+master right, Horizontal with mixed satellites enabled; this observation does
+**not** establish idle costs with a populated master/satellite or mixed layout.
+
+| Idle interval | Actual duration | TotalProcessorTime delta |
+|---|---|---|
+| 1 | 30.064 s | 218.75 ms |
+| 2 | 30.190 s | 156.25 ms |
+| 3 | 30.091 s | 218.75 ms |
+
+Total: **593.75 ms process CPU over 90.345 s**, equivalent to 0.657% of one
+logical processor's capacity (individual intervals 0.518–0.728%). This is total
+FancyWM process CPU, not DiscoverWindows cost or whole-computer utilization.
+Allocations/GC and command/frame latency were not measured. No concrete redundant
+operation or justified optimization was established; no code experiment or
+before/after improvement is claimed. The bounded pass ends without expanding
+the investigation or repeating the existing desktop-snapshot optimization.
+
+All 357 external polls observed unchanged last-input timestamps, visible HWNDs/
+rectangles and foreground; window snapshots also match between intervals.
+Polling was requested every 250 ms; this is sampled observation, not a native
+event trace. Receipt assertions, separate-process identity and unchanged settings
+SHA-256 checks pass. Only one FancyWM instance ran and remains running.
+
+Earlier attempts below remain **excluded from idle results**. Counts are ordinary
+visible native windows at the start, not necessarily tiled windows; an input
+timestamp change alone does not identify its producer.
+
+| Attempt | Duration | TotalProcessorTime delta | Windows at start | Activity detected |
+|---|---|---|---|---|
+| Initial | 30.146 s | 437.5 ms | 4 | Input |
+| After the user's free-interval reply | 30.235 s | 343.75 ms | 5 | Input |
+| Retry after a stable 10 s input/cursor probe | 30.113 s | 2562.5 ms | 5 | Input, windows and foreground |
+
+Application code/settings, 250 ms reconciliation, dependency patches and the
+portable are unchanged. Documentation `git diff --check` passes; no regression
+or rebuild was needed. Local observation files remain ignored under
+`artifacts/performance/FWM-IDLE-20260914/`; accepted receipt: `idle-202157.json`.
+Historical unfinished criteria retain their status.
+
 ## PERF-010/021 four-window measurement complete — 2026-09-14
+
+The current practical PERFORMANCE iteration is **complete**. Further changes
+require a concrete reproducible problem or a measured bottleneck. Historical
+results and remaining IN_PROGRESS criteria retain their existing status.
 
 At `0b625b7`, the existing Release full-app host completed `run-7`: four real
 WinForms HWNDs at a time, Horizontal/Vertical/Mixed, two warmup cycles and three
