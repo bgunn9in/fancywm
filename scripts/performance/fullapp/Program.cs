@@ -32,17 +32,19 @@ internal static partial class Program
     private static string Output = "";
     private static int Iterations;
     private static bool Validation;
+    private static bool FourWindows;
     private static object? MainWindowObject;
 
     [STAThread]
     private static int MainEntry(string[] args)
     {
-        if (args.Length != 4 || Directory.Exists(args[0])) throw new ArgumentException("Usage: <fresh-output> <target-exe> <iterations> <validation|measurement>");
+        if (args.Length != 4 || Directory.Exists(args[0])) throw new ArgumentException("Usage: <fresh-output> <target-exe> <iterations> <validation|measurement|four-windows>");
         Output = Path.GetFullPath(args[0]); var targetExe = Path.GetFullPath(args[1]);
         if (!AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), new(-4)))
             throw new InvalidOperationException("Launch the archived apphost EXE with the production PerMonitorV2 manifest; the current DPI context differs.");
         Iterations = int.Parse(args[2]); Validation = args[3] == "validation";
-        if (args[3] is not ("validation" or "measurement")) throw new ArgumentException("Unknown run mode.");
+        FourWindows = args[3] == "four-windows";
+        if (args[3] is not ("validation" or "measurement" or "four-windows")) throw new ArgumentException("Unknown run mode.");
         if (Iterations is < 1 or > 20 || !File.Exists(targetExe)) throw new ArgumentException("Invalid controls.");
         Directory.CreateDirectory(Output); Directory.SetCurrentDirectory(Output);
         var options = (JsonSerializerOptions)typeof(AppState).GetMethod("CreateSettingsJsonSerializerOptions", Static)!.Invoke(null, null)!;
@@ -50,6 +52,8 @@ internal static partial class Program
             ShowStartupWindow = false, CheckForUpdates = false, RemindToRateReview = false,
             ShowContextHints = false, SoundOnFailure = false, NotifyVirtualDesktopServiceIncompatibility = false };
         if (Validation) settings = settings with { Keybindings = ValidationBindings() };
+        if (FourWindows) settings = settings with { Keybindings = FourWindowBindings(), ModifierMoveWindow = true,
+            MasterSatelliteLayout = new() { Enabled = true } };
         File.WriteAllText("settings.json", JsonSerializer.Serialize(settings, options));
         var services = new ServiceCollection(); var argumentsType = typeof(Startup).GetNestedType("Arguments", BindingFlags.NonPublic)!;
         var arguments = Activator.CreateInstance(argumentsType, true)!;
@@ -84,7 +88,8 @@ internal static partial class Program
                 await Idle(0);
                 await State.Settings.SaveAsync(s => s with { AutoFloatNewWindows = false });
                 Targets = new TargetClient(targetExe, Path.Combine(Output, "targets"));
-                await Run();
+                if (FourWindows) await RunFourWindows();
+                else await Run();
             }
             catch (Exception error) { Failure = Failure is null ? error : new AggregateException(Failure, error); }
             finally
@@ -121,7 +126,7 @@ internal static partial class Program
                     typeof(WinMan.IWindow).Assembly, typeof(Program).Assembly }
                     .Select(assembly => new { assembly.Location, SHA256 = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(assembly.Location))) }).ToArray(),
                 RealApplication = typeof(App).Assembly.Location, ActualAnimationDurationMs = 100,
-                FixtureAutoSplitCount = 5, FixtureLayoutPreparation = "SettledEvenFlexAndTargetOrder",
+                FixtureAutoSplitCount = 5, FixtureLayoutPreparation = FourWindows ? "FourNativeWindowsAutomaticInput" : "SettledEvenFlexAndTargetOrder",
                 TargetMinimumSize = new { Width = 48, Height = 48 },
                 TargetStyle = "Captionless WinForms with native SIZEBOX/MINIMIZEBOX/MAXIMIZEBOX; no fabricated WM_GETMINMAXINFO result",
                 IsPackaged = false, IsolatedSettingsPath = State?.Settings.FullPath,
@@ -306,7 +311,20 @@ internal static partial class Program
     [DllImport("user32.dll")] private static extern bool AreDpiAwarenessContextsEqual(nint left, nint right);
 
     [STAThread]
-    private static int Main(string[] args) => MainEntry(args);
+    private static int Main(string[] args)
+    {
+        if (args.LastOrDefault() != "four-windows") return MainEntry(args);
+        bool original = FancyWM.Utilities.SystemParameters.Instance.WindowArranging;
+        try { return MainEntry(args); }
+        finally
+        {
+            bool afterShutdown = FancyWM.Utilities.SystemParameters.Instance.WindowArranging;
+            if (afterShutdown != original) FancyWM.Utilities.SystemParameters.Instance.WindowArranging = original;
+            if (Directory.Exists(Output)) File.WriteAllText(Path.Combine(Output, "window-arranging.json"),
+                JsonSerializer.Serialize(new { Original = original, AfterShutdown = afterShutdown,
+                    Final = FancyWM.Utilities.SystemParameters.Instance.WindowArranging }, Json));
+        }
+    }
 
     private sealed class TargetClient : IDisposable
     {

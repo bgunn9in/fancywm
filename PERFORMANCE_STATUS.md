@@ -1,5 +1,32 @@
 # Performance implementation status
 
+## PERF-010/021 four-window measurement complete — 2026-09-14
+
+At `0b625b7`, the existing Release full-app host completed `run-7`: four real
+WinForms HWNDs at a time, Horizontal/Vertical/Mixed, two warmup cycles and three
+measured cycles per layout. **78 measured operations** (including 18 automatic
+drags); 52 warmup operations excluded. Native geometry, exact slots/master roles,
+operation focus, visible WPF preview and drop cleanup pass. Input now runs off
+the Dispatcher so native hook callbacks can consult it; owned Alt/button releases
+are protected across awaits. Admission, ownership and interference guards remain.
+
+Median per-cycle process CPU: H 1453 ms, V 625 ms, M 547 ms; allocations:
+4.963 / 4.869 / 8.746 MiB. These include in-process fixture work and background
+application work, not command-exclusive costs. Fixed waits/native polling are
+observation intervals, not frame latency. **0 model additions and 0 child Reset
+notifications** across measured operations. CPU spread and un-attributed mixed
+allocations do not establish a specific redundant production operation: no
+optimization selected. [Short table, method and limits](docs/performance/FOUR_WINDOW_INTERACTION.md).
+
+Runs 1–6 are excluded, including all partial warmups; repeated occupied-input
+symptoms cannot be attributed to the user alone. Release build, run-7 assertions,
+independent receipt checks and diff checks pass. Twelve target HWNDs across three
+phases and both processes are gone; no pressed input remains. User JSON, existing
+window rectangles and display geometry match; WindowArranging restored normally.
+Production is unchanged, so the [current portable](docs/portable.md) is retained;
+no new portable, full regression, ETW/GPU work or second candidate. Raw results
+remain ignored under `artifacts/performance/FWM-FOUR-WINDOWS-20260914/`.
+
 ## PERF-017 periodic candidate checked — 2026-09-14
 
 At `9011e2f`, the three hook/policy files and directly related tests show no

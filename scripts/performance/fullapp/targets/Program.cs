@@ -57,7 +57,7 @@ internal static class Program
                     if (Windows.Any(w => !w.IsDisposed)) throw new InvalidOperationException("Previous owned targets remain.");
                     Windows.Clear();
                     int count = c.GetProperty("Count").GetInt32();
-                    if (count is not (1 or 10 or 50)) throw new ArgumentException("Unsupported target count.");
+                    if (count is not (1 or 4 or 10 or 50)) throw new ArgumentException("Unsupported target count.");
                     for (int i = 0; i < count; i++)
                     {
                         var form = new Target(i) { Text = $"PERF-010 owned full-app target {i}",

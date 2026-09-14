@@ -1,5 +1,21 @@
 # Performance optimization plan
 
+## Current scope — 2026-09-14 four-window interaction measurement complete
+
+The bounded PERF-010/021 native scenario now passes in the existing Release
+full-app host: four owned windows, Horizontal/Vertical/Mixed, two warmup cycles
+and three measured cycles per layout. Run 7 supplies 78 measured operations;
+runs 1–6 and all warmups are excluded. Automatic hotkeys and modifier-drags
+verify slots, master roles, focus, visible preview and native geometry. Cleanup
+checks pass; production and the current portable remain unchanged.
+
+No concrete redundant production operation was established: overlay model
+additions and Reset notifications are zero. Process CPU/allocations include
+fixture work; mixed-layout allocation differences have no established cause.
+No optimization or further investigation is started in this pass. The existing
+scenario and [results/limits](docs/performance/FOUR_WINDOW_INTERACTION.md) are
+saved for a future comparison if a concrete production candidate is identified.
+
 ## Current scope — 2026-09-14 PERF-017 periodic check complete
 
 The bounded review at `9011e2f` covered LowLevelKeyboardHook,
