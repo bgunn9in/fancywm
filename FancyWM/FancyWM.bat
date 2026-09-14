@@ -1,3 +1,3 @@
 @echo off
-FancyWM-CLI.exe %*
+"%~dp0FancyWM.exe" %*
 exit /b %ERRORLEVEL%
