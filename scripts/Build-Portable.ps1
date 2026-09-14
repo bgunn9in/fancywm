@@ -59,6 +59,12 @@ using patches/winman-windows/manifest.json.
 3. Run FancyWM-GUI.exe. No separate .NET installation is required.
 
 Settings and logs use the existing %APPDATA%\FancyWM directory.
+To start at Windows sign-in, enable "Run at startup" in FancyWM settings.
+The portable creates %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\FancyWM.lnk
+pointing to FancyWM-GUI.exe in this extracted folder. Keep the folder in place;
+after moving/updating to another folder, enable the option from the new copy.
+Disable the option to remove the shortcut. This does not require the Store app.
+
 For CLI help/version without starting the UI, run FancyWM.exe --help or
 FancyWM.exe --version. FancyWM.bat forwards arguments to the adjacent FancyWM.exe
 and returns its exit code, including from a different working directory.
