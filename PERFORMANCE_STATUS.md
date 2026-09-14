@@ -1,5 +1,27 @@
 # Performance implementation status
 
+## One local optimization complete — 2026-09-14
+
+Both new features are complete and manually confirmed by the user; feature
+implementation, tests and closeout docs are in local commit `a40cf6d`. That UI
+confirmation does not extend to unspecified monitors, DPI or applications.
+No repeat UI pass is pending without a concrete reason.
+
+PERF-010/021 local result: panel child collection updates now retain surviving
+tabs during permutations and membership changes. In 72 comparable updates
+(Horizontal/Vertical/mixed, both master sides), newly created WPF tabs fell
+**228 → 48**, resets **96 → 0**, collection notifications **324 → 183**.
+Only these counts are claimed; whole-app speed, allocation bytes and GPU work
+were not measured. [Method, scope and receipts](docs/performance/OVERLAY_CHILD_ORDER.md).
+
+Final affected regression passed **756 Debug + 798 Release = 1554** leaf cases,
+with zero failures/skips. The runs include both feature suites and overlay
+recovery/lifetime tests; the production projects also compiled in both modes.
+Raw logs/TRX are ignored under `artifacts/performance/FWM-OVERLAY-REORDER-20260914/`.
+No interactive application launch, push, installation or publication occurred.
+The one-optimization scope is complete. Historical whole-ID IN_PROGRESS states
+and deferred GPU/memory/provider work below are unchanged.
+
 ## Practical stage complete — 2026-09-13
 
 The user confirmed **«Работает»**; no new issue was reported. Use the working

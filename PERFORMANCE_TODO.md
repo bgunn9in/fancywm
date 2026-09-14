@@ -1,5 +1,29 @@
 # Performance optimization plan
 
+## Current scope — 2026-09-14 bounded overlay optimization complete
+
+The user manually confirmed both new features work normally. Their stage is
+closed in `NEW_FEATURE_TODO.md` and `docs/new-features-verification.md`, with
+implementation/tests/docs committed locally as `a40cf6d`. No repeat UI pass is
+required without a concrete reason; unspecified monitors, DPI and applications
+are not covered by that confirmation.
+
+One local PERF-010/021 improvement is complete: update panel child order with
+Move/Insert/Remove instead of clearing and repopulating the tab collection.
+The existing overlay reuse is preserved. In the same 72-update WPF workload
+across Horizontal, Vertical and mixed layouts and both master sides, new tabs
+decreased **228 → 48**, Reset notifications **96 → 0**, all collection
+notifications **324 → 183**. This is a construction/notification count result,
+not a measured whole-application speedup. See [method and results](docs/performance/OVERLAY_CHILD_ORDER.md).
+
+Final affected regression: Debug **756**, Release **798** passed cases; no
+failures/skips. Both features, MinSize, recovery, commands, mouse/preview and
+overlay lifetimes are included. No interactive UI was launched. No new cache,
+layout/command rule or 250 ms reconciliation change was introduced.
+The authorized one-optimization pass is finished; no second candidate was
+investigated. Broad PERF-010/021 acceptance and deferred research retain their
+historical status. This section supersedes older next actions below.
+
 ## Current scope — 2026-09-13 practical closeout
 
 The user confirmed **«Работает»** and reported no new problem. The practical

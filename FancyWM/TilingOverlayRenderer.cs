@@ -701,15 +701,58 @@ namespace FancyWM
 
             if (HaveChildrenChanged(vm, node))
             {
-                vm.ChildNodes.Clear();
+                UpdateChildren(vm, node);
+            }
+        }
+
+        private void UpdateChildren(TilingPanelViewModel vm, PanelNode node)
+        {
+            int epoch = Volatile.Read(ref m_invalidationEpoch);
+            m_collectionChangeDepth++;
+            Exception? failure = null;
+            try
+            {
+                // Keep surviving tabs attached when only their order or one
+                // participant changes. All inputs are read in this update;
+                // no tree or window state is cached between calls.
+                int index = 0;
                 foreach (var child in node.Children)
                 {
                     var childViewModel = GetViewModel(child);
-                    if (childViewModel == null)
+                    if (childViewModel == null) { continue; }
+                    if (index >= vm.ChildNodes.Count || vm.ChildNodes[index] != childViewModel)
                     {
-                        continue;
+                        int previousIndex = vm.ChildNodes.IndexOf(childViewModel);
+                        if (previousIndex >= 0) { vm.ChildNodes.Move(previousIndex, index); }
+                        else { vm.ChildNodes.Insert(index, childViewModel); }
+                        if (!IsUpdateCurrent(epoch)) { return; }
                     }
-                    vm.ChildNodes.Add(childViewModel);
+                    index++;
+                }
+                while (vm.ChildNodes.Count > index)
+                {
+                    vm.ChildNodes.RemoveAt(vm.ChildNodes.Count - 1);
+                    if (!IsUpdateCurrent(epoch)) { return; }
+                }
+            }
+            catch (Exception error)
+            {
+                failure = error;
+                throw;
+            }
+            finally
+            {
+                // A listener can invalidate the overlay or throw during a
+                // collection notification. Finish notification delivery before
+                // the existing full invalidation/recovery releases its owners.
+                m_collectionChangeDepth--;
+                if (failure == null) { CompleteDeferredViewInvalidation(); }
+                else
+                {
+                    ReleaseAfterFailure(
+                        CompleteDeferredViewInvalidation,
+                        failure,
+                        "TilingOverlayRenderer.UpdateViewModelsExceptions");
                 }
             }
         }
@@ -830,7 +873,7 @@ namespace FancyWM
         {
             if (m_collectionChangeDepth != 0)
             {
-                // ObservableCollection cannot be cleared while its add/remove
+                // ObservableCollection cannot be cleared while its change
                 // notification is reaching other listeners (including WPF).
                 // Cancel immediately; finish cleanup synchronously once they
                 // unwind, before the suspended mutation returns to the update.
